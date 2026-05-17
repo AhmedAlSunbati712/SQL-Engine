@@ -68,6 +68,7 @@ Page *DLList::remove(int page_num) {
     // Decrement length, free node, and remove from the nodesmap.
     length--;
     nodesMap.erase(page_num);
+    delete node;
     
     return page;
 }
