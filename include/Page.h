@@ -1,5 +1,7 @@
 #pragma once
 
+#define PAGE_SIZE = 4096;
+
 struct Page {
     char data[4096];
     int page_num;

@@ -9,7 +9,7 @@
 class Pager {
 	public:
 		Pager(std::string db_file);
-		char[] get(int page_num);
+		char *get(int page_num);
 		bool write(int page_num);
 		void pin_page(int page_num); // if page.num_refs == 0, call pcache.pin_page(page_num). Increment num_refs
 		void unpin_page(int page_num); // if page.num_refs == 0, do nothing. Decrement num_refs. If num_refs == 0 call pcache.unpin_page(int page_num);
@@ -24,4 +24,4 @@ class Pager {
 		std::string database_name;
 		std::string jFile_name;
 		PCache *pCache;
-}
+};
