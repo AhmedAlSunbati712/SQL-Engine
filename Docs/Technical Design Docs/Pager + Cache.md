@@ -33,7 +33,7 @@ class PCache {
 		int capacity = DEFAULT_CAPACITY;
 		int length = 0;
 		std::unordered_map<int, Page *> cache_map;
-		DLList *unpinned_pages = new DLList(capacity);
+		DLList *unpinned_pages = new DLList();
 	public:
 		PCache(): capacity(DEFAULT_CAPACITY) {};
 		~PCache() {/* Should we free the pages if we are destructing the cache? */}
@@ -71,21 +71,24 @@ class Pager {
 class DLList {
 	private:
 		struct Node {
+			Node() {};
+			Node(Page *page): page(page) {};
 			Page *page = nullptr;
 			Node *next = nullptr;
 			Node *prev = nullptr;
-		}
+		};
 		std::unordered_map<int, Node *> nodesMap;
+		int length = 0;
 		Node *head;
 		Node *tail;
 	public:
 		DLList() {/*Fill in*/};
-		~DLList() { };
-		void add(Page *page);
+		~DLList();
+		void add(int page_num, Page *page);
+		Page *get(int page_num);
 		Page *remove(int page_num);
-		bool is_empty();
 		bool exists(int page_num);
-		
+		int len();
 }
 ```
 

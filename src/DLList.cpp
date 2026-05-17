@@ -1,6 +1,5 @@
 #include <unordered_map>
 #include <DLList.h>
-#include <Pager.h>
 
 
 DLList::DLList(): head(new Node()), tail(new Node()) {
@@ -14,9 +13,6 @@ DLList::DLList(): head(new Node()), tail(new Node()) {
 DLList::~DLList() {
     Node *curr = head;
     while (curr) {
-        if (curr != head) {
-            delete curr->page;
-        }
         Node *next = curr->next;
         delete curr;
         curr = next;
@@ -69,8 +65,9 @@ Page *DLList::remove(int page_num) {
     prev_node->next = node->next;
     node->next->prev = prev_node;
 
-    // Decrement the length
+    // Decrement length, free node, and remove from the nodesmap.
     length--;
+    nodesMap.erase(page_num);
     
     return page;
 }

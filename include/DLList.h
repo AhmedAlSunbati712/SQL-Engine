@@ -1,7 +1,9 @@
 #pragma once
 #include <unordered_map>
 #include <vector>
-#include <Pager.h>
+
+// Forward-declaration of the page struct
+struct Page;
 
 /**
  * Purpose: The usecase I'm targeting for this is in the PCache. It will hold a list of pages that
