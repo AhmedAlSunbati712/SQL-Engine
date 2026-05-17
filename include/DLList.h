@@ -15,9 +15,11 @@
 class DLList {
     private:
         struct Node {
-            Page *page;
-            Node *next;
-            Node *prev;
+            Node() {};
+            Node(Page *page): page(page) {};
+            Page *page = nullptr;
+            Node *next = nullptr;
+            Node *prev = nullptr;
         };
         std::unordered_map<int, Node *> nodesMap; // For O(1) lookups
         int length = 0;
