@@ -46,8 +46,9 @@ class PCache {
 ### Pager
 
 ```cpp
-class Page {
+class Pager {
 	public:
+		Pager(std::string db_file);
 		char[] get(int page_num);
 		bool write(int page_num);
 		bool commit_phase_one();
