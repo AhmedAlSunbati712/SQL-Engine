@@ -35,4 +35,57 @@ class DLList {
         Page *remove(int page_num);
         bool exists(int page_num);
         int len();
+
+        // Iterator interface for stepping through the list.
+        class Iterator {
+            private:
+                Node *current = nullptr;
+            public:
+                Iterator(Node *current): current(current) {};
+                Page *operator*() const {
+                    return current->page;
+                }
+                
+                // this is prefix incrementing
+                Iterator &operator++() {
+                    current = current->next;
+                    return *this;
+                }
+
+                // postfix incrementing
+                Iterator &operator++(int) {
+                    Iterator temp = *this;
+                    current = current->next;
+                    return temp;
+                }
+
+                // postfix decrementing
+                Iterator &operator--(int) {
+                    Iterator temp = *this;
+                    current = current->prev;
+                    return temp;
+                }
+
+                // this is prefix decrementing
+                Iterator &operator--() {
+                    current = current->prev;
+                    return *this;
+                }
+                
+                bool operator!=(const Iterator &other) const {
+                    return current != other.current;
+                }
+                
+                bool operator==(const Iterator &other) const {
+                    return current == other.current;
+                }
+        };
+
+        Iterator begin() {
+            return Iterator(head->next);
+        }
+
+        Iterator end() {
+            return Iterator(tail);
+        }
 };
