@@ -53,14 +53,14 @@ class DLList {
                 }
 
                 // postfix incrementing
-                Iterator &operator++(int) {
+                Iterator operator++(int) {
                     Iterator temp = *this;
                     current = current->next;
                     return temp;
                 }
 
                 // postfix decrementing
-                Iterator &operator--(int) {
+                Iterator operator--(int) {
                     Iterator temp = *this;
                     current = current->prev;
                     return temp;
