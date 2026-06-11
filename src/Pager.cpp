@@ -22,30 +22,8 @@ char *Pager::get(int page_num) {
     
     // If it doesn't, read from disk
     if (!page) {
-        // We need too check if the cache has enough space for a read
-        // Which means either pCache->length < capacity or there's a free
-        // unpinned page (not dirty). Instead of handling this here, it should be handled in 
-        // the cache. Would be nice tho if there's a fast way to check if there's
-        // an unpinned page that is not dirty. For the early versions, we are going to throw an error
-        // when the only available pages are dirty so it's important in this case that we dont even 
-        // waste time trying to fetch from disk the page. but later on, the cache itself will handle
-        // flushing the dirty unpinned page so doesn't matter.
-        
-        // Calculate the offset. Make sure to cast to the internal type streamoff to avoid arbitrary sizes of int
-        // on different platforms for offset
-        std::streamoff offset = static_cast<std::streamoff>(page_num) * static_cast<std::streamoff>(PAGE_SIZE);
-        disk::seek_read_to(dbFile_handler, offset);
-
-        // Make a new page object and initialize its members
-        page = new Page();
-        page->page_num = page_num;
-        page->is_dirty = false;
-        page->need_to_flush_journal = false;
-
-        // Make a span out of the page data array so it can be passed safely into read exact
-        std::span<char> buffer_span(page->data);
-        disk::read_exact(dbFile_handler, buffer_span);
-
+        // Read from disk
+        page = read_page_from_disk(page_num);
         // Add to cache
         pCache->put(page);
     }
@@ -56,11 +34,39 @@ char *Pager::get(int page_num) {
 
 bool Pager::begin_write(int page_num) {
     /**
-     * Read the page first through Pager::get. This will check if the page exists
-     * in cache. if it doesn't, it will handle 
-     * 
-     * 
-     * 
-     * 
+     * V1 for begin write: read page through get, ignore lock permissions, mark it as dirty
+     * add to dirty pages disk and add to journal.
      */
+
+}
+
+
+/** Private helpers */
+
+Page *Pager::read_page_from_disk(int page_num) {
+    // We need too check if the cache has enough space for a read
+    // Which means either pCache->length < capacity or there's a free
+    // unpinned page (not dirty). Instead of handling this here, it should be handled in 
+    // the cache. Would be nice tho if there's a fast way to check if there's
+    // an unpinned page that is not dirty. For the early versions, we are going to throw an error
+    // when the only available pages are dirty so it's important in this case that we dont even 
+    // waste time trying to fetch from disk the page. but later on, the cache itself will handle
+    // flushing the dirty unpinned page so doesn't matter.
+
+
+    // Calculate the offset. Make sure to cast to the internal type streamoff to avoid arbitrary sizes of int
+    // on different platforms for offset
+    std::streamoff offset = static_cast<std::streamoff>(page_num) * static_cast<std::streamoff>(PAGE_SIZE);
+    disk::seek_read_to(dbFile_handler, offset);
+
+    // Make a new page object and initialize its members
+    Page *page = new Page();
+    page->page_num = page_num;
+    page->is_dirty = false;
+    page->need_to_flush_journal = false;
+
+    // Make a span out of the page data array so it can be passed safely into read exact
+    std::span<char> buffer_span(page->data);
+    disk::read_exact(dbFile_handler, buffer_span);
+    return page;
 }

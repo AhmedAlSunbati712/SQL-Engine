@@ -18,6 +18,7 @@ class Pager {
 		bool commit_phase_two();
 	private:
 		std::unordered_set<Page *> dirty_pages;
+		DLList *jBackup_images = new DLList();
 
 		std::fstream dbFile_handler;
 		std::fstream jFile_handler;
@@ -25,4 +26,6 @@ class Pager {
 		std::string db_name;
 		std::string jFile_name;
 		PCache *pCache;
+
+		Page *read_page_from_disk(int page_num);
 };
