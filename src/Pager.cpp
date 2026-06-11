@@ -1,4 +1,5 @@
 #include <Pager.h>
+#include <DiskIO.h>
 
 Pager::Pager(std::string db_file): db_name(db_file), dbFile_handler(db_file, std::ios::in | std::ios::out | std::ios::binary) {
     if (!dbFile_handler.is_open() || dbFile_handler.fail()) {
@@ -29,15 +30,31 @@ char *Pager::get(int page_num) {
         // when the only available pages are dirty so it's important in this case that we dont even 
         // waste time trying to fetch from disk the page. but later on, the cache itself will handle
         // flushing the dirty unpinned page so doesn't matter.
+        
+        // Calculate the offset. Make sure to cast to the internal type streamoff to avoid arbitrary sizes of int
+        // on different platforms for offset
+        std::streamoff offset = static_cast<std::streamoff>(page_num) * static_cast<std::streamoff>(PAGE_SIZE);
+        disk::seek_read_to(dbFile_handler, offset);
 
-        // TODO: Read from disk and save in cache
+        // Make a new page object and initialize its members
+        page = new Page();
+        page->page_num = page_num;
+        page->is_dirty = false;
+        page->need_to_flush_journal = false;
+
+        // Make a span out of the page data array so it can be passed safely into read exact
+        std::span<char> buffer_span(page->data);
+        disk::read_exact(dbFile_handler, buffer_span);
+
+        // Add to cache
+        pCache->put(page);
     }
     page->refs_num += 1;
     if (page->refs_num == 1) pCache->pin_page(page_num);
     return page->data;
 }
 
-bool Pager::write(int page_num) {
+bool Pager::begin_write(int page_num) {
     /**
      * Read the page first through Pager::get. This will check if the page exists
      * in cache. if it doesn't, it will handle 
