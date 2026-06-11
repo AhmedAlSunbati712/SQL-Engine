@@ -74,9 +74,8 @@ Page *PCache::put(Page *page) {
 
         // If a victim page page is dirty, we need to do some cleanup
         if (victim_page->is_dirty) {
-            if (victim_page->need_to_flush_journal) {
-                // TODO: we need to flush the journal to disk
-            }
+            // TODO: we need to flush the journal to disk
+
             // TODO: Flush the page to disk
         }
 

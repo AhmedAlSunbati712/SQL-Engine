@@ -7,5 +7,4 @@ struct Page {
     int page_num;
     int refs_num;
     bool is_dirty;
-    bool need_to_flush_journal;
 };

@@ -17,8 +17,12 @@ class Pager {
 		bool commit_phase_one();
 		bool commit_phase_two();
 	private:
-		std::unordered_set<Page *> dirty_pages;
-		DLList *jBackup_images = new DLList();
+		struct DirtyPageEntry {
+			char backup_image[PAGE_SIZE];
+			Page *page;
+		};
+
+		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
 
 		std::fstream dbFile_handler;
 		std::fstream jFile_handler;

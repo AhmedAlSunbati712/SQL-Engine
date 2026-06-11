@@ -34,9 +34,25 @@ char *Pager::get(int page_num) {
 
 bool Pager::begin_write(int page_num) {
     /**
-     * V1 for begin write: read page through get, ignore lock permissions, mark it as dirty
-     * add to dirty pages disk and add to journal.
-     */
+    * V1 for begin write: read page through get, ignore lock permissions, mark it as dirty
+    * add to dirty pages disk and add to journal.
+    */
+    Page *page = pCache->get(page_num);
+    if (!page) {
+        page = read_page_from_disk(page_num);
+        pCache->put(page);
+    }
+
+    // If page is already dirty, just return true
+    if (page->is_dirty) return true;
+
+    // Mark page as dirty, save a copy of its image and add it to our dirty pages map.
+    page->is_dirty = true;
+    DirtyPageEntry *new_entry = new DirtyPageEntry();
+    std::memcpy(new_entry->backup_image, page->data, PAGE_SIZE);
+    new_entry->page = page;
+    dirty_pages[page_num] = new_entry;
+    return true;
 
 }
 
@@ -63,7 +79,6 @@ Page *Pager::read_page_from_disk(int page_num) {
     Page *page = new Page();
     page->page_num = page_num;
     page->is_dirty = false;
-    page->need_to_flush_journal = false;
 
     // Make a span out of the page data array so it can be passed safely into read exact
     std::span<char> buffer_span(page->data);
