@@ -17,7 +17,7 @@ class PCache {
 	private:
 		static const int DEFAULT_CAPACITY = 64;
 		int capacity = DEFAULT_CAPACITY;
-		int length = 0;
+		int length = 0; // Total number of pages in the cache. Pinned or unpinned
 		std::unordered_map<int, Page *> cache_map;
 		DLList *unpinned_pages = new DLList();
 };
