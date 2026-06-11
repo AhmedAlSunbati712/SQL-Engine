@@ -12,8 +12,8 @@ class Pager {
 		~Pager();
 		char *get(int page_num);
 		bool begin_write(int page_num);
-		void pin_page(int page_num); // if page.num_refs == 0, call pcache.pin_page(page_num). Increment num_refs
-		void unpin_page(int page_num); // if page.num_refs == 0, do nothing. Decrement num_refs. If num_refs == 0 call pcache.unpin_page(int page_num);
+		void ref_page(int page_num); // increment page ref nums. if page.num_refs == 1, call pcache.pin_page(page_num)
+		void unref_page(int page_num); // decrement page ref nums. if page.num_refs == 0 call pcache.unpin_page(int page_num);
 		bool commit_phase_one();
 		bool commit_phase_two();
 	private:

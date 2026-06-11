@@ -1,5 +1,7 @@
 #include <Pager.h>
 #include <DiskIO.h>
+#include <sstream>
+
 
 Pager::Pager(std::string db_file): db_name(db_file), dbFile_handler(db_file, std::ios::in | std::ios::out | std::ios::binary) {
     if (!dbFile_handler.is_open() || dbFile_handler.fail()) {
@@ -56,6 +58,31 @@ bool Pager::begin_write(int page_num) {
 
 }
 
+
+void Pager::ref_page(int page_num) {
+    Page *page = pCache->get(page_num);
+    if (!page) {
+        std::ostringstream oss;
+        oss << "Error (Pager.ref_page, Pager object: " << static_cast<void *>(this) << "): Page " << page_num << " doesn't exist in the cache.";
+        throw std::runtime_error(oss.str());
+    }
+    page->refs_num++;
+    if (page->refs_num == 1) pCache->pin_page(page_num);
+    return;
+}
+
+void Pager::unref_page(int page_num) {
+    Page *page = pCache->get(page_num);
+    if (!page) {
+        std::ostringstream oss;
+        oss << "Error (Pager.unref_page, Pager object: " << static_cast<void *>(this) << "): Page " << page_num << " doesn't exist in the cache.";
+        throw std::runtime_error(oss.str());
+    }
+
+    page->refs_num--;
+    if (page->refs_num == 1) pCache->unpin_page(page_num);
+    return;
+}
 
 /** Private helpers */
 
