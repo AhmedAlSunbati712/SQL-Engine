@@ -24,7 +24,7 @@ class Pager {
 		};
 
 		std::uint32_t generate_nonce();
-		std::uint32_t checksum(uint32_t nonce, std::span<char> data);
+		std::uint32_t checksum(uint32_t nonce, std::span<const char> data);
 
 		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
 
