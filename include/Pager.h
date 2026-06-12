@@ -4,6 +4,7 @@
 #include <fstream>
 #include <PCache.h>
 #include <string.h>
+#include <Journal.h>
 
 
 
@@ -18,14 +19,6 @@ class Pager {
 		bool commit_phase_one();
 		bool commit_phase_two();
 	private:
-		struct DirtyPageEntry {
-			char backup_image[PAGE_SIZE];
-			Page *page;
-		};
-
-		std::uint32_t generate_nonce();
-		std::uint32_t checksum(uint32_t nonce, std::span<const char> data);
-
 		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
 
 		std::fstream dbFile_handler;
