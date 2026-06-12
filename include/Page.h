@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #define PAGE_SIZE 4096
 
 struct Page {
@@ -11,14 +12,14 @@ struct Page {
 
 struct JournalHeader {
     char magic[8] = {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7};
-    uint32_t page_count;
-    uint32_t nonce;
-    uint32_t init_db_page_count;
+    std::uint32_t page_count;
+    std::uint32_t nonce;
+    std::uint32_t init_db_page_count;
     
 }__attribute__((packed));
 
 struct JournalPageRecord {
-    uint32_t page_num;
+    std::uint32_t page_num;
     char data[PAGE_SIZE];
-    uint32_t checksum;
+    std::uint32_t checksum;
 }__attribute__((packed));

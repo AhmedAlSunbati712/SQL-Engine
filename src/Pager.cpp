@@ -1,6 +1,7 @@
 #include <Pager.h>
 #include <DiskIO.h>
 #include <sstream>
+#include <random>
 
 
 Pager::Pager(std::string db_file): db_name(db_file), dbFile_handler(db_file, std::ios::in | std::ios::out | std::ios::binary) {
@@ -111,4 +112,22 @@ Page *Pager::read_page_from_disk(int page_num) {
     std::span<char> buffer_span(page->data);
     disk::read_exact(dbFile_handler, buffer_span);
     return page;
+}
+
+std::uint32_t Pager::generate_nonce() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<std::uint32_t>dist;
+    return dist(gen);
+}
+
+std::uint32_t Pager::checksum(uint32_t nonce, std::span<const char> page) {
+    uint32_t checksum_value = nonce;
+    int offset = static_cast<int>(0.05 * page.size());
+    int X = page.size() - offset;
+    while (X >= 0) {
+        checksum_value += static_cast<uint32_t>(static_cast<uint8_t>(page[page.size() - offset]));
+        X -= offset;
+    }
+    return checksum_value;
 }
