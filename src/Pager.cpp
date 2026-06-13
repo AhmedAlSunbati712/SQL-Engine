@@ -116,7 +116,7 @@ Page *Pager::read_page_from_disk(int page_num) {
 }
 
 // TODO: replace all seekp with seek_write_to
-bool Pager::commit_phase_one() {
+void Pager::commit_phase_one() {
     /**
      * flush the dirty pages to the journal
      * flush the journal header to disk.
@@ -208,6 +208,23 @@ bool Pager::commit_phase_one() {
         delete dPage_entry;
         it = dirty_pages.erase(it);
     }
-    return true;
+    return;
+}
 
+void Pager::commit_phase_two() {
+    // Check if there doesn't exist any journal. In that case, we can't commit. Throw an error
+    bool valid_journal = std::filesystem::exists(jFile_name) && !std::filesystem::is_empty(jFile_name);
+    if (!valid_journal) {
+        std::ostringstream oss;
+        oss << "Error (Pager.commit_phase_two, Pager object: " << static_cast<void *>(this) << " ): Can't execute second phase of the commit! Journal doesn't exist/invalid";
+        throw std::runtime_error(oss.str());
+    }
+
+    // There's a journal that has content, therefore we need to truncate it.
+    std::fstream jFile(jFile_name, std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!jFile.is_open() || jFile.fail()) {
+        std::ostringstream oss;
+        oss << "Error (Pager.commit_phase_two, Pager object: " << static_cast<void *>(this) << " ): Failed to truncate journal file";
+    }
+    return;
 }
