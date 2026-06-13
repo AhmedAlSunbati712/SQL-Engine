@@ -22,7 +22,6 @@ class Pager {
 		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
 
 		std::fstream dbFile_handler;
-		std::fstream jFile_handler;
 
 		std::string db_name;
 		std::string jFile_name;

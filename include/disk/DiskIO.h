@@ -3,6 +3,7 @@
 #include <fstream>
 #include <span>
 
+//TODO: add another param to the seek functions to pass the direction of seeking
 namespace disk {
     std::size_t file_size(std::fstream& file);
     void seek_read_to(std::fstream& file, std::streamoff offset);
