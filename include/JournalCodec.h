@@ -14,4 +14,5 @@ namespace Journal {
     std::uint32_t generate_nonce();
 	std::uint32_t checksum(uint32_t nonce, std::span<const char> data);
 	bool validate_journal_record_checksum(JournalPageRecord &jPage_record, JournalHeader& jHeader);
+    bool validate_journal_header(JournalHeader &jHeader);
 }

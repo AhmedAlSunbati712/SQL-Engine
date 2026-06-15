@@ -18,6 +18,7 @@ class Pager {
 		void unref_page(int page_num); // decrement page ref nums. if page.num_refs == 0 call pcache.unpin_page(int page_num);
 		void commit_phase_one();
 		void commit_phase_two();
+		void rollback_hot_journal();
 	private:
 		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
 

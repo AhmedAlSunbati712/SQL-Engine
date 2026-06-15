@@ -16,9 +16,6 @@ namespace Journal {
     void deserialize_jHeader(JournalHeader &jHeader, char *in) {
         const unsigned char expected_magic[8] = {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7};
         for (int i = 0; i < 8; i++) {
-            if (static_cast<unsigned char>(in[i]) != expected_magic[i]) {
-                 throw std::runtime_error("JournalHeader::deserialize: invalid magic bytes");
-            }
             jHeader.magic[i] = static_cast<unsigned char>(in[i]);
         }
         jHeader.page_count = get_u32_be(&in[8]);
@@ -53,11 +50,11 @@ namespace Journal {
 
     std::uint32_t checksum(uint32_t nonce, std::span<const char> page) {
         uint32_t checksum_value = nonce;
-        int offset = static_cast<int>(0.05 * page.size());
-        int X = page.size() - offset;
+        int stride = 200;
+        int X = page.size() - stride;
         while (X >= 0) {
-            checksum_value += static_cast<uint32_t>(static_cast<uint8_t>(page[page.size() - offset]));
-            X -= offset;
+            checksum_value += static_cast<uint32_t>(static_cast<uint8_t>(page[X]));
+            X -= stride;
         }
         return checksum_value;
     }
@@ -66,6 +63,15 @@ namespace Journal {
         std::uint32_t nonce = jHeader.nonce;
         std::uint32_t checksum_value = checksum(nonce, jPage_record.data);
         return checksum_value == jPage_record.checksum;
+    }
+
+    bool validate_journal_header(JournalHeader &jHeader) {
+        // TODO: is it possible to define this as a global in the namespace?
+        const unsigned char expected_magic[8] = {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7};
+        for (int i = 0; i < 8; i++) {
+            if (jHeader.magic[i] != expected_magic[i]) return false;
+        }
+        return true;
     }
 
 }

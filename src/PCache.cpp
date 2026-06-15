@@ -31,7 +31,7 @@ Page *PCache::get(int page_num) {
     return iterator->second;
 }
 
-Page *PCache::put(Page *page) {
+void PCache::put(Page *page) {
     int page_num = page->page_num;
 
     // Check if the page already exists. If it does, throw a runtime_error
@@ -74,9 +74,11 @@ Page *PCache::put(Page *page) {
 
         // If a victim page page is dirty, we need to do some cleanup
         if (victim_page->is_dirty) {
-            // TODO: we need to flush the journal to disk
-
-            // TODO: Flush the page to disk
+            // We need to do a cache spillover. instead of calling phase 1 commit from here
+            // which is going to require the pCache to hold a pointer to its parent pager
+            // we can just throw an error and return a status code
+            // rc: CACHE_SPILLOVER
+            throw std::runtime_error("Error: Cache is full. Need to flush dirty pages to disk");
         }
 
         // Cleanup: Free the resource taken up by the page

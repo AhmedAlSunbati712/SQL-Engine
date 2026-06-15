@@ -10,4 +10,6 @@ namespace disk {
     void seek_write_to(std::fstream& file, std::streamoff offset);
     void read_exact(std::fstream& file, std::span<char> buffer);
     void write_exact(std::fstream& file, std::span<const char> buffer);
+    std::streamoff get_curr_write_offset(std::fstream& file);
+    std::streamoff get_curr_read_offset(std::fstream& file);
 }
