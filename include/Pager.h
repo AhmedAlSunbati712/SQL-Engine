@@ -28,5 +28,7 @@ class Pager {
 		std::string jFile_name;
 		PCache *pCache;
 
+		void handle_cache_eviction(const PCacheEviction &eviction);
+		void cache_put_or_throw(Page *page);
 		Page *read_page_from_disk(int page_num);
 };

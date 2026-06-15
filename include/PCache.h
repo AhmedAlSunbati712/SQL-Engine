@@ -1,18 +1,25 @@
 #pragma once
+#include <cstdint>
 #include <unordered_map>
 #include <DLList.h>
 #include <Page.h>
 
-enum class PCacheError : std::uint8_t {
+enum class PCacheResult : std::uint8_t {
 	Success = 0,
-	PageInCache, // PCache::put
-	NoVictim, // PCache::put
-	DirtyFlush, // PCache::put
-	RemovingPinnedPage, // Possibly PCache::remove
-	PinningNonexistantPage, // PCache::pin_page
-	PinnedZeroRefsPage, // PCache::pin_page
-	UnpinningNonexistantPage, // PCache::unpin_page
-	UnpinnedNonZeroRefsPage, // PCache::unpin_page
+	NoVictim,
+	DirtyFlush,
+	RemovingPinnedPage
+};
+
+struct PCacheEviction {
+	bool happened = false;
+	int page_num = -1;
+	bool was_dirty = false;
+};
+
+struct PCachePutResult {
+	PCacheResult status = PCacheResult::Success;
+	PCacheEviction eviction;
 };
 
 class PCache {
@@ -21,8 +28,8 @@ class PCache {
         PCache(int capacity);
 		~PCache();
 		Page *get(int page_num);
-		void put(Page *page);
-        void remove(int page_num);
+		PCachePutResult put(Page *page);
+        PCacheResult remove(int page_num);
 		void pin_page(int page_num); // If page is already pinned, do nothing. Else move out of unpinned pages
 		void unpin_page(int page_num); // if page is already unpinned, do nothing. If not, move it into unpinned pages
 		int len();

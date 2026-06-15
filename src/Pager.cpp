@@ -6,6 +6,7 @@
 #include <iostream>
 #include <JournalCodec.h>
 
+
 Pager::Pager(std::string db_file): db_name(db_file), dbFile_handler(db_file, std::ios::in | std::ios::out | std::ios::binary) {
     if (!dbFile_handler.is_open() || dbFile_handler.fail()) {
         throw std::runtime_error("Error: Failed to open database file");
@@ -30,10 +31,7 @@ char *Pager::get(int page_num) {
         // Read from disk
         page = read_page_from_disk(page_num);
         // Add to cache
-        // TODO: wrap this arround in try catch or check the return status code
-        pCache->put(page);
-        // if FLUSH_CACHE
-        // call phase_one_commit
+        cache_put_or_throw(page);
     }
     page->refs_num += 1;
     if (page->refs_num == 1) pCache->pin_page(page_num);
@@ -48,7 +46,7 @@ bool Pager::begin_write(int page_num) {
     Page *page = pCache->get(page_num);
     if (!page) {
         page = read_page_from_disk(page_num);
-        pCache->put(page);
+        cache_put_or_throw(page);
     }
 
     // If page is already dirty, just return true
@@ -56,6 +54,7 @@ bool Pager::begin_write(int page_num) {
 
     // Mark page as dirty, save a copy of its image and add it to our dirty pages map.
     page->is_dirty = true;
+    page->need_flushing = true;
     DirtyPageEntry *new_entry = new DirtyPageEntry();
     std::memcpy(new_entry->backup_image, page->data, PAGE_SIZE);
     new_entry->page = page;
@@ -86,7 +85,7 @@ void Pager::unref_page(int page_num) {
     }
 
     page->refs_num--;
-    if (page->refs_num == 1) pCache->unpin_page(page_num);
+    if (page->refs_num == 0) pCache->unpin_page(page_num);
     return;
 }
 
@@ -249,6 +248,7 @@ void Pager::commit_phase_one() {
     for (auto it = dirty_pages.begin(); it != dirty_pages.end(); ) {
         DirtyPageEntry *dPage_entry = it->second;
         dPage_entry->page->is_dirty = false;
+        dPage_entry->page->need_flushing = false;
 
         // erase and advance
         delete dPage_entry;
@@ -369,10 +369,50 @@ Page *Pager::read_page_from_disk(int page_num) {
     // Make a new page object and initialize its members
     Page *page = new Page();
     page->page_num = page_num;
+    page->refs_num = 0;
     page->is_dirty = false;
+    page->need_flushing = false;
 
     // Make a span out of the page data array so it can be passed safely into read exact
     std::span<char> buffer_span(page->data);
     disk::read_exact(dbFile_handler, buffer_span);
     return page;
+}
+
+void Pager::handle_cache_eviction(const PCacheEviction &eviction) {
+    if (!eviction.happened || !eviction.was_dirty) return;
+
+    auto it = dirty_pages.find(eviction.page_num);
+    if (it == dirty_pages.end()) return;
+
+    delete it->second;
+    dirty_pages.erase(it);
+}
+
+void Pager::cache_put_or_throw(Page *page) {
+    PCachePutResult put_result = pCache->put(page);
+    if (put_result.status == PCacheResult::Success) {
+        handle_cache_eviction(put_result.eviction);
+        return;
+    }
+
+    if (put_result.status == PCacheResult::DirtyFlush) {
+        commit_phase_one();
+        put_result = pCache->put(page);
+        if (put_result.status == PCacheResult::Success) {
+            handle_cache_eviction(put_result.eviction);
+            return;
+        }
+    }
+
+    delete page;
+
+    if (put_result.status == PCacheResult::NoVictim) {
+        throw std::runtime_error("Error: Failed to cache page because no evictable page exists");
+    }
+    if (put_result.status == PCacheResult::DirtyFlush) {
+        throw std::runtime_error("Error: Failed to cache page after spill/flush retry");
+    }
+
+    throw std::runtime_error("Error: Failed to cache page");
 }
