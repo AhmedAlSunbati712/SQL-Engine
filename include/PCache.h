@@ -3,6 +3,18 @@
 #include <DLList.h>
 #include <Page.h>
 
+enum class PCacheError : std::uint8_t {
+	Success = 0,
+	PageInCache, // PCache::put
+	NoVictim, // PCache::put
+	DirtyFlush, // PCache::put
+	RemovingPinnedPage, // Possibly PCache::remove
+	PinningNonexistantPage, // PCache::pin_page
+	PinnedZeroRefsPage, // PCache::pin_page
+	UnpinningNonexistantPage, // PCache::unpin_page
+	UnpinnedNonZeroRefsPage, // PCache::unpin_page
+};
+
 class PCache {
     public:
 		PCache();
