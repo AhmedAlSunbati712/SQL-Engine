@@ -6,6 +6,7 @@
 #include <iostream>
 #include <JournalCodec.h>
 #include <cassert>
+#include <unordered_set>
 
 Pager::Pager() {
     pCache = new PCache();
@@ -92,16 +93,27 @@ PagerResult Pager::begin_write(int page_num) {
         if (cache_result != PagerResult::Success) return cache_result;
     }
 
-    // If page is already dirty, just return true
-    if (page->is_dirty) return PagerResult::Success;
+    // If page is already dirty and still needs flushing, just return
+    if (page->is_dirty && page->need_flushing) return PagerResult::Success;
+
+    // If page is already dirty but no longer needs flushing, mark it dirty for a new spill
+    if (page->is_dirty && !page->need_flushing) {
+        page->need_flushing = true;
+        return PagerResult::Success;
+    }
 
     // Mark page as dirty, save a copy of its image and add it to our dirty pages map.
     page->is_dirty = true;
     page->need_flushing = true;
-    DirtyPageEntry *new_entry = new DirtyPageEntry();
-    std::memcpy(new_entry->backup_image, page->data, PAGE_SIZE);
-    new_entry->page = page;
-    dirty_pages[page_num] = new_entry;
+    auto it = dirty_pages.find(page_num);
+    if (it == dirty_pages.end()) {
+        DirtyPageEntry *new_entry = new DirtyPageEntry();
+        std::memcpy(new_entry->backup_image, page->data, PAGE_SIZE);
+        new_entry->page = page;
+        dirty_pages[page_num] = new_entry;
+    } else {
+        it->second->page = page;
+    }
     return PagerResult::Success;
 }
 
@@ -326,15 +338,10 @@ PagerResult Pager::commit_phase_one() {
         return PagerResult::DbFlushFailed;
     }
 
-    // Now, go through the dirty pages and mark them as not dirty any more
-    for (auto it = dirty_pages.begin(); it != dirty_pages.end(); ) {
-        DirtyPageEntry *dPage_entry = it->second;
-        dPage_entry->page->is_dirty = false;
+    // Now, go through the dirty pages and mark them as not needing flushing any more
+    for (auto &[page_num, dPage_entry] : dirty_pages) {
+        dPage_entry->page->is_dirty = true;
         dPage_entry->page->need_flushing = false;
-
-        // erase and advance
-        delete dPage_entry;
-        it = dirty_pages.erase(it);
     }
     return PagerResult::Success;
 }
@@ -357,12 +364,28 @@ PagerResult Pager::commit_phase_two() {
     if (!jFile.is_open() || jFile.fail()) {
         return PagerResult::JournalTruncateFailed;
     }
+    // On successful commit, clear the transaction-associated dirty pages that we kept around
+    for (auto it = dirty_pages.begin(); it != dirty_pages.end(); ) {
+        DirtyPageEntry *dPage_entry = it->second;
+        if (dPage_entry->page) {
+            dPage_entry->page->is_dirty = false;
+            dPage_entry->page->need_flushing = false;
+        }
+        delete dPage_entry;
+        it = dirty_pages.erase(it);
+    }
     return PagerResult::Success;
 }
 
 PagerResult Pager::rollback_hot_journal() {
     /**
-     * 
+     * TODO: since we have multiple headers now, what we probably need to do is the following:
+     * while the current the current offset is not at the end of the journal file, read a number of bytes
+     * from disk equal to the size of a header. If it's not a valid header, seek to the end of this page and go to the next iteration
+     * if it's a valid header, get the number of pages that are in this sub-journal records and for i <- 1 to record_num (or wtvr):
+     *      read a page deserialize and validate and do all the stuff we are doing and rollback
+     * make sure we are at a page boundary. seek to the next smallest page boundary (or stay at the current one if its a page boundary)
+     * Then eventually go over each page in dirty pages and clean up by removing it from the cache. does that sound like a good plan?
      */
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
@@ -376,6 +399,10 @@ PagerResult Pager::rollback_hot_journal() {
     assert(valid_journal);
     if (!valid_journal) return PagerResult::JournalOpenFailed;
 
+    auto align_to_page_boundary = [](std::streamoff offset) -> std::streamoff {
+        return (offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    };
+
     // open the journal file and throw if we fail
     std::fstream jFile(jFile_name, std::ios::in | std::ios::out | std::ios::binary);
     if (!jFile.is_open() || jFile.fail()) {
@@ -383,70 +410,101 @@ PagerResult Pager::rollback_hot_journal() {
         oss << "Error (Pager.rollback_hot_journal, Pager object: " << static_cast<void *>(this) << " ): Failed to open rollback journal";
         return PagerResult::JournalOpenFailed;
     }
-
-    // Read the journal header from disk
-    char jHeader_bytes[JOURNAL_HEADER_SIZE];
+    std::size_t journal_file_size = 0;
     try {
-        disk::seek_read_to(jFile, 0);
-        disk::read_exact(jFile, jHeader_bytes);
+        journal_file_size = disk::file_size(jFile);
     } catch (const std::exception &) {
         return PagerResult::JournalOpenFailed;
     }
 
-    // Deserialize the bytes into an object
-    JournalHeader jHeader;
-    Journal::deserialize_jHeader(jHeader, jHeader_bytes);
-
-    bool is_valid_header = Journal::validate_journal_header(jHeader);
-    if (!is_valid_header) {
-        jFile.close();
+    std::unordered_set<int> restored_page_nums;
+    std::streamoff curr_offset = 0;
+    while (curr_offset < static_cast<std::streamoff>(journal_file_size)) {
+        // Read a number of bytes from disk equal to the size of a header.
+        char jHeader_bytes[JOURNAL_HEADER_SIZE];
         try {
-            std::filesystem::resize_file(jFile_name, 0);
+            disk::seek_read_to(jFile, curr_offset);
+            disk::read_exact(jFile, jHeader_bytes);
         } catch (const std::exception &) {
-            return PagerResult::JournalTruncateFailed;
-        }
-        return PagerResult::JournalCorrupt;
-    }
-
-    // Read number of pages that are to be recovered
-    int page_count = jHeader.page_count;
-
-    // Now read each page and recover it into the db
-    for (int i = 1; i <= page_count; i++) {
-        // Read record bytes
-        char jPage_record_bytes[JOURNAL_PAGE_RECORD];
-        std::streamoff j_offset = static_cast<std::streamoff>(i) * static_cast<std::streamoff>(PAGE_SIZE);
-        try {
-            disk::seek_read_to(jFile, j_offset);
-            disk::read_exact(jFile, jPage_record_bytes);
-        } catch (const std::exception &) {
-            return PagerResult::RollbackRecordCorrupt;
+            return PagerResult::JournalOpenFailed;
         }
 
-        // Deserialize into a JournalPageRecord object
-        JournalPageRecord jPage_record;
-        Journal::deserialize_jPage_record(jPage_record, jPage_record_bytes);
+        // Deserialize the bytes into an object
+        JournalHeader jHeader;
+        Journal::deserialize_jHeader(jHeader, jHeader_bytes);
 
-        // validate checksum of the page
-        bool is_valid_record = Journal::validate_journal_record_checksum(jPage_record, jHeader);
-        if (!is_valid_record) {
-            break;
+        // If it's not a valid header, seek to the end of this page and go to the next iteration
+        bool is_valid_header = Journal::validate_journal_header(jHeader);
+        if (!is_valid_header) {
+            curr_offset += PAGE_SIZE;
+            continue;
         }
 
-        // Now seek into the write position in the db to write back this image
-        int db_page_num = jPage_record.page_num;
-        std::streamoff db_offset = static_cast<std::streamoff>(db_page_num) * static_cast<std::streamoff>(PAGE_SIZE);
-        try {
-            disk::seek_write_to(dbFile_handler, db_offset);
-            disk::write_exact(dbFile_handler, jPage_record.data);
-        } catch (const std::exception &) {
-            return PagerResult::DbWriteFailed;
+        // If it's a valid header, get the number of pages that are in this sub-journal records
+        int page_count = jHeader.page_count;
+        std::streamoff records_offset = curr_offset + static_cast<std::streamoff>(PAGE_SIZE);
+
+        // and for i <- 1 to record_num (or wtvr):
+        //      read a page deserialize and validate and do all the stuff we are doing and rollback
+        for (int i = 0; i < page_count; i++) {
+            char jPage_record_bytes[JOURNAL_PAGE_RECORD];
+            std::streamoff j_offset = records_offset + static_cast<std::streamoff>(i) * static_cast<std::streamoff>(JOURNAL_PAGE_RECORD);
+            try {
+                disk::seek_read_to(jFile, j_offset);
+                disk::read_exact(jFile, jPage_record_bytes);
+            } catch (const std::exception &) {
+                return PagerResult::RollbackRecordCorrupt;
+            }
+
+            // Deserialize into a JournalPageRecord object
+            JournalPageRecord jPage_record;
+            Journal::deserialize_jPage_record(jPage_record, jPage_record_bytes);
+
+            // validate checksum of the page
+            bool is_valid_record = Journal::validate_journal_record_checksum(jPage_record, jHeader);
+            if (!is_valid_record) {
+                break;
+            }
+
+            // Skip repeated pages. The first valid record we see for a page wins.
+            int db_page_num = jPage_record.page_num;
+            if (restored_page_nums.find(db_page_num) != restored_page_nums.end()) {
+                continue;
+            }
+            restored_page_nums.insert(db_page_num);
+
+            // Now seek into the write position in the db to write back this image
+            std::streamoff db_offset = static_cast<std::streamoff>(db_page_num) * static_cast<std::streamoff>(PAGE_SIZE);
+            try {
+                disk::seek_write_to(dbFile_handler, db_offset);
+                disk::write_exact(dbFile_handler, jPage_record.data);
+            } catch (const std::exception &) {
+                return PagerResult::DbWriteFailed;
+            }
         }
+
+        // make sure we are at a page boundary. seek to the next smallest page boundary (or stay at the current one if its a page boundary)
+        curr_offset = align_to_page_boundary(records_offset + static_cast<std::streamoff>(page_count) * static_cast<std::streamoff>(JOURNAL_PAGE_RECORD));
     }
     // Need to flush and sync probably here
     dbFile_handler.flush();
     if (dbFile_handler.bad() || dbFile_handler.fail()) {
         return PagerResult::DbFlushFailed;
+    }
+    try {
+        disk::sync_file_to_disk(db_name);
+    } catch (const std::exception &) {
+        return PagerResult::DbFlushFailed;
+    }
+
+    // Then eventually go over each page in dirty pages and clean up by removing it from the cache.
+    for (auto it = dirty_pages.begin(); it != dirty_pages.end(); ) {
+        int page_num = it->first;
+        PCacheResult remove_result = pCache->remove(page_num);
+        assert(remove_result != PCacheResult::RemovingPinnedPage);
+
+        delete it->second;
+        it = dirty_pages.erase(it);
     }
 
     if (jFile.is_open()) jFile.close();
