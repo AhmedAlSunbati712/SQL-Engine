@@ -214,10 +214,9 @@ PagerResult Pager::commit_phase_one() {
         }
         jFile.seekp(0, std::ios::end); // Seek to the end of the file (after the most recent backup image appended)
     }
-    // TODO: seek to the next page boundary.
-    // do a ceiling operation on the boundary to align to the least next page boundary (which could be the current one)
-    // std::streamoff curr_offset = disk::get_curr_wirte(jFile);
-    // curr_offset = ceil(curr_offset)
+
+    // A header should start on a page boundary so seek the smallest next page boundary
+    // or stay on the current one if it's already a page boundary
     std::streamoff curr_offset = 0;
     try {
         curr_offset = disk::get_curr_write_offset(jFile);
@@ -226,7 +225,7 @@ PagerResult Pager::commit_phase_one() {
     }
     curr_offset = (curr_offset + PAGE_SIZE - 1) & ~(PAGE_SIZE  - 1);
 
-    // Create the header either way (this is for the new patch of pages)
+    // Create the new header
     jHeader.nonce = Journal::generate_nonce();
     jHeader.init_db_page_count = 0; // TODO: Change this when we are tracking db page count
     jHeader.page_count = 0;
@@ -263,9 +262,6 @@ PagerResult Pager::commit_phase_one() {
             char jPage_record_bytes[JOURNAL_PAGE_RECORD];
             Journal::serialize_jPage_record(jPage_record, jPage_record_bytes);
 
-            // Should wrap this step in try catch. Caller can either try to call again or abort the transaction
-            // Return code: FAIL_WRITE_RECORD
-            // Caller options: abort & rollback or try again
             try {
                 disk::write_exact(jFile, jPage_record_bytes);
             } catch (const std::exception &) {
@@ -275,13 +271,14 @@ PagerResult Pager::commit_phase_one() {
             // 
         }
     }
-    // TODO: Future me is going to be so pissed off that we have to rewrite all of this with the POSIX file utils
-    // Flush the journal pages to disk
-    // Actually!! c++ introduced native handle on file streams. fsync(jFile.native_handle)
+    // Flush and sync file to disk
     jFile.flush();
     if (jFile.bad() || jFile.fail()) {
-        // need to rollback and invalidate any dirty pages
-        // Return status code: FAILED_FLUSH_JOURNAL
+        return PagerResult::JournalFlushFailed;
+    }
+    try {
+        disk::sync_file_to_disk(jFile_name);
+    } catch (const std::exception &) {
         return PagerResult::JournalFlushFailed;
     }
     // Now write the journal header and flush again
@@ -294,30 +291,38 @@ PagerResult Pager::commit_phase_one() {
         return PagerResult::JournalHeaderWriteFailed;
     }
 
-    // Flush again
+    // Flush again and sync to disk
     jFile.flush();
     if (jFile.bad() || jFile.fail()) {
         // need to rollback and invalidate any dirty pages
         // Return status code: FAILED_FLUSH_JOURNAL
         return PagerResult::JournalFlushFailed;
     }
+    try {
+        disk::sync_file_to_disk(jFile_name);
+    } catch (const std::exception &) {
+        return PagerResult::JournalFlushFailed;
+    }
 
     // Now, we need to iterate through the dirty pages again, this time to write the change db pages to disk
     for (const auto &[page_num, dPage_entry] : dirty_pages) {
         std::span<char> new_page_data(dPage_entry->page->data);
-        // TODO: Is it more efficient to seek from beginning of the file or to seek from current position?
         // Seek to the correct write offset and write the data to disk
         try {
             disk::seek_write_to(dbFile_handler, static_cast<std::streamoff>(static_cast<std::streamoff>(page_num) * static_cast<std::streamoff>(PAGE_SIZE)));
-            // TODO: probably need a fallback here that if an error is thrown here, we need to rollback. A rollback will also need to invalidate the cache as it's reading
             disk::write_exact(dbFile_handler, new_page_data);
         } catch (const std::exception &) {
             return PagerResult::DbWriteFailed;
         }
     }
-    // Flush db pages to disk
+    // Flush db pages to disk and sync
     dbFile_handler.flush();
     if (dbFile_handler.bad() || dbFile_handler.fail()) {
+        return PagerResult::DbFlushFailed;
+    }
+    try {
+        disk::sync_file_to_disk(db_name);
+    } catch (const std::exception &) {
         return PagerResult::DbFlushFailed;
     }
 
@@ -350,8 +355,6 @@ PagerResult Pager::commit_phase_two() {
     // There's a journal that has content, therefore we need to truncate it.
     std::fstream jFile(jFile_name, std::ios::out | std::ios::trunc | std::ios::binary);
     if (!jFile.is_open() || jFile.fail()) {
-        std::ostringstream oss;
-        oss << "Error (Pager.commit_phase_two, Pager object: " << static_cast<void *>(this) << " ): Failed to truncate journal file";
         return PagerResult::JournalTruncateFailed;
     }
     return PagerResult::Success;

@@ -2,6 +2,9 @@
 #include <span>
 #include <fstream>
 #include <stdexcept>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 
 // An assumption that is made throughout here is that a file is already open.
 namespace disk {
@@ -70,5 +73,32 @@ namespace disk {
             throw std::runtime_error("Error (write_exact): Failed to write to file!");
         }
         return;
+    }
+
+    void sync_file_to_disk(const std::string& path) {
+        int fd = ::open(path.c_str(), O_RDWR);
+        if (fd == -1) {
+            throw std::runtime_error("Error (sync_file_to_disk): Failed to open file for sync!");
+        }
+
+#ifdef __APPLE__
+        if (::fcntl(fd, F_FULLFSYNC) == -1) {
+            int saved_errno = errno;
+            ::close(fd);
+            errno = saved_errno;
+            throw std::runtime_error("Error (sync_file_to_disk): Failed to fully sync file!");
+        }
+#else
+        if (::fsync(fd) == -1) {
+            int saved_errno = errno;
+            ::close(fd);
+            errno = saved_errno;
+            throw std::runtime_error("Error (sync_file_to_disk): Failed to sync file!");
+        }
+#endif
+
+        if (::close(fd) == -1) {
+            throw std::runtime_error("Error (sync_file_to_disk): Failed to close synced file descriptor!");
+        }
     }
 }
