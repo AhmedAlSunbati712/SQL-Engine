@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <Page.h>
 #include <unordered_set>
 #include <fstream>
@@ -6,29 +7,58 @@
 #include <string.h>
 #include <Journal.h>
 
+enum class PagerResult : std::uint8_t {
+    Success = 0,
+    DatabaseNotOpen,
+    OpenDbFailed,
+    DbReadFailed,
+    NoEvictablePage,
+    CacheSpillFailed,
+    JournalCreateFailed,
+    JournalOpenFailed,
+    JournalCorrupt,
+    JournalRecordWriteFailed,
+    JournalHeaderWriteFailed,
+    JournalFlushFailed,
+    DbWriteFailed,
+    DbFlushFailed,
+    JournalTruncateFailed,
+    RollbackRecordCorrupt,
+};
 
+struct PagerGetResult {
+    PagerResult status = PagerResult::Success;
+    char *data = nullptr;
+};
 
 class Pager {
 	public:
-		Pager(std::string db_file);
+		Pager();
 		~Pager();
-		char *get(int page_num);
-		bool begin_write(int page_num);
-		void ref_page(int page_num); // increment page ref nums. if page.num_refs == 1, call pcache.pin_page(page_num)
-		void unref_page(int page_num); // decrement page ref nums. if page.num_refs == 0 call pcache.unpin_page(int page_num);
-		void commit_phase_one();
-		void commit_phase_two();
-		void rollback_hot_journal();
+		PagerResult open(std::string db_file);
+		PagerGetResult get(int page_num);
+		PagerResult begin_write(int page_num);
+		PagerResult ref_page(int page_num); // increment page ref nums. if page.num_refs == 1, call pcache.pin_page(page_num)
+		PagerResult unref_page(int page_num); // decrement page ref nums. if page.num_refs == 0 call pcache.unpin_page(int page_num);
+		PagerResult commit_phase_one();
+		PagerResult commit_phase_two();
+		PagerResult rollback_hot_journal();
 	private:
+		struct PagerReadPageResult {
+			PagerResult status = PagerResult::Success;
+			Page *page = nullptr;
+		};
+
 		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
 
 		std::fstream dbFile_handler;
 
 		std::string db_name;
 		std::string jFile_name;
-		PCache *pCache;
+		PCache *pCache = nullptr;
+		bool is_open = false;
 
 		void handle_cache_eviction(const PCacheEviction &eviction);
-		void cache_put_or_throw(Page *page);
-		Page *read_page_from_disk(int page_num);
+		PagerResult cache_put(Page *page);
+		PagerReadPageResult read_page_from_disk(int page_num);
 };
