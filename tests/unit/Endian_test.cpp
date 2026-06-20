@@ -58,4 +58,4 @@ TEST(EndianTest, RoundTripMixedByteValue) {
     EXPECT_EQ(value, 0xA1B2C3D4u);
 }
 
-} // namespace
+}
