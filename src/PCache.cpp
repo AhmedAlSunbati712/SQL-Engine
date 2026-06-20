@@ -11,8 +11,7 @@ PCache::~PCache() {
     auto iterator = cache_map.begin();
     while (iterator != cache_map.end()) {
         delete iterator->second;
-        cache_map.erase(iterator->first);
-        iterator = std::next(iterator);
+        iterator = cache_map.erase(iterator);
     }
 
     // Free up the unpinned pages list
