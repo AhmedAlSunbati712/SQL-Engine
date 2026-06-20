@@ -2,3 +2,4 @@ AGENTS.md
 SQLite Database System Design and Implementation (Sibsankar Haldar) (Z-Library)-2.pdf
 .vscode
 *.o
+build/

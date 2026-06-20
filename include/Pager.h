@@ -4,7 +4,6 @@
 #include <unordered_set>
 #include <fstream>
 #include <PCache.h>
-#include <string.h>
 #include <Journal.h>
 
 enum class PagerResult : std::uint8_t {

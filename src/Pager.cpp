@@ -6,6 +6,7 @@
 #include <iostream>
 #include <JournalCodec.h>
 #include <cassert>
+#include <cstring>
 #include <unordered_set>
 
 Pager::Pager() {
