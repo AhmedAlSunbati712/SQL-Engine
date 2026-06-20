@@ -31,9 +31,22 @@ PagerResult Pager::open(std::string db_file) {
         return PagerResult::OpenDbFailed;
     }
 
+
+
     db_name = db_file;
     jFile_name = db_file + "_journal";
     is_open = true;
+    write_txn_state = WriteTxnState::None;
+
+    PagerResult recovery_result = maybe_recover_hot_journal();
+    if (recovery_result != PagerResult::Success) {
+        if (dbFile_handler.is_open()) dbFile_handler.close();
+        db_name.clear();
+        jFile_name.clear();
+        is_open = false;
+        write_txn_state = WriteTxnState::None;
+        return recovery_result;
+    }
     return PagerResult::Success;
 }
 
@@ -47,6 +60,12 @@ PagerGetResult Pager::get(int page_num) {
     PagerGetResult result;
     if (!is_open) {
         result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+
+    PagerResult recovery_result = maybe_recover_hot_journal();
+    if (recovery_result != PagerResult::Success) {
+        result.status = recovery_result;
         return result;
     }
 
@@ -83,6 +102,9 @@ PagerResult Pager::begin_write(int page_num) {
     */
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
+    PagerResult recovery_result = maybe_recover_hot_journal();
+    if (recovery_result != PagerResult::Success) return recovery_result;
+
     Page *page = pCache->get(page_num);
     if (!page) {
         PagerReadPageResult read_result = read_page_from_disk(page_num);
@@ -98,11 +120,15 @@ PagerResult Pager::begin_write(int page_num) {
 
     // If page is already dirty but no longer needs flushing, mark it dirty for a new spill
     if (page->is_dirty && !page->need_flushing) {
+        assert(write_txn_state != WriteTxnState::None);
         page->need_flushing = true;
         return PagerResult::Success;
     }
 
     // Mark page as dirty, save a copy of its image and add it to our dirty pages map.
+    if (write_txn_state == WriteTxnState::None) {
+        write_txn_state = WriteTxnState::DirtyInMemory;
+    }
     page->is_dirty = true;
     page->need_flushing = true;
     auto it = dirty_pages.find(page_num);
@@ -156,19 +182,21 @@ PagerResult Pager::commit_phase_one() {
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     // First of all, check if there are any dirty pages to begin with. If there isn't, just return
-    if (dirty_pages.size() == 0) {
+    bool has_pages_to_flush = false;
+    for (const auto &[page_num, dPage_entry] : dirty_pages) {
+        (void)page_num;
+        if (dPage_entry->page && dPage_entry->page->need_flushing) {
+            has_pages_to_flush = true;
+            break;
+        }
+    }
+    if (!has_pages_to_flush) {
         return PagerResult::Success;
     }
     // Check if the journal file exists
     bool journal_exists = false;
-    try {
-        journal_exists = std::filesystem::exists(jFile_name);
-        if (journal_exists) {
-            journal_exists = !std::filesystem::is_empty(jFile_name);
-        }
-    } catch (const std::exception &) {
-        return PagerResult::JournalOpenFailed;
-    }
+    PagerResult journal_check = journal_has_contents(journal_exists);
+    if (journal_check != PagerResult::Success) return journal_check;
     JournalHeader jHeader;
     
     std::fstream jFile;
@@ -228,7 +256,7 @@ PagerResult Pager::commit_phase_one() {
     } catch (const std::exception &) {
         return PagerResult::JournalHeaderWriteFailed;
     }
-    curr_offset = (curr_offset + PAGE_SIZE - 1) & ~(PAGE_SIZE  - 1);
+    curr_offset = align_to_page_boundary(curr_offset);
 
     // Create the new header
     jHeader.nonce = Journal::generate_nonce();
@@ -307,6 +335,7 @@ PagerResult Pager::commit_phase_one() {
     } catch (const std::exception &) {
         return PagerResult::JournalFlushFailed;
     }
+    write_txn_state = WriteTxnState::JournalDurable;
 
     // Now, we need to iterate through the dirty pages again, this time to write the change db pages to disk
     for (const auto &[page_num, dPage_entry] : dirty_pages) {
@@ -340,14 +369,12 @@ PagerResult Pager::commit_phase_one() {
 
 PagerResult Pager::commit_phase_two() {
     if (!is_open) return PagerResult::DatabaseNotOpen;
+    assert(write_txn_state != WriteTxnState::DirtyInMemory);
 
     // Check if there doesn't exist any journal. In that case, we can't commit. Throw an error
     bool valid_journal = false;
-    try {
-        valid_journal = std::filesystem::exists(jFile_name) && !std::filesystem::is_empty(jFile_name);
-    } catch (const std::exception &) {
-        return PagerResult::JournalTruncateFailed;
-    }
+    PagerResult journal_check = journal_has_contents(valid_journal);
+    if (journal_check != PagerResult::Success) return PagerResult::JournalTruncateFailed;
     assert(valid_journal);
     if (!valid_journal) return PagerResult::JournalTruncateFailed;
 
@@ -366,7 +393,19 @@ PagerResult Pager::commit_phase_two() {
         delete dPage_entry;
         it = dirty_pages.erase(it);
     }
+    write_txn_state = WriteTxnState::None;
     return PagerResult::Success;
+}
+
+PagerResult Pager::rollback_transaction() {
+    if (!is_open) return PagerResult::DatabaseNotOpen;
+
+    if (write_txn_state == WriteTxnState::None) return PagerResult::Success;
+    if (write_txn_state == WriteTxnState::DirtyInMemory) {
+        return cleanup_transaction_cache();
+    }
+
+    return rollback_hot_journal();
 }
 
 PagerResult Pager::rollback_hot_journal() {
@@ -383,23 +422,19 @@ PagerResult Pager::rollback_hot_journal() {
 
     // Check if there's a valid journal on disk. throw if there isn't
     bool valid_journal = false;
-    try {
-        valid_journal = std::filesystem::exists(jFile_name) && !std::filesystem::is_empty(jFile_name);
-    } catch (const std::exception &) {
+    PagerResult journal_check = journal_has_contents(valid_journal);
+    if (journal_check != PagerResult::Success) return PagerResult::JournalOpenFailed;
+    if (!valid_journal) {
+        if (write_txn_state == WriteTxnState::DirtyInMemory) {
+            return cleanup_transaction_cache();
+        }
+        assert(write_txn_state != WriteTxnState::JournalDurable);
         return PagerResult::JournalOpenFailed;
     }
-    assert(valid_journal);
-    if (!valid_journal) return PagerResult::JournalOpenFailed;
-
-    auto align_to_page_boundary = [](std::streamoff offset) -> std::streamoff {
-        return (offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    };
 
     // open the journal file and throw if we fail
     std::fstream jFile(jFile_name, std::ios::in | std::ios::out | std::ios::binary);
     if (!jFile.is_open() || jFile.fail()) {
-        std::ostringstream oss;
-        oss << "Error (Pager.rollback_hot_journal, Pager object: " << static_cast<void *>(this) << " ): Failed to open rollback journal";
         return PagerResult::JournalOpenFailed;
     }
     std::size_t journal_file_size = 0;
@@ -507,26 +542,85 @@ PagerResult Pager::rollback_hot_journal() {
         return PagerResult::DbFlushFailed;
     }
 
-    // Then eventually go over each page in dirty pages and clean up by removing it from the cache.
-    for (auto it = dirty_pages.begin(); it != dirty_pages.end(); ) {
-        int page_num = it->first;
-        PCacheResult remove_result = pCache->remove(page_num);
-        assert(remove_result != PCacheResult::RemovingPinnedPage);
-
-        delete it->second;
-        it = dirty_pages.erase(it);
-    }
-
     if (jFile.is_open()) jFile.close();
     try {
         std::filesystem::resize_file(jFile_name, 0);
     } catch (const std::exception &) {
         return PagerResult::JournalTruncateFailed;
     }
+
+    if (write_txn_state != WriteTxnState::None || !dirty_pages.empty()) {
+        return cleanup_transaction_cache();
+    }
     return PagerResult::Success;
 }
 
 /** Private helpers */
+
+PagerResult Pager::journal_has_contents(bool &has_contents) {
+    has_contents = false;
+    try {
+        has_contents = std::filesystem::exists(jFile_name);
+        if (has_contents) {
+            has_contents = !std::filesystem::is_empty(jFile_name);
+        }
+    } catch (const std::exception &) {
+        return PagerResult::JournalOpenFailed;
+    }
+    return PagerResult::Success;
+}
+
+PagerResult Pager::maybe_recover_hot_journal() {
+    // This is mainly used in the following places:
+    // - Opening a db: If we try to open a db, and then find that there's a hot journal, we need to rollback
+    // - Get: A process calling get could either be the process doing the write transaction or another process 
+    //        that is reading after a writer process crashed. In the first case, we don't want to rollback. that's
+    //        what the if statement is doing. In the latter, we do want to rollback
+    // - begin_write: similar reasoning
+    if (write_txn_state != WriteTxnState::None) return PagerResult::Success;
+
+    bool hot_journal_exists = false;
+    PagerResult journal_check = journal_has_contents(hot_journal_exists);
+    if (journal_check != PagerResult::Success) return journal_check;
+    if (!hot_journal_exists) return PagerResult::Success;
+
+    return rollback_hot_journal();
+}
+
+PagerResult Pager::cleanup_transaction_cache() {
+    // This invalidates the current dirty pages in cache for recovery from a failed write transaction
+    // called in rollback_hot_journal only iff the process calling rollback is the one that was doing the transaction
+    // or if the dirty pages list is not empty
+
+    for (auto it = dirty_pages.begin(); it != dirty_pages.end(); ) {
+        int page_num = it->first;
+        DirtyPageEntry *dPage_entry = it->second;
+        Page *cached_page = pCache->get(page_num);
+
+        if (!cached_page) {
+            delete dPage_entry;
+            it = dirty_pages.erase(it);
+            continue;
+        }
+
+        // if the page is pinned, don't kick it out from the cache to avoid dangling refs
+        // but copy the original image into it tho.
+        if (cached_page->refs_num > 0) {
+            std::memcpy(cached_page->data, dPage_entry->backup_image, PAGE_SIZE);
+            cached_page->is_dirty = false;
+            cached_page->need_flushing = false;
+        } else {
+            PCacheResult remove_result = pCache->remove(page_num);
+            assert(remove_result == PCacheResult::Success);
+        }
+
+        delete dPage_entry;
+        it = dirty_pages.erase(it);
+    }
+
+    write_txn_state = WriteTxnState::None;
+    return PagerResult::Success;
+}
 
 Pager::PagerReadPageResult Pager::read_page_from_disk(int page_num) {
     // We need too check if the cache has enough space for a read

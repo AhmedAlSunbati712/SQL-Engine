@@ -9,6 +9,7 @@
 - We know that we are not taking up more than 4KB when loading from disk. We can just then allocate a static array for the data so it lives in the same block of contiguous memory as the page, instead of storing a pointer to another region in the heap and having to deal with allocations and frees. Hence, `char data[4096]`
 - Bookkeeping fields: `page_num`, `refs_num` the number of transactions pinning down this page (actively using it).
 - `is_dirty.` We need this for a couple of reasons. First of all, for bookkeeping in the case that we call `get` to read a page and for some reason want to check if it’s dirty or not. The other reason is for journaling purposes. A page that has been marked dirty means that we already have a backup of it in the journal, so no need to back it up again. The third reason is that during LRU Page eviction, it might happen that the victim page to evict happens to be a dirty page. If that’s the case, we need to flush it to disk, and possibly flush the journal too. We need a way to find that out quickly, and having a boolean flag for that is the easiest way.
+- `need_flushing.` This tells us whether a dirty page still needs to participate in the next journal spill / phase-one flush. A page can remain dirty after phase one, but stop needing another flush until it is written again.
 
 ```cpp
 struct Page {
@@ -16,7 +17,7 @@ struct Page {
 	int page_num;
 	int refs_num;
 	bool is_dirty;
-	bool need_to_flush_journal;
+	bool need_flushing;
 }
 ```
 
@@ -48,20 +49,29 @@ class PCache {
 ```cpp
 class Pager {
 	public:
-		Pager(std::string db_file);
-		char[] get(int page_num);
-		bool write(int page_num);
-		bool commit_phase_one();
-		bool commit_phase_two();
+		Pager();
+		PagerResult open(std::string db_file);
+		PagerGetResult get(int page_num);
+		PagerResult begin_write(int page_num);
+		PagerResult commit_phase_one();
+		PagerResult commit_phase_two();
+		PagerResult rollback_transaction();
+		PagerResult rollback_hot_journal();
 	private:
-		std::unordered_set<Page *> dirty_pages;
+		enum class WriteTxnState : std::uint8_t {
+			None = 0,
+			DirtyInMemory,
+			JournalDurable,
+		};
+
+		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
 
 		std::fstream dbFile_handler;
-		std::fstream jFile_handler;
 
-		std::string database_name;
+		std::string db_name;
 		std::string jFile_name;
 		PCache *pCache;
+		WriteTxnState write_txn_state;
 }
 ```
 
@@ -102,8 +112,18 @@ class DLList {
 - No two `Page` objects will hold refs to the same page_num. NOT ALLOWED.
 - Before phase one commit, every dirty page must have a corresponding rollback journal record in memory. After phase one commit, the journal is securely on disk.
 - Before phase two commit, the journal is flushed to disk. After phase two commit, the dirty pages are flushed to disk and the journal is truncated. **Open question:** How do we ensure that the What
+- `WriteTxnState::DirtyInMemory` means the current transaction can still be rolled back entirely from the pager's in-memory backup images.
+- `WriteTxnState::JournalDurable` means this transaction has already crossed the durable-journal boundary, so abort must go through hot-journal recovery semantics rather than memory-only cleanup.
 
 ## State Transitions / Lifecycle
+
+- `None -> DirtyInMemory` on the first successful `begin_write()` of a clean page.
+- `DirtyInMemory -> JournalDurable` once phase one finishes making the rollback journal durable on disk.
+- `JournalDurable` is sticky for the remainder of the transaction, even if the current dirty set later becomes empty because of cache spill.
+- `rollback_transaction()` is the explicit local abort entrypoint:
+  - if state is `DirtyInMemory`, it invalidates / restores the dirty cached pages from `backup_image`
+  - if state is `JournalDurable`, it delegates to `rollback_hot_journal()`
+- `rollback_hot_journal()` handles crash recovery and any abort path that already touched durable journal state on disk.
 
 ## Control Flow
 

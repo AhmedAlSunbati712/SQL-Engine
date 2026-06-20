@@ -42,11 +42,18 @@ class Pager {
 		PagerResult unref_page(int page_num); // decrement page ref nums. if page.num_refs == 0 call pcache.unpin_page(int page_num);
 		PagerResult commit_phase_one();
 		PagerResult commit_phase_two();
+		PagerResult rollback_transaction();
 		PagerResult rollback_hot_journal();
 	private:
 		struct PagerReadPageResult {
 			PagerResult status = PagerResult::Success;
 			Page *page = nullptr;
+		};
+
+		enum class WriteTxnState : std::uint8_t {
+			None = 0,
+			DirtyInMemory,
+			JournalDurable,
 		};
 
 		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
@@ -57,8 +64,12 @@ class Pager {
 		std::string jFile_name;
 		PCache *pCache = nullptr;
 		bool is_open = false;
+		WriteTxnState write_txn_state = WriteTxnState::None;
 
 		void handle_cache_eviction(const PCacheEviction &eviction);
 		PagerResult cache_put(Page *page);
+		PagerResult journal_has_contents(bool &has_contents);
+		PagerResult maybe_recover_hot_journal();
+		PagerResult cleanup_transaction_cache();
 		PagerReadPageResult read_page_from_disk(int page_num);
 };
