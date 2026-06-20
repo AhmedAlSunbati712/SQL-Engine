@@ -13,13 +13,17 @@ jobs:
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
-      
+
       - name: Install dependencies
         run: |
-            sudo apt-get update
-            sudo apt-get install -y g++ make cmake libgtest-dev
-      - name: build
+          sudo apt-get update
+          sudo apt-get install -y g++ make libgtest-dev
+
+      - name: Build
         run: make all
-      
-      - name: Run tests
-        run: make test
+
+      - name: Run Unit tests
+        run: make test-unit
+
+      - name: Run Integration tests
+        run: make test-integration
