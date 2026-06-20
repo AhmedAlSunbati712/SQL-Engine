@@ -3,16 +3,23 @@ name: CI Pipeline
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+  workflow-dispatch:
 
 jobs:
-  test:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
-
-      - name: Unit Testing
-        run: make unit-test
-
-      - name: Integration Testing
-        run: make integration-test
+      
+      - name: Install dependencies
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y g++ make cmake libgtest-dev
+      - name: build
+        run: make all
+      
+      - name: Run tests
+        run: make test
