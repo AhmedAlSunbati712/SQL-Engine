@@ -96,6 +96,10 @@ PCachePutResult PCache::put(Page *page) {
     // Saving the page in our cache.
     cache_map[page->page_num] = page;
     length++;
+    if (page->refs_num == 0) {
+        assert(!unpinned_pages->exists(page_num));
+        unpinned_pages->add(page_num, page);
+    }
     result.status = PCacheResult::Success;
     return result;
 }
@@ -127,15 +131,17 @@ void PCache::pin_page(int page_num) {
     auto it = cache_map.find(page_num);
     assert(it != cache_map.end());
 
-    // If page is not pinned, pin it
+    // Pager increments refs_num before calling this helper.
     Page *page = it->second;
-    if (page->refs_num == 0) {
-        // Does the page have no refs and exists in unpinned pages?
-        // and remove it from unpinned pages
-        assert(unpinned_pages->exists(page_num));
+    assert(page->refs_num > 0);
+
+    if (page->refs_num == 1 && unpinned_pages->exists(page_num)) {
+        // A 0 -> 1 transition means the page is no longer evictable.
         unpinned_pages->remove(page_num);
+    } else {
+        assert(page->refs_num == 1 || !unpinned_pages->exists(page_num));
     }
-    // Don't increment refs. this will be done by the pager
+    // Don't increment refs_num. this will be done by the pager
 }
 
 void PCache::unpin_page(int page_num) {
@@ -143,19 +149,13 @@ void PCache::unpin_page(int page_num) {
     auto it = cache_map.find(page_num);
     assert(it != cache_map.end());
 
-    // if page is pinned, unpin it
+    // Pager decrements refs_num before calling this helper.
     Page *page = it->second;
-    if (page->refs_num == 0) {
-        // Page has one ref (that is being unpinned by this call)
-        // The sceond condition is just a sanity check. if it has a non-zero refs_num,
-        // it shouldn't be in the unpinned pages
+    assert(page->refs_num == 0);
 
-        // add to the unpinned_pages
-        assert(!unpinned_pages->exists(page_num));
-        unpinned_pages->add(page_num, page);
-    } else {
-        assert(page->refs_num == 0 || !unpinned_pages->exists(page_num));
-    }
+    // add to the unpinned_pages
+    assert(!unpinned_pages->exists(page_num));
+    unpinned_pages->add(page_num, page);
     // don't change refs_num. this will be done by the pager
 }
 
