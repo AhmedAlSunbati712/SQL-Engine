@@ -134,10 +134,28 @@ TEST(DiskIOTest, GetCurrWriteOffsetReturnsCurrentWritePosition) {
     EXPECT_EQ(offset, 3);
 }
 
+TEST(DiskIOTest, GetCurrReadOffsetReturnsCurrentReadPosition) {
+    TempFile temp_file;
+    write_file_bytes(temp_file.path, "abcdef");
+
+    std::fstream file(temp_file.path, std::ios::in | std::ios::binary);
+    disk::seek_read_to(file, 4);
+
+    std::streamoff offset = disk::get_curr_read_offset(file);
+
+    EXPECT_EQ(offset, 4);
+}
+
 TEST(DiskIOTest, GetCurrWriteOffsetThrowsForClosedFile) {
     std::fstream file;
 
     EXPECT_THROW(disk::get_curr_write_offset(file), std::runtime_error);
+}
+
+TEST(DiskIOTest, GetCurrReadOffsetThrowsForClosedFile) {
+    std::fstream file;
+
+    EXPECT_THROW(disk::get_curr_read_offset(file), std::runtime_error);
 }
 
 TEST(DiskIOTest, SyncFileToDiskSucceedsForExistingFile) {
