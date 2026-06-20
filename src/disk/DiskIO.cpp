@@ -75,6 +75,15 @@ namespace disk {
         return;
     }
 
+    std::streamoff get_curr_write_offset(std::fstream& file) {
+        file.clear();
+        std::streamoff curr = file.tellp();
+        if (curr == static_cast<std::streamoff>(-1)) {
+            throw std::runtime_error("Error (get_curr_write_offset): Failed to read current write offset!");
+        }
+        return curr;
+    }
+
     void sync_file_to_disk(const std::string& path) {
         int fd = ::open(path.c_str(), O_RDWR);
         if (fd == -1) {

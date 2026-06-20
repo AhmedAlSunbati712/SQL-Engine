@@ -14,7 +14,6 @@ namespace Journal {
     }
 
     void deserialize_jHeader(JournalHeader &jHeader, char *in) {
-        const unsigned char expected_magic[8] = {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7};
         for (int i = 0; i < 8; i++) {
             jHeader.magic[i] = static_cast<unsigned char>(in[i]);
         }
