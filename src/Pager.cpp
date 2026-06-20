@@ -192,12 +192,8 @@ PagerResult Pager::commit_phase_one() {
 
         // open without the truncate flag, read the header, deserialize it and start at the end of the file
         jFile.open(jFile_name, std::ios::in | std::ios::out | std::ios::binary);
-        // In case reading failed:
-        // Return code: FAILED_TO_OPEN_JOURNAL
-        // In this case, the caller can either try again or abort the transaction
-        // In case of aborting the transaction, they need to do the following:
-        // Invalidate dirty pages. Invalidate the previously dirty pages (how to do that? maybe need the need_to_flush flag back)
-        // and rollback the journal and copy into the db
+
+        // Caller can either try again or abort the transaction and rollback
         if (!jFile.is_open() || jFile.fail()) {
             return PagerResult::JournalOpenFailed;
         }
@@ -216,12 +212,9 @@ PagerResult Pager::commit_phase_one() {
         // Check if the journal header is not corrupted (has a valid magic byte pattern)
         bool valid_journal = Journal::validate_journal_header(jHeader);
         if (!valid_journal) {
-            // I dont think this should possibly happen. This means, some pages were flushed
-            // to disk in the db and the backup images are stored in the journal
-            // However, the journal is corrupt now so we can't rollback if the user would like
-            // to abort the transaction. And, we can't proceed because the journal is corrupt
-            // Assumption: The user will abort the transaction without calling a rollback. That's fine
-            // Return code: CORRUPT_JOURNAL
+            // This is the kind of corruption we are not accounting for.
+            // The database has pages that don't belong to the pre-transaction state
+            // There's no way to rollback. Cooked
             return PagerResult::JournalCorrupt;
         }
         jFile.seekp(0, std::ios::end); // Seek to the end of the file (after the most recent backup image appended)
@@ -279,8 +272,7 @@ PagerResult Pager::commit_phase_one() {
             } catch (const std::exception &) {
                 return PagerResult::JournalRecordWriteFailed;
             }
-            
-            // 
+
         }
     }
     // Flush and sync file to disk
@@ -381,7 +373,7 @@ PagerResult Pager::rollback_hot_journal() {
     /**
      * TODO: since we have multiple headers now, what we probably need to do is the following:
      * while the current the current offset is not at the end of the journal file, read a number of bytes
-     * from disk equal to the size of a header. If it's not a valid header, seek to the end of this page and go to the next iteration
+     * from disk equal to the size of a header. If it's not a valid header, stop here and finalize recovery
      * if it's a valid header, get the number of pages that are in this sub-journal records and for i <- 1 to record_num (or wtvr):
      *      read a page deserialize and validate and do all the stuff we are doing and rollback
      * make sure we are at a page boundary. seek to the next smallest page boundary (or stay at the current one if its a page boundary)
@@ -419,25 +411,35 @@ PagerResult Pager::rollback_hot_journal() {
 
     std::unordered_set<int> restored_page_nums;
     std::streamoff curr_offset = 0;
-    while (curr_offset < static_cast<std::streamoff>(journal_file_size)) {
+    bool stop_recovery = false;
+    while (curr_offset < static_cast<std::streamoff>(journal_file_size) && !stop_recovery) {
         // Read a number of bytes from disk equal to the size of a header.
         char jHeader_bytes[JOURNAL_HEADER_SIZE];
         try {
             disk::seek_read_to(jFile, curr_offset);
             disk::read_exact(jFile, jHeader_bytes);
         } catch (const std::exception &) {
-            return PagerResult::JournalOpenFailed;
+            if (curr_offset == 0) return PagerResult::JournalOpenFailed;
+            break;
         }
 
         // Deserialize the bytes into an object
         JournalHeader jHeader;
         Journal::deserialize_jHeader(jHeader, jHeader_bytes);
 
-        // If it's not a valid header, seek to the end of this page and go to the next iteration
+        // If it's not a valid header, stop here and finalize recovery
         bool is_valid_header = Journal::validate_journal_header(jHeader);
         if (!is_valid_header) {
-            curr_offset += PAGE_SIZE;
-            continue;
+            if (curr_offset == 0) {
+                jFile.close();
+                try {
+                    std::filesystem::resize_file(jFile_name, 0);
+                } catch (const std::exception &) {
+                    return PagerResult::JournalTruncateFailed;
+                }
+                return PagerResult::JournalCorrupt;
+            }
+            break;
         }
 
         // If it's a valid header, get the number of pages that are in this sub-journal records
@@ -453,7 +455,8 @@ PagerResult Pager::rollback_hot_journal() {
                 disk::seek_read_to(jFile, j_offset);
                 disk::read_exact(jFile, jPage_record_bytes);
             } catch (const std::exception &) {
-                return PagerResult::RollbackRecordCorrupt;
+                stop_recovery = true;
+                break;
             }
 
             // Deserialize into a JournalPageRecord object
@@ -463,6 +466,7 @@ PagerResult Pager::rollback_hot_journal() {
             // validate checksum of the page
             bool is_valid_record = Journal::validate_journal_record_checksum(jPage_record, jHeader);
             if (!is_valid_record) {
+                stop_recovery = true;
                 break;
             }
 
@@ -483,8 +487,14 @@ PagerResult Pager::rollback_hot_journal() {
             }
         }
 
+        if (stop_recovery) break;
+
         // make sure we are at a page boundary. seek to the next smallest page boundary (or stay at the current one if its a page boundary)
-        curr_offset = align_to_page_boundary(records_offset + static_cast<std::streamoff>(page_count) * static_cast<std::streamoff>(JOURNAL_PAGE_RECORD));
+        std::streamoff next_header_offset = align_to_page_boundary(records_offset + static_cast<std::streamoff>(page_count) * static_cast<std::streamoff>(JOURNAL_PAGE_RECORD));
+        if (next_header_offset >= static_cast<std::streamoff>(journal_file_size)) {
+            break;
+        }
+        curr_offset = next_header_offset;
     }
     // Need to flush and sync probably here
     dbFile_handler.flush();
