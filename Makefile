@@ -13,7 +13,8 @@ SRC = \
 	src/PCache.cpp \
 	src/Pager.cpp \
 	src/disk/DiskIO.cpp \
-	src/encoding/Endian.cpp
+	src/encoding/Endian.cpp \
+	src/DBHeaderCodec.cpp
 
 OBJ = \
 	build/DLList.o \
@@ -21,7 +22,8 @@ OBJ = \
 	build/PCache.o \
 	build/Pager.o \
 	build/disk/DiskIO.o \
-	build/encoding/Endian.o
+	build/encoding/Endian.o \
+	build/DBHeaderCodec.o
 
 UNIT_TEST_SRC := $(wildcard tests/unit/*.cpp)
 UNIT_TEST_OBJ := $(patsubst tests/unit/%.cpp,build/tests/unit/%.o,$(UNIT_TEST_SRC))
