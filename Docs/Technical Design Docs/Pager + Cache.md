@@ -255,3 +255,75 @@ graph TD
 - Database header. Need to also incorporate file-change counts in later versions of commits
 - We haven’t really talked about Pager::open yet! What should we do when a database file doesn’t exist as opposed to when it exists? Need to also add branches to each of the other methods if there’s no database opened. Also implement Pager::close
 -
+# Revision: June 24th, 2026: Page allocation for the pager
+As I was writing the integration test for the pager, I realized one major issue with the current version (SHA `ea1be59`): The pager has no way of allocating new pages! It had the capability of reading and writing existing pages in a crash-safe manner. However, it couldn't handle cases where we needed a new page to write to. This also means that if there isn't an already existing database file, starting a new database is not possible. This is the cause of this revision. Simply adding a method called `allocate_page()` + `free_page(uint32_t page_num)` is not that easy. The reason for that is that adding or freeing pages is equivalent to changing the DB. Therefore, we have to handle some edge cases of rollbacks in case the DB crashes in the middle of a transaction that allocates or frees pages.
+
+## Page allocation
+In this design, we propose two mechanisms of allocating pages:
+
+- Allocate from a previously freed page (Therefore we need to keep track of a list of free pages to reuse).
+- Simply extending the DB with a new page if there's a free page to reusue.
+
+The freepage list is going to be simply a doubly-linked list. Each node is simply a 4KB page, with the first 4 bytes storing the page number of the next free page in the freelist, the next 4 bytes storing the page number of the previous free page. Since we are using unsinged integers to store those, we are going to the the number of the pages in the database to represent the absence of a next/previous free page. For example, if the DB has 10 pages, then the last page on the freelist will have a next pointer holding the value 10.
+```
+[4 bytes | 4 bytes | EMPTY 4088 bytes]
+[next_free_page_num | prev_free_page_num | Garbage OR Zeros]
+```
+
+The header page of the database will contain a pointer to the the first page of the freelist at the offset 24. Here's the structure of the database header:
+```
+[16 bytes | 4 bytes | 4 bytes | 4 bytes | 4 bytes | EMPTY 4064 bytes]
+[magic_header_string | file_change_counter | db_page_count | freelist_head_page_num | freelist_page_count | Garbage OR Zeros]
+```
+
+Now, how do we handle requests for page allocation? Roughly, the approach is as the following: If the free_page count from the DB header is not zero, get a free page, save a backup of that page, it's previous page and its next page in the list if there exists one. Modify the previous page pointers, the next page pointers, and the header file accounting informatoin (number of free pages).
+
+Otherwise, just return a zeroed-out array of 4KB with a page_num equal to the number of pages in the DB.
+```
+allocate_page()
+	If free_page_count > 0:
+		freelist_head_page_num <- header.freelist_head
+		begin_write(freelist_head_page_num)
+		freelist_head_page <- pCache.get(freelist_head_page_num)
+		if (next_free_page_num <- freelist_head_page.next) != page_count: # only if freelist_head_page.next != page count
+			begin_write(next_free_page_num)
+			header.freelist_head <- next_free_page_num
+			next_free_page <- pCache.get(freelist_next_free_page_num)
+			next_free_page.prev <- 0
+			header->freelist_head <-  next_free_page_num
+		else:
+			header->freelist_head <- page_count
+		
+		return {freelist_head_page_num, char[4kb]}
+	else:
+		# Don't extend the database file yet
+		Create a page struct
+		Add to cache
+		mark as dirty
+		add to dirty list
+		return {db_page_count, char[4kb]}
+```
+
+For v1, freeing a page means we will just add it to the freelist. For now, let's traverse the freelist till the end and then add this one
+```
+free_page(page_num):
+	begin_write(page_num)
+	curr <- header
+	while curr.next != page_count:
+		seek to curr.next page offest
+		read exact
+		deserialize
+	now add curr to our read cache
+	add it to the dirty list
+	mark it dirty
+	set its next pointer to the page we want to free
+	add the 
+
+```
+
+## Rolling back
+This adds a little bit of changes to the journaling and rolling back after a crash. It matters in the following cases:
+- **A new page was added to the database**: In that case, we need to truncate it out of the database. We can do this by first doing normal recovery then checking the page count from the header. Then ask ourselves what is the size of the database. Then calculate the page nums from that. If it ends up being more than the one in the header, we truncate.
+- **DirtyPageEntry for new pages**: The backup image will be nullptr. Just to make sure we don't store an image for it in the journal.
+
+I think that's it. One thing we will also need to do is the logic when opening a database file for the first time. If the file for the db doesn't exist, create one, create the header, write it to disk, flush and sync, then return to the user.
