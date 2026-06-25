@@ -86,6 +86,18 @@ TEST(PCacheTest, RemovePinnedPageReturnsRemovingPinnedPage) {
     EXPECT_EQ(cache.get(4), page);
 }
 
+TEST(PCacheTest, ForceRemovePinnedPageDropsItFromCache) {
+    PCache cache;
+    Page *page = make_page(4, 1);
+
+    EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
+
+    cache.force_remove(4);
+
+    EXPECT_EQ(cache.len(), 0);
+    EXPECT_EQ(cache.get(4), nullptr);
+}
+
 TEST(PCacheTest, PinPageRemovesZeroRefPageFromEvictableSet) {
     PCache cache(1);
     Page *page = make_page(1);

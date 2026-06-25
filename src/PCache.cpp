@@ -125,6 +125,23 @@ PCacheResult PCache::remove(int page_num) {
     return PCacheResult::Success;
 }
 
+void PCache::force_remove(int page_num) {
+    auto it = cache_map.find(page_num);
+    if (it == cache_map.end()) return;
+
+    Page *page = it->second;
+    if (page->refs_num == 0) {
+        assert(unpinned_pages->exists(page_num));
+        unpinned_pages->remove(page_num);
+    } else {
+        assert(!unpinned_pages->exists(page_num));
+    }
+
+    cache_map.erase(page_num);
+    delete page;
+    length--;
+}
+
 void PCache::pin_page(int page_num) {
     // Check if page exists in cache first
     auto it = cache_map.find(page_num);
