@@ -33,7 +33,7 @@ namespace DBHeaderCodec {
         }
 
         if (db_header.freelist_head_page_num == 0) return false;
-        if (db_header.freelist_head_page_num > db_header.db_page_count) return false;
+        if (db_header.freelist_head_page_num >= db_header.db_page_count) return false;
 
         return true;
     }
