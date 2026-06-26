@@ -448,4 +448,69 @@ TEST_F(PagerIntegrationTest, FreePageRollbackRestoresFreelistState) {
     }
 }
 
+TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreelistPageReuse) {
+    auto original_page_bytes = make_filled_page('D');
+    auto reused_page_bytes = make_filled_page('E');
+
+    {
+        Pager pager;
+        ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult allocate_result = pager.allocate_page();
+        ASSERT_EQ(allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(allocate_result.page_num, 1);
+        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+        ASSERT_EQ(pager.unref_page(1), PagerResult::Success);
+
+        ASSERT_EQ(pager.free_page(1), PagerResult::Success);
+        ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    DBHeader header = read_db_header();
+    EXPECT_EQ(header.db_page_count, 2u);
+    EXPECT_EQ(header.freelist_head_page_num, 1u);
+    EXPECT_EQ(header.freelist_page_count, 1u);
+
+    {
+        Pager writer_pager;
+        ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult reuse_result = writer_pager.allocate_page();
+        ASSERT_EQ(reuse_result.status, PagerResult::Success);
+        ASSERT_EQ(reuse_result.page_num, 1);
+        std::memcpy(reuse_result.data, reused_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
+        EXPECT_TRUE(journal_exists());
+        EXPECT_GT(journal_size(), 0u);
+
+        header = read_db_header();
+        EXPECT_EQ(header.freelist_head_page_num, 0u);
+        EXPECT_EQ(header.freelist_page_count, 0u);
+        EXPECT_EQ(read_db_page(1), reused_page_bytes);
+    }
+
+    Pager recovery_pager;
+    ASSERT_EQ(recovery_pager.open(db_path.string()), PagerResult::Success);
+
+    EXPECT_TRUE(journal_exists());
+    EXPECT_EQ(journal_size(), 0u);
+
+    header = read_db_header();
+    EXPECT_EQ(header.db_page_count, 2u);
+    EXPECT_EQ(header.freelist_head_page_num, 1u);
+    EXPECT_EQ(header.freelist_page_count, 1u);
+
+    PagerAllocateResult recovered_reuse_result = recovery_pager.allocate_page();
+    ASSERT_EQ(recovered_reuse_result.status, PagerResult::Success);
+    EXPECT_EQ(recovered_reuse_result.page_num, 1);
+
+    std::array<char, PAGE_SIZE> zero_page{};
+    EXPECT_EQ(std::memcmp(recovered_reuse_result.data, zero_page.data(), PAGE_SIZE), 0);
+}
+
 } // namespace
