@@ -622,4 +622,60 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreePage) {
     }
 }
 
+TEST_F(PagerIntegrationTest, FreePageWithExistingFreelistRollbackRestoresLinks) {
+    auto first_page_bytes = make_filled_page('G');
+    auto second_page_bytes = make_filled_page('H');
+
+    Pager pager;
+    ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+
+    PagerAllocateResult first_allocate_result = pager.allocate_page();
+    ASSERT_EQ(first_allocate_result.status, PagerResult::Success);
+    ASSERT_EQ(first_allocate_result.page_num, 1);
+    std::memcpy(first_allocate_result.data, first_page_bytes.data(), PAGE_SIZE);
+
+    PagerAllocateResult second_allocate_result = pager.allocate_page();
+    ASSERT_EQ(second_allocate_result.status, PagerResult::Success);
+    ASSERT_EQ(second_allocate_result.page_num, 2);
+    std::memcpy(second_allocate_result.data, second_page_bytes.data(), PAGE_SIZE);
+
+    ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+    ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+    ASSERT_EQ(pager.unref_page(1), PagerResult::Success);
+    ASSERT_EQ(pager.unref_page(2), PagerResult::Success);
+
+    ASSERT_EQ(pager.free_page(1), PagerResult::Success);
+    ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+    ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+
+    DBHeader header = read_db_header();
+    EXPECT_EQ(header.db_page_count, 3u);
+    EXPECT_EQ(header.freelist_head_page_num, 1u);
+    EXPECT_EQ(header.freelist_page_count, 1u);
+
+    ASSERT_EQ(pager.free_page(2), PagerResult::Success);
+    ASSERT_EQ(pager.rollback_transaction(), PagerResult::Success);
+
+    header = read_db_header();
+    EXPECT_EQ(header.db_page_count, 3u);
+    EXPECT_EQ(header.file_change_counter, 2u);
+    EXPECT_EQ(header.freelist_head_page_num, 1u);
+    EXPECT_EQ(header.freelist_page_count, 1u);
+    EXPECT_TRUE(!journal_exists() || std::filesystem::is_empty(journal_path));
+
+    PagerGetResult second_get_result = pager.get(2);
+    ASSERT_EQ(second_get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(second_get_result.data[i], 'H');
+    }
+    EXPECT_EQ(read_db_page(2), second_page_bytes);
+
+    PagerAllocateResult reuse_result = pager.allocate_page();
+    ASSERT_EQ(reuse_result.status, PagerResult::Success);
+    EXPECT_EQ(reuse_result.page_num, 1);
+
+    std::array<char, PAGE_SIZE> zero_page{};
+    EXPECT_EQ(std::memcmp(reuse_result.data, zero_page.data(), PAGE_SIZE), 0);
+}
+
 } // namespace
