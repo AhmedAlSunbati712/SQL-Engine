@@ -748,4 +748,74 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreePageWithExistingFree
     EXPECT_EQ(std::memcmp(reuse_result.data, zero_page.data(), PAGE_SIZE), 0);
 }
 
+TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterMultiPageOverwrite) {
+    auto first_original_page_bytes = make_filled_page('K');
+    auto second_original_page_bytes = make_filled_page('L');
+    auto first_updated_page_bytes = make_filled_page('M');
+    auto second_updated_page_bytes = make_filled_page('N');
+
+    {
+        Pager writer_pager;
+        ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult first_allocate_result = writer_pager.allocate_page();
+        ASSERT_EQ(first_allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(first_allocate_result.page_num, 1);
+        std::memcpy(first_allocate_result.data, first_original_page_bytes.data(), PAGE_SIZE);
+
+        PagerAllocateResult second_allocate_result = writer_pager.allocate_page();
+        ASSERT_EQ(second_allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(second_allocate_result.page_num, 2);
+        std::memcpy(second_allocate_result.data, second_original_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
+
+        PagerGetResult first_get_result = writer_pager.get(1);
+        ASSERT_EQ(first_get_result.status, PagerResult::Success);
+        ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
+        std::memcpy(first_get_result.data, first_updated_page_bytes.data(), PAGE_SIZE);
+
+        PagerGetResult second_get_result = writer_pager.get(2);
+        ASSERT_EQ(second_get_result.status, PagerResult::Success);
+        ASSERT_EQ(writer_pager.begin_write(2), PagerResult::Success);
+        std::memcpy(second_get_result.data, second_updated_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
+        EXPECT_TRUE(journal_exists());
+        EXPECT_GT(journal_size(), 0u);
+        EXPECT_EQ(read_db_page(1), first_updated_page_bytes);
+        EXPECT_EQ(read_db_page(2), second_updated_page_bytes);
+    }
+
+    EXPECT_TRUE(journal_exists());
+    EXPECT_GT(journal_size(), 0u);
+
+    Pager recovery_pager;
+    ASSERT_EQ(recovery_pager.open(db_path.string()), PagerResult::Success);
+
+    EXPECT_TRUE(journal_exists());
+    EXPECT_EQ(journal_size(), 0u);
+    EXPECT_EQ(read_db_page(1), first_original_page_bytes);
+    EXPECT_EQ(read_db_page(2), second_original_page_bytes);
+
+    DBHeader header = read_db_header();
+    EXPECT_EQ(header.db_page_count, 3u);
+    EXPECT_EQ(header.file_change_counter, 1u);
+    EXPECT_EQ(header.freelist_head_page_num, 0u);
+    EXPECT_EQ(header.freelist_page_count, 0u);
+
+    PagerGetResult first_recovery_get_result = recovery_pager.get(1);
+    ASSERT_EQ(first_recovery_get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(first_recovery_get_result.data[i], 'K');
+    }
+
+    PagerGetResult second_recovery_get_result = recovery_pager.get(2);
+    ASSERT_EQ(second_recovery_get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(second_recovery_get_result.data[i], 'L');
+    }
+}
+
 } // namespace
