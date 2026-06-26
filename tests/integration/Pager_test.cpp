@@ -2,6 +2,7 @@
 
 #include <DBHeaderCodec.h>
 #include <Pager.h>
+#include <JournalCodec.h>
 
 #include <array>
 #include <chrono>
@@ -200,6 +201,105 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAndTruncatesAppendedPages) {
     PagerGetResult get_result = recovery_pager.get(1);
     EXPECT_EQ(get_result.status, PagerResult::PageOutOfRange);
     EXPECT_EQ(get_result.data, nullptr);
+}
+
+TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageCommitsUpdatedBytes) {
+    Pager writer_pager;
+    ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
+    PagerAllocateResult allocate_result = writer_pager.allocate_page();
+    ASSERT_EQ(allocate_result.status, PagerResult::Success);
+    EXPECT_EQ(allocate_result.page_num, 1);
+
+    auto page_bytes = make_filled_page('A');
+    std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+    writer_pager.commit_phase_one();
+
+    // Make sure that there are not journal records on disk for this.
+    std::fstream jFile;
+    jFile.open(journal_path, std::ios::in | std::ios::binary);
+    char jHeader_bytes[JOURNAL_HEADER_SIZE];
+    jFile.read(jHeader_bytes, JOURNAL_HEADER_SIZE);
+    JournalHeader jHeader;
+    Journal::deserialize_jHeader(jHeader, jHeader_bytes);
+    EXPECT_EQ(jHeader.init_db_page_count, 1);
+    EXPECT_EQ(jHeader.page_count, 1);
+    EXPECT_EQ(std::filesystem::file_size(journal_path), PAGE_SIZE + JOURNAL_PAGE_RECORD);
+
+    jFile.close();
+
+    writer_pager.commit_phase_two();
+    ASSERT_EQ(std::filesystem::is_empty(journal_path), true);
+
+    DBHeader header = read_db_header();
+    EXPECT_EQ(header.db_page_count, 2);
+    EXPECT_EQ(header.file_change_counter, 1);
+
+    // Now, we need to get that page, and ensure it has the content we wrote!
+    PagerGetResult get_result = writer_pager.get(1);
+    ASSERT_EQ(get_result.status, PagerResult::Success);
+    char *get_page_bytes = get_result.data;
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_page_bytes[i], 'A');
+    }
+
+    header = read_db_header();
+    char header_bytes[PAGE_SIZE] = {};
+    DBHeaderCodec::serialize_DBHeader(header, header_bytes);
+    PagerResult begin_write_result = writer_pager.begin_write(1);
+    ASSERT_EQ(begin_write_result, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        get_page_bytes[i] = 'B';
+    }
+    writer_pager.commit_phase_one();
+
+    // Validate the journal has expected data
+    jFile.open(journal_path, std::ios::in | std::ios::binary);
+    jFile.read(jHeader_bytes, JOURNAL_HEADER_SIZE);
+    Journal::deserialize_jHeader(jHeader, jHeader_bytes);
+    EXPECT_EQ(jHeader.init_db_page_count, 2);
+    EXPECT_EQ(jHeader.page_count, 2);
+    EXPECT_EQ(std::filesystem::file_size(journal_path), PAGE_SIZE + JOURNAL_PAGE_RECORD * 2);
+
+    // The page records
+    jFile.seekg(static_cast<std::streamoff>(PAGE_SIZE));
+    char curr_page_record[JOURNAL_PAGE_RECORD];
+    for (int i = 0; i < 2; i++) {
+        jFile.read(curr_page_record, JOURNAL_PAGE_RECORD);
+        JournalPageRecord jPage_record;
+        Journal::deserialize_jPage_record(jPage_record, curr_page_record);
+        for (int j = 0; j < PAGE_SIZE; j++) {
+            if (jPage_record.page_num == 0) {
+                EXPECT_EQ(jPage_record.data[j], header_bytes[j]);
+            } else {
+                EXPECT_EQ(jPage_record.data[j], 'A');
+            }
+        }
+
+    }
+
+    jFile.close();
+
+    ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
+    EXPECT_TRUE(std::filesystem::is_empty(journal_path));
+
+    auto updated_page_bytes = make_filled_page('B');
+    EXPECT_EQ(read_db_page(1), updated_page_bytes);
+
+    header = read_db_header();
+    EXPECT_EQ(header.db_page_count, 2u);
+    EXPECT_EQ(header.file_change_counter, 2u);
+    EXPECT_EQ(header.freelist_head_page_num, 0u);
+    EXPECT_EQ(header.freelist_page_count, 0u);
+
+    Pager recovery_pager;
+    ASSERT_EQ(recovery_pager.open(db_path.string()), PagerResult::Success);
+
+    PagerGetResult recovery_get_result = recovery_pager.get(1);
+    ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.data[i], 'B');
+    }
+
 }
 
 } // namespace
