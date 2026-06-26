@@ -348,4 +348,55 @@ TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageRollbackRestoresOriginalByt
 
 }
 
+TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterExistingPageOverwrite) {
+    auto original_page_bytes = make_filled_page('A');
+    auto updated_page_bytes = make_filled_page('B');
+
+    {
+        Pager writer_pager;
+        ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        ASSERT_EQ(allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(allocate_result.page_num, 1);
+        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
+
+        PagerGetResult get_result = writer_pager.get(1);
+        ASSERT_EQ(get_result.status, PagerResult::Success);
+        ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
+        std::memcpy(get_result.data, updated_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
+        EXPECT_TRUE(journal_exists());
+        EXPECT_GT(journal_size(), 0u);
+        EXPECT_EQ(read_db_page(1), updated_page_bytes);
+    }
+
+    EXPECT_TRUE(journal_exists());
+    EXPECT_GT(journal_size(), 0u);
+    EXPECT_EQ(read_db_page(1), updated_page_bytes);
+
+    Pager recovery_pager;
+    ASSERT_EQ(recovery_pager.open(db_path.string()), PagerResult::Success);
+
+    EXPECT_TRUE(journal_exists());
+    EXPECT_EQ(journal_size(), 0u);
+    EXPECT_EQ(read_db_page(1), original_page_bytes);
+
+    DBHeader header = read_db_header();
+    EXPECT_EQ(header.db_page_count, 2u);
+    EXPECT_EQ(header.file_change_counter, 1u);
+    EXPECT_EQ(header.freelist_head_page_num, 0u);
+    EXPECT_EQ(header.freelist_page_count, 0u);
+
+    PagerGetResult recovery_get_result = recovery_pager.get(1);
+    ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.data[i], 'A');
+    }
+}
+
 } // namespace
