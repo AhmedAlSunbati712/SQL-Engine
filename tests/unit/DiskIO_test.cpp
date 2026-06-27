@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <string>
 
 namespace {
@@ -169,6 +170,95 @@ TEST(DiskIOTest, SyncFileToDiskThrowsForMissingFile) {
     TempFile temp_file;
 
     EXPECT_THROW(disk::sync_file_to_disk(temp_file.path.string()), std::runtime_error);
+}
+
+TEST(DiskIOTest, OpenFileAndCloseFileSucceedsForExistingFile) {
+    TempFile temp_file;
+    write_file_bytes(temp_file.path, "abcdef");
+
+    int fd = disk::open_file(temp_file.path.string(), O_RDWR);
+
+    EXPECT_GE(fd, 0);
+    EXPECT_NO_THROW(disk::close_file(fd));
+}
+
+TEST(DiskIOTest, OpenFileCreatesMissingFileWhenRequested) {
+    TempFile temp_file;
+
+    int fd = disk::open_file(temp_file.path.string(), O_RDWR | O_CREAT, 0644);
+    EXPECT_TRUE(std::filesystem::exists(temp_file.path));
+
+    EXPECT_NO_THROW(disk::close_file(fd));
+}
+
+TEST(DiskIOTest, FdFileSizeReturnsNumberOfBytes) {
+    TempFile temp_file;
+    write_file_bytes(temp_file.path, "abcdef");
+
+    int fd = disk::open_file(temp_file.path.string(), O_RDWR);
+
+    EXPECT_EQ(disk::file_size(fd), 6u);
+
+    EXPECT_NO_THROW(disk::close_file(fd));
+}
+
+TEST(DiskIOTest, ReadExactAtReadsRequestedBytesFromOffset) {
+    TempFile temp_file;
+    write_file_bytes(temp_file.path, "abcdef");
+
+    int fd = disk::open_file(temp_file.path.string(), O_RDWR);
+    std::array<char, 4> buffer{};
+
+    disk::read_exact_at(fd, buffer, 1);
+
+    EXPECT_EQ(std::string(buffer.begin(), buffer.end()), "bcde");
+    EXPECT_NO_THROW(disk::close_file(fd));
+}
+
+TEST(DiskIOTest, ReadExactAtThrowsWhenBufferWouldCrossEof) {
+    TempFile temp_file;
+    write_file_bytes(temp_file.path, "abc");
+
+    int fd = disk::open_file(temp_file.path.string(), O_RDWR);
+    std::array<char, 4> buffer{};
+
+    EXPECT_THROW(disk::read_exact_at(fd, buffer, 0), std::runtime_error);
+    EXPECT_NO_THROW(disk::close_file(fd));
+}
+
+TEST(DiskIOTest, WriteExactAtWritesRequestedBytesAtOffset) {
+    TempFile temp_file;
+    write_file_bytes(temp_file.path, "abcdef");
+
+    int fd = disk::open_file(temp_file.path.string(), O_RDWR);
+    std::array<char, 2> buffer{'X', 'Y'};
+
+    disk::write_exact_at(fd, buffer, 2);
+    EXPECT_NO_THROW(disk::close_file(fd));
+
+    EXPECT_EQ(read_file_bytes(temp_file.path), "abXYef");
+}
+
+TEST(DiskIOTest, TruncateFileShrinksFileToRequestedSize) {
+    TempFile temp_file;
+    write_file_bytes(temp_file.path, "abcdef");
+
+    int fd = disk::open_file(temp_file.path.string(), O_RDWR);
+
+    disk::truncate_file(fd, 3);
+    EXPECT_NO_THROW(disk::close_file(fd));
+
+    EXPECT_EQ(read_file_bytes(temp_file.path), "abc");
+}
+
+TEST(DiskIOTest, SyncFileToDiskFdSucceedsForExistingFile) {
+    TempFile temp_file;
+    write_file_bytes(temp_file.path, "journal");
+
+    int fd = disk::open_file(temp_file.path.string(), O_RDWR);
+
+    EXPECT_NO_THROW(disk::sync_file_to_disk_fd(fd));
+    EXPECT_NO_THROW(disk::close_file(fd));
 }
 
 }
