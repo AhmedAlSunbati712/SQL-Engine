@@ -3,3 +3,4 @@ SQLite Database System Design and Implementation (Sibsankar Haldar) (Z-Library)-
 .vscode
 *.o
 build/
+benchmarks/*
