@@ -10,6 +10,7 @@ LIB = build/libsqlengine.a
 SRC = \
 	src/DLList.cpp \
 	src/JournalCodec.cpp \
+	src/LockMgr.cpp \
 	src/PCache.cpp \
 	src/Pager.cpp \
 	src/disk/DiskIO.cpp \
@@ -19,6 +20,7 @@ SRC = \
 OBJ = \
 	build/DLList.o \
 	build/JournalCodec.o \
+	build/LockMgr.o \
 	build/PCache.o \
 	build/Pager.o \
 	build/disk/DiskIO.o \
