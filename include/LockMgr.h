@@ -37,16 +37,19 @@ class LockMgr {
         };
         static const int MAX_EXCLUSIVE_RETRIES = 32;
         static const int MAX_PENDING_RETRIES = 32;
-        static const std::streamoff PENDING_BYTE;
-        static const std::streamoff RESERVED_BYTE;
-        static const std::streamoff SHARED_BYTE;
+        static constexpr std::streamoff PENDING_BYTE = 1LL << 32;
+        static constexpr std::streamoff RESERVED_BYTE = PENDING_BYTE + 1;
+        static constexpr std::streamoff SHARED_BYTE = PENDING_BYTE + 2;
 
         LockState lock_state = LockState::NOLOCK;
         LockMgrStatus acquire_primitive_lock(int fd, PrimitiveLockType type, std::streamoff byte);
         LockMgrStatus release_primitive_lock(int fd, std::streamoff byte);
         LockMgrStatus acquire_shared(int fd);
         LockMgrStatus acquire_reserved(int fd);
-        LockMgrStatus acquire_pending(int fd);
         LockMgrStatus acquire_exclusive_from_nolock(int fd);
         LockMgrStatus acquire_exclusive_from_reserved(int fd);
+        LockMgrStatus release_shared(int fd);
+        LockMgrStatus release_reserved(int fd);
+        LockMgrStatus release_pending(int fd);
+        LockMgrStatus release_exclusive(int fd);
 };

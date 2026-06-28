@@ -29,6 +29,104 @@ LockMgrStatus LockMgr::lock(int fd, Lock target_state) {
 
 }
 
+LockMgrStatus LockMgr::unlock(int fd, Lock target_state) {
+    switch (target_state) {
+        case Lock::EXCLUSIVE:
+            // unlock() is not how we move up. If we already have exclusive, this is a no-op.
+            return (lock_state == LockState::EXCLUSIVE) ? LockMgrStatus::Success : LockMgrStatus::Busy;
+
+        case Lock::RESERVED:
+            switch (lock_state) {
+                case LockState::NOLOCK:
+                case LockState::SHARED:
+                    return LockMgrStatus::Busy;
+                case LockState::RESERVED:
+                    return LockMgrStatus::Success;
+                case LockState::PENDING:
+                    // This state should not survive between public calls.
+                    std::abort();
+                case LockState::EXCLUSIVE:
+                    // To go from exclusive back to reserved, reacquire the reserved byte first
+                    // and then downgrade the shared byte from write to read.
+                    if (acquire_primitive_lock(fd, PrimitiveLockType::WRITE, RESERVED_BYTE) != LockMgrStatus::Success) {
+                        std::abort();
+                    }
+                    if (acquire_primitive_lock(fd, PrimitiveLockType::READ, SHARED_BYTE) != LockMgrStatus::Success) {
+                        std::abort();
+                    }
+                    lock_state = LockState::RESERVED;
+                    return LockMgrStatus::Success;
+            }
+            break;
+
+        case Lock::SHARED:
+            switch (lock_state) {
+                case LockState::NOLOCK:
+                    return LockMgrStatus::Busy;
+                case LockState::SHARED:
+                    return LockMgrStatus::Success;
+                case LockState::RESERVED:
+                    if (release_primitive_lock(fd, RESERVED_BYTE) != LockMgrStatus::Success) {
+                        std::abort();
+                    }
+                    lock_state = LockState::SHARED;
+                    return LockMgrStatus::Success;
+                case LockState::PENDING:
+                    // This state should not survive between public calls.
+                    std::abort();
+                case LockState::EXCLUSIVE:
+                    // This converts the shared-byte lock from write to read.
+                    if (acquire_primitive_lock(fd, PrimitiveLockType::READ, SHARED_BYTE) != LockMgrStatus::Success) {
+                        std::abort();
+                    }
+                    lock_state = LockState::SHARED;
+                    return LockMgrStatus::Success;
+            }
+            break;
+
+        case Lock::NOLOCK:
+            return release_all_locks(fd);
+    }
+
+    return LockMgrStatus::Busy;
+}
+
+LockMgrStatus LockMgr::release_all_locks(int fd) {
+    // Shared -> r-lock on shared byte
+    // Reserved -> r-lock on shared byte + w-lock on Reserved byte
+    // Pending -> r-lock on shared byte + w-lock on Reserved Byte and Pending byte
+    // Exclusive -> w-lock on shared byte 
+    switch (lock_state) {
+        case LockState::NOLOCK:
+            return LockMgrStatus::Success;
+        case LockState::SHARED:
+            if (release_shared(fd) != LockMgrStatus::Success) {
+                std::abort();
+            }
+            lock_state = LockState::NOLOCK;
+            return LockMgrStatus::Success;
+        case LockState::RESERVED:
+            if (release_reserved(fd) != LockMgrStatus::Success) {
+                std::abort();
+            }
+            lock_state = LockState::NOLOCK;
+            return LockMgrStatus::Success;
+        case LockState::PENDING:
+            if (release_pending(fd) != LockMgrStatus::Success) {
+                std::abort();
+            }
+            lock_state = LockState::NOLOCK;
+            return LockMgrStatus::Success;
+        case LockState::EXCLUSIVE:
+            if (release_exclusive(fd) != LockMgrStatus::Success) {
+                std::abort();
+            }
+            lock_state = LockState::NOLOCK;
+            return LockMgrStatus::Success;
+    }
+    return LockMgrStatus::Busy;
+}
+
 
 
 
@@ -145,6 +243,8 @@ LockMgrStatus LockMgr::acquire_exclusive_from_reserved(int fd) {
     for (int i = 0; i < MAX_EXCLUSIVE_RETRIES; i++) {
         LockMgrStatus shared_byte_write = acquire_primitive_lock(fd, PrimitiveLockType::WRITE, SHARED_BYTE);
         if (shared_byte_write == LockMgrStatus::Success) {
+            // release the pending and the reserved bytes
+            if (release_primitive_lock(fd, PENDING_BYTE) != LockMgrStatus::Success || release_primitive_lock(fd, RESERVED_BYTE) != LockMgrStatus::Success) std::abort();
             lock_state = LockState::EXCLUSIVE;
             return LockMgrStatus::Success;
         }
@@ -155,4 +255,47 @@ LockMgrStatus LockMgr::acquire_exclusive_from_reserved(int fd) {
     }
     lock_state = LockState::RESERVED;
     return LockMgrStatus::Busy;
+}
+
+
+LockMgrStatus LockMgr::release_shared(int fd) {
+    // Shared -> r-lock on shared byte
+    return release_primitive_lock(fd, SHARED_BYTE);
+}
+
+LockMgrStatus LockMgr::release_reserved(int fd) {
+    // Reserved -> r-lock on shared byte + w-lock on Reserved byte
+    if (release_primitive_lock(fd, SHARED_BYTE) != LockMgrStatus::Success || release_primitive_lock(fd, RESERVED_BYTE) != LockMgrStatus::Success) return LockMgrStatus::Busy;
+    return LockMgrStatus::Success;
+}
+
+LockMgrStatus LockMgr::release_pending(int fd) {
+    // Pending -> r-lock on shared byte + w-lock on Reserved Byte and Pending byte
+    if (release_primitive_lock(fd, SHARED_BYTE) != LockMgrStatus::Success ||
+        release_primitive_lock(fd, RESERVED_BYTE) != LockMgrStatus::Success ||
+        release_primitive_lock(fd, PENDING_BYTE) != LockMgrStatus::Success) return LockMgrStatus::Busy;
+    return LockMgrStatus::Success;
+}
+
+LockMgrStatus LockMgr::release_exclusive(int fd) {
+    // Exclusive -> w-lock on shared byte
+    return release_primitive_lock(fd, SHARED_BYTE);
+}
+
+Lock LockMgr::get_curr_lock() const {
+    switch (lock_state) {
+        case LockState::NOLOCK:
+            return Lock::NOLOCK;
+        case LockState::SHARED:
+            return Lock::SHARED;
+        case LockState::RESERVED:
+            return Lock::RESERVED;
+        case LockState::PENDING:
+            // Pending is an internal state only. from the outside, this is still a writer intent state.
+            return Lock::RESERVED;
+        case LockState::EXCLUSIVE:
+            return Lock::EXCLUSIVE;
+    }
+
+    return Lock::NOLOCK;
 }
