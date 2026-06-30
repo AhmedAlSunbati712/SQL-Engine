@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
 #include <span>
 #include <unordered_set>
 
@@ -30,6 +31,18 @@ Page *make_page(int page_num) {
     return page;
 }
 
+bool close_fd_if_open(int &fd) {
+    if (fd == -1) return true;
+    try {
+        disk::close_file(fd);
+        fd = -1;
+        return true;
+    } catch (const std::exception &) {
+        fd = -1;
+        return false;
+    }
+}
+
 } // namespace
 
 Pager::Pager() {
@@ -42,7 +55,8 @@ Pager::~Pager() {
         it = dirty_pages.erase(it);
     }
 
-    if (dbFile_handler.is_open()) dbFile_handler.close();
+    close_fd_if_open(db_fd);
+    close_fd_if_open(journal_fd);
     delete pCache;
 }
 
@@ -92,8 +106,9 @@ PagerResult Pager::open(std::string db_file) {
     }
     // Now, we are sure there's a db file on disk that is valid
     // open the database file
-    dbFile_handler.open(db_name, std::ios::in | std::ios::out | std::ios::binary);
-    if (!dbFile_handler.is_open() || dbFile_handler.fail()) {
+    try {
+        db_fd = disk::open_file(db_name, O_RDWR);
+    } catch (const std::exception &) {
         db_name.clear();
         jFile_name.clear();
         return PagerResult::OpenDbFailed;
@@ -107,7 +122,8 @@ PagerResult Pager::open(std::string db_file) {
     if (recovery_result != PagerResult::Success) {
         // If recovery failed, close the db file handler and return the failure state
         // we cant continue.
-        if (dbFile_handler.is_open()) dbFile_handler.close();
+        close_fd_if_open(db_fd);
+        close_fd_if_open(journal_fd);
         db_name.clear();
         jFile_name.clear();
         is_open = false;
@@ -121,7 +137,8 @@ PagerResult Pager::open(std::string db_file) {
     PagerResult header_result = load_db_header_from_disk();
     if (header_result != PagerResult::Success) {
         // If we cant load the header, something went wrong.
-        if (dbFile_handler.is_open()) dbFile_handler.close();
+        close_fd_if_open(db_fd);
+        close_fd_if_open(journal_fd);
         db_name.clear();
         jFile_name.clear();
         is_open = false;
@@ -418,7 +435,6 @@ PagerResult Pager::unref_page(int page_num) {
 }
 
 
-// TODO: replace all seekp with seek_write_to
 PagerResult Pager::commit_phase_one() {
     /**
      * Phase 1:
@@ -449,27 +465,33 @@ PagerResult Pager::commit_phase_one() {
     if (journal_check != PagerResult::Success) return journal_check;
     JournalHeader jHeader;
 
-    std::fstream jFile;
     if (!journal_exists) {
         // First section for this transaction. create a brand new journal file.
-        jFile.open(jFile_name, std::ios::in | std::ios::out | std::ios::trunc | std::ios::binary);
-        if (!jFile.is_open() || jFile.fail()) {
+        try {
+            if (journal_fd == -1) {
+                journal_fd = disk::open_file(jFile_name, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            } else {
+                disk::truncate_file(journal_fd, 0);
+            }
+        } catch (const std::exception &) {
             return PagerResult::JournalCreateFailed;
         }
 
     } else {
         // Journal already exists from an earlier spill.
         // Open it and verify that the first header is sane before we append another section.
-        jFile.open(jFile_name, std::ios::in | std::ios::out | std::ios::binary);
-
-        if (!jFile.is_open() || jFile.fail()) {
-            return PagerResult::JournalOpenFailed;
+        if (journal_fd == -1) {
+            try {
+                journal_fd = disk::open_file(jFile_name, O_RDWR);
+            } catch (const std::exception &) {
+                return PagerResult::JournalOpenFailed;
+            }
         }
 
         char header_bytes[JOURNAL_HEADER_SIZE];
         try {
-            disk::seek_read_to(jFile, 0);
-            disk::read_exact(jFile, header_bytes);
+            std::span<char> header_bytes_span(header_bytes, JOURNAL_HEADER_SIZE);
+            disk::read_exact_at(journal_fd, header_bytes_span, 0);
         } catch (const std::exception &) {
             return PagerResult::JournalOpenFailed;
         }
@@ -480,13 +502,12 @@ PagerResult Pager::commit_phase_one() {
         if (!valid_journal) {
             return PagerResult::JournalCorrupt;
         }
-        jFile.seekp(0, std::ios::end); // Seek to the end of the file (after the most recent backup image appended)
     }
 
     // The new section header must start on a page boundary
     std::streamoff curr_offset = 0;
     try {
-        curr_offset = disk::get_curr_write_offset(jFile);
+        curr_offset = static_cast<std::streamoff>(disk::file_size(journal_fd));
     } catch (const std::exception &) {
         return PagerResult::JournalHeaderWriteFailed;
     }
@@ -503,18 +524,14 @@ PagerResult Pager::commit_phase_one() {
     // We come back later and rewrite it once we know how many records we actually appended.
     char jHeader_bytes[JOURNAL_HEADER_SIZE];
     try {
-        disk::seek_write_to(jFile, curr_offset);
         Journal::serialize_jHeader(jHeader, jHeader_bytes);
-        disk::write_exact(jFile, jHeader_bytes);
+        std::span<const char> jHeader_bytes_span(jHeader_bytes, JOURNAL_HEADER_SIZE);
+        disk::write_exact_at(journal_fd, jHeader_bytes_span, curr_offset);
     } catch (const std::exception &) {
         return PagerResult::JournalHeaderWriteFailed;
     }
 
-    try {
-        disk::seek_write_to(jFile, curr_offset + static_cast<std::streamoff>(PAGE_SIZE));
-    } catch (const std::exception &) {
-        return PagerResult::JournalRecordWriteFailed;
-    }
+    std::streamoff journal_write_offset = curr_offset + static_cast<std::streamoff>(PAGE_SIZE);
 
     // Append the backup image of every page that still needs flushing.
     // Appended pages have backup_image == nullptr since there is no older image to restore,
@@ -536,20 +553,18 @@ PagerResult Pager::commit_phase_one() {
         Journal::serialize_jPage_record(jPage_record, jPage_record_bytes);
 
         try {
-            disk::write_exact(jFile, jPage_record_bytes);
+            std::span<const char> jPage_record_bytes_span(jPage_record_bytes, JOURNAL_PAGE_RECORD);
+            disk::write_exact_at(journal_fd, jPage_record_bytes_span, journal_write_offset);
         } catch (const std::exception &) {
             return PagerResult::JournalRecordWriteFailed;
         }
+        journal_write_offset += static_cast<std::streamoff>(JOURNAL_PAGE_RECORD);
     }
 
     // Flush and sync the journal records first.
     // At this point the header still says page_count = 0, so crash recovery should ignore this section.
-    jFile.flush();
-    if (jFile.bad() || jFile.fail()) {
-        return PagerResult::JournalFlushFailed;
-    }
     try {
-        disk::sync_file_to_disk(jFile_name);
+        disk::sync_file_to_disk_fd(journal_fd);
     } catch (const std::exception &) {
         return PagerResult::JournalFlushFailed;
     }
@@ -558,19 +573,15 @@ PagerResult Pager::commit_phase_one() {
     // Once this is on disk, the whole journal section becomes valid and replayable.
     char jHeader_bytes_final[JOURNAL_HEADER_SIZE];
     try {
-        disk::seek_write_to(jFile, curr_offset);
         Journal::serialize_jHeader(jHeader, jHeader_bytes_final);
-        disk::write_exact(jFile, jHeader_bytes_final);
+        std::span<const char> jHeader_bytes_final_span(jHeader_bytes_final, JOURNAL_HEADER_SIZE);
+        disk::write_exact_at(journal_fd, jHeader_bytes_final_span, curr_offset);
     } catch (const std::exception &) {
         return PagerResult::JournalHeaderWriteFailed;
     }
 
-    jFile.flush();
-    if (jFile.bad() || jFile.fail()) {
-        return PagerResult::JournalFlushFailed;
-    }
     try {
-        disk::sync_file_to_disk(jFile_name);
+        disk::sync_file_to_disk_fd(journal_fd);
     } catch (const std::exception &) {
         return PagerResult::JournalFlushFailed;
     }
@@ -578,24 +589,20 @@ PagerResult Pager::commit_phase_one() {
 
     // The backup images are durable now, so it is finally safe to overwrite the db pages.
     for (const auto &[page_num, dPage_entry] : dirty_pages) {
-        std::span<char> new_page_data(dPage_entry->page->data);
+        std::span<const char> new_page_data(dPage_entry->page->data, PAGE_SIZE);
         try {
-            disk::seek_write_to(
-                dbFile_handler,
+            disk::write_exact_at(
+                db_fd,
+                new_page_data,
                 static_cast<std::streamoff>(page_num) * static_cast<std::streamoff>(PAGE_SIZE)
             );
-            disk::write_exact(dbFile_handler, new_page_data);
         } catch (const std::exception &) {
             return PagerResult::DbWriteFailed;
         }
     }
 
-    dbFile_handler.flush();
-    if (dbFile_handler.bad() || dbFile_handler.fail()) {
-        return PagerResult::DbFlushFailed;
-    }
     try {
-        disk::sync_file_to_disk(db_name);
+        disk::sync_file_to_disk_fd(db_fd);
     } catch (const std::exception &) {
         return PagerResult::DbFlushFailed;
     }
@@ -623,8 +630,16 @@ PagerResult Pager::commit_phase_two() {
 
     // Truncate the journal to zero bytes.
     // Once this succeeds, the transaction is fully committed.
-    std::fstream jFile(jFile_name, std::ios::out | std::ios::trunc | std::ios::binary);
-    if (!jFile.is_open() || jFile.fail()) {
+    if (journal_fd == -1) {
+        try {
+            journal_fd = disk::open_file(jFile_name, O_RDWR);
+        } catch (const std::exception &) {
+            return PagerResult::JournalTruncateFailed;
+        }
+    }
+    try {
+        disk::truncate_file(journal_fd, 0);
+    } catch (const std::exception &) {
         return PagerResult::JournalTruncateFailed;
     }
 
@@ -686,13 +701,16 @@ PagerResult Pager::rollback_hot_journal() {
     }
 
     // Open the journal file
-    std::fstream jFile(jFile_name, std::ios::in | std::ios::out | std::ios::binary);
-    if (!jFile.is_open() || jFile.fail()) {
-        return PagerResult::JournalOpenFailed;
+    if (journal_fd == -1) {
+        try {
+            journal_fd = disk::open_file(jFile_name, O_RDWR);
+        } catch (const std::exception &) {
+            return PagerResult::JournalOpenFailed;
+        }
     }
     std::size_t journal_file_size = 0;
     try {
-        journal_file_size = disk::file_size(jFile);
+        journal_file_size = disk::file_size(journal_fd);
     } catch (const std::exception &) {
         return PagerResult::JournalOpenFailed;
     }
@@ -710,8 +728,8 @@ PagerResult Pager::rollback_hot_journal() {
         // so we need to read the journal header of this section
         char jHeader_bytes[JOURNAL_HEADER_SIZE];
         try {
-            disk::seek_read_to(jFile, curr_offset);
-            disk::read_exact(jFile, jHeader_bytes);
+            std::span<char> jHeader_bytes_span(jHeader_bytes, JOURNAL_HEADER_SIZE);
+            disk::read_exact_at(journal_fd, jHeader_bytes_span, curr_offset);
         } catch (const std::exception &) {
             if (curr_offset == 0) return PagerResult::JournalOpenFailed;
             break;
@@ -727,9 +745,8 @@ PagerResult Pager::rollback_hot_journal() {
             if (curr_offset == 0) {
                 // If this is the first header of the journal, it means the whole journal is corrupted
                 // finalize it here
-                jFile.close();
                 try {
-                    std::filesystem::resize_file(jFile_name, 0);
+                    disk::truncate_file(journal_fd, 0);
                 } catch (const std::exception &) {
                     return PagerResult::JournalTruncateFailed;
                 }
@@ -758,8 +775,8 @@ PagerResult Pager::rollback_hot_journal() {
             char jPage_record_bytes[JOURNAL_PAGE_RECORD];
             std::streamoff j_offset = records_offset + static_cast<std::streamoff>(i) * static_cast<std::streamoff>(JOURNAL_PAGE_RECORD);
             try {
-                disk::seek_read_to(jFile, j_offset);
-                disk::read_exact(jFile, jPage_record_bytes);
+                std::span<char> jPage_record_bytes_span(jPage_record_bytes, JOURNAL_PAGE_RECORD);
+                disk::read_exact_at(journal_fd, jPage_record_bytes_span, j_offset);
             } catch (const std::exception &) {
                 stop_recovery = true;
                 break;
@@ -783,8 +800,8 @@ PagerResult Pager::rollback_hot_journal() {
 
             std::streamoff db_offset = static_cast<std::streamoff>(db_page_num) * static_cast<std::streamoff>(PAGE_SIZE);
             try {
-                disk::seek_write_to(dbFile_handler, db_offset);
-                disk::write_exact(dbFile_handler, jPage_record.data);
+                std::span<const char> jPage_record_data_span(jPage_record.data, PAGE_SIZE);
+                disk::write_exact_at(db_fd, jPage_record_data_span, db_offset);
             } catch (const std::exception &) {
                 return PagerResult::DbWriteFailed;
             }
@@ -802,13 +819,8 @@ PagerResult Pager::rollback_hot_journal() {
         curr_offset = next_header_offset;
     }
 
-    // Flush and sync to disk
-    dbFile_handler.flush();
-    if (dbFile_handler.bad() || dbFile_handler.fail()) {
-        return PagerResult::DbFlushFailed;
-    }
     try {
-        disk::sync_file_to_disk(db_name);
+        disk::sync_file_to_disk_fd(db_fd);
     } catch (const std::exception &) {
         return PagerResult::DbFlushFailed;
     }
@@ -816,25 +828,19 @@ PagerResult Pager::rollback_hot_journal() {
     // Make sure to truncate the db file if the transaction changed it
     if (has_recovery_target_page_count) {
         try {
-            std::uintmax_t current_db_size = std::filesystem::file_size(db_name);
-            std::uintmax_t target_db_size = static_cast<std::uintmax_t>(recovery_target_page_count) * PAGE_SIZE;
+            std::size_t current_db_size = disk::file_size(db_fd);
+            std::streamoff target_db_size = static_cast<std::streamoff>(recovery_target_page_count) * static_cast<std::streamoff>(PAGE_SIZE);
             if (current_db_size > target_db_size) {
-                if (dbFile_handler.is_open()) dbFile_handler.close();
-                std::filesystem::resize_file(db_name, target_db_size);
-                dbFile_handler.open(db_name, std::ios::in | std::ios::out | std::ios::binary);
-                if (!dbFile_handler.is_open() || dbFile_handler.fail()) {
-                    return PagerResult::OpenDbFailed;
-                }
+                disk::truncate_file(db_fd, target_db_size);
             }
         } catch (const std::exception &) {
             return PagerResult::DbFlushFailed;
         }
     }
 
-    // close the journal and truncate the journal
-    if (jFile.is_open()) jFile.close();
+    // Truncate the journal to zero bytes to invalidate it after recovery.
     try {
-        std::filesystem::resize_file(jFile_name, 0);
+        disk::truncate_file(journal_fd, 0);
     } catch (const std::exception &) {
         return PagerResult::JournalTruncateFailed;
     }
@@ -851,16 +857,34 @@ PagerResult Pager::rollback_hot_journal() {
 /** Private helpers */
 
 PagerResult Pager::journal_has_contents(bool &has_contents) {
-    // A journal has contents if it exists and is not empty
+    // A journal has contents if it exists and its fd reports a non-zero size.
     has_contents = false;
+
+    if (journal_fd != -1) {
+        try {
+            has_contents = disk::file_size(journal_fd) > 0;
+        } catch (const std::exception &) {
+            return PagerResult::JournalOpenFailed;
+        }
+        return PagerResult::Success;
+    }
+
     try {
         has_contents = std::filesystem::exists(jFile_name);
-        if (has_contents) {
-            has_contents = !std::filesystem::is_empty(jFile_name);
-        }
     } catch (const std::exception &) {
         return PagerResult::JournalOpenFailed;
     }
+
+    if (!has_contents) return PagerResult::Success;
+
+    try {
+        journal_fd = disk::open_file(jFile_name, O_RDWR);
+        has_contents = disk::file_size(journal_fd) > 0;
+    } catch (const std::exception &) {
+        close_fd_if_open(journal_fd);
+        return PagerResult::JournalOpenFailed;
+    }
+
     return PagerResult::Success;
 }
 
@@ -934,30 +958,31 @@ PagerResult Pager::create_new_database_file() {
     char header_page[PAGE_SIZE] = {};
     DBHeaderCodec::serialize_DBHeader(initial_header, header_page);
 
-    std::fstream dbFile(db_name, std::ios::out | std::ios::trunc | std::ios::binary);
-    if (!dbFile.is_open() || dbFile.fail()) {
+    int create_fd = -1;
+    try {
+        create_fd = disk::open_file(db_name, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    } catch (const std::exception &) {
         return PagerResult::OpenDbFailed;
     }
 
     try {
         // Write the header to disk
         std::span<const char> header_page_span(header_page, PAGE_SIZE);
-        disk::write_exact(dbFile, header_page_span);
+        disk::write_exact_at(create_fd, header_page_span, 0);
     } catch (const std::exception &) {
+        close_fd_if_open(create_fd);
         return PagerResult::OpenDbFailed;
     }
-
-    // Make sure to flush the write to the OS buffer
-    dbFile.flush();
-    if (dbFile.bad() || dbFile.fail()) {
-        return PagerResult::OpenDbFailed;
-    }
-    dbFile.close();
 
     // Make sure to sync it on disk
     try {
-        disk::sync_file_to_disk(db_name);
+        disk::sync_file_to_disk_fd(create_fd);
     } catch (const std::exception &) {
+        close_fd_if_open(create_fd);
+        return PagerResult::OpenDbFailed;
+    }
+
+    if (!close_fd_if_open(create_fd)) {
         return PagerResult::OpenDbFailed;
     }
 
@@ -967,11 +992,10 @@ PagerResult Pager::create_new_database_file() {
 }
 
 PagerResult Pager::load_db_header_from_disk() {
-    char header_page[PAGE_SIZE];
+    char header_page[PAGE_SIZE] = {};
     try {
-        disk::seek_read_to(dbFile_handler, 0);
         std::span<char> header_page_span(header_page, PAGE_SIZE);
-        disk::read_exact(dbFile_handler, header_page_span);
+        disk::read_exact_at(db_fd, header_page_span, 0);
     } catch (const std::exception &) {
         return PagerResult::DbReadFailed;
     }
@@ -987,7 +1011,7 @@ PagerResult Pager::load_db_header_from_disk() {
 
     std::size_t file_size = 0;
     try {
-        file_size = disk::file_size(dbFile_handler);
+        file_size = disk::file_size(db_fd);
     } catch (const std::exception &) {
         return PagerResult::DbReadFailed;
     }
@@ -1141,12 +1165,10 @@ Pager::PagerReadPageResult Pager::read_page_from_disk(int page_num) {
     std::streamoff offset = static_cast<std::streamoff>(page_num) * static_cast<std::streamoff>(PAGE_SIZE);
     Page *page = nullptr;
     try {
-        disk::seek_read_to(dbFile_handler, offset);
-
         page = make_page(page_num);
 
         std::span<char> buffer_span(page->data);
-        disk::read_exact(dbFile_handler, buffer_span);
+        disk::read_exact_at(db_fd, buffer_span, offset);
     } catch (const std::exception &) {
         delete page;
         result.status = PagerResult::DbReadFailed;

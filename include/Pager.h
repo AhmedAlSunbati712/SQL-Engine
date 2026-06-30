@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <Page.h>
 #include <unordered_set>
-#include <fstream>
 #include <PCache.h>
 #include <Journal.h>
 
@@ -67,7 +66,8 @@ class Pager {
 
 		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
 
-		std::fstream dbFile_handler;
+        int db_fd = -1;
+        int journal_fd = -1;
 
 		std::string db_name;
 		std::string jFile_name;
