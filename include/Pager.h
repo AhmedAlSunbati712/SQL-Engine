@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include <PCache.h>
 #include <Journal.h>
+#include <LockMgr.h>
 
 enum class PagerResult : std::uint8_t {
     Success = 0,
@@ -24,6 +25,8 @@ enum class PagerResult : std::uint8_t {
     DbFlushFailed,
     JournalTruncateFailed,
     RollbackRecordCorrupt,
+    Busy,
+    PageNotCached,
 };
 
 struct PagerGetResult {
@@ -72,6 +75,7 @@ class Pager {
 		std::string db_name;
 		std::string jFile_name;
 		PCache *pCache = nullptr;
+        LockMgr *lock_manager = nullptr;
 		bool is_open = false;
 		WriteTxnState write_txn_state = WriteTxnState::None;
         DBHeader db_header{};
@@ -79,12 +83,18 @@ class Pager {
         bool txn_init_header_valid = false;
 
         static constexpr int DB_HEADER_PAGE_NUM = 0;
+        static constexpr int BUSY_RETRIES = 32;
 
 		void handle_cache_eviction(const PCacheEviction &eviction);
 		PagerResult cache_put(Page *page);
 		PagerResult journal_has_contents(bool &has_contents);
 		PagerResult maybe_recover_hot_journal();
+        PagerResult enter_from_nolock(Lock target_lock);
+        PagerResult finish_after_clean_state();
+        PagerResult restore_lock_after_failure(Lock pre_lock);
+        PagerResult replay_hot_journal_under_exclusive();
 		PagerResult cleanup_transaction_cache();
+        PagerResult purge_cache();
         PagerResult create_new_database_file();
         PagerResult load_db_header_from_disk();
         PagerResult ensure_header_page_loaded(Page *&page);

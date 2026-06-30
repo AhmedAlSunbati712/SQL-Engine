@@ -47,7 +47,7 @@ exclusive --> shared
 ## Pager state machine integration
 Before mapping individual functions, there are a couple of global rules that matter:
 - The pager acquires `SHARED` on the first successful read access and keeps it until all page refs are released, unless it gets upgraded to a higher lock state in the meantime
-- Any transition from `NOLOCK` to any other lock state must first refresh the DB header from disk. If the `file_change_counter` differs from the one currently cached in memory, the pager purges its page cache and updates the cached header before continuing
+- Any transition from `NOLOCK` to any other lock state must first acquire a stable lock state (`SHARED` or `RESERVED`) and only then refresh the DB header from disk. If the `file_change_counter` differs from the one currently cached in memory, the pager purges its page cache and updates the cached header before continuing
 - Hot journal recovery can only happen either:
 	- when a pager is opening the DB and still holds `NOLOCK`
 	- when a pager is about to read from `NOLOCK`
@@ -63,9 +63,9 @@ Before mapping individual functions, there are a couple of global rules that mat
 ### `Pager::get`
 - Required starting lock: Any lock
 - Possible lock upgrade:
-	- if current state is `NOLOCK`, refresh the header first
 	- if current state is `NOLOCK` and a hot journal exists, upgrade right away to `EXCLUSIVE`, rollback it, downgrade back to `NOLOCK`, then continue with the normal read path
-	- if the pager still needs to read from disk, request `SHARED`
+	- if current state is `NOLOCK`, request `SHARED` first, then refresh the header under that read privilege
+	- if the pager still needs to read from disk, it already holds `SHARED`
 - Resulting pager state if it succeds: Requested page is in cache and reffed. The pager holds at least `SHARED`
 - Rollback path if it fails:
 	- if lock acquisition fails, return Busy
@@ -85,11 +85,11 @@ Before mapping individual functions, there are a couple of global rules that mat
 ### `Pager::ref_page`
 - Required starting lock: Any lock, but the page must already exist in cache
 - Possible lock upgrade:
-	- if current state is `NOLOCK`, refresh the header first
-	- if the pager needs to keep the cache entry live again from `NOLOCK`, request `SHARED` before incrementing the ref count
+	- if current state is `NOLOCK`, request `SHARED` first and then refresh the header under that read privilege
 - Resulting pager state if it succeds: The page ref count is incremented and the pager holds at least `SHARED`
 - Rollback path if it fails:
 	- if lock acquisition fails, return Busy
+	- if the header refresh purges the stale cache entry, return `PageNotCached`
 	- if ref increment fails for any other reason, do not keep a newly acquired `SHARED` lock unless some other page is still reffed
 
 ### `Pager::unref_page`
@@ -129,7 +129,7 @@ Before mapping individual functions, there are a couple of global rules that mat
 - Resulting pager state if it succeds: The pager holds `EXCLUSIVE`, the journal is durable on disk, and the rest of the current phase-one invariants hold
 - Rollback path if it fails:
 	- if the lock upgrade fails, return Busy and keep the transaction in its pre-phase-one write state
-	- if the failure happens before the journal reaches the durable boundary, the pager may remain in its pre-phase-one write state
+	- if the failure happens before the journal reaches the durable boundary and this call had not already inherited a durable journal from an earlier spill section, the pager may back down to its pre-phase-one write state
 	- if the failure happens after the journal reaches the durable boundary, do not blindly downgrade. The pager must keep the lock state consistent with the fact that hot-journal recovery semantics now apply
 
 ### `Pager::commit_phase_two`
@@ -178,7 +178,7 @@ Before mapping individual functions, there are a couple of global rules that mat
 
 ## Cache invalidation rules
 - A cache purge is only considered when the pager is currently in `NOLOCK` and is about to transition to some other lock state
-- Before that transition, the pager reloads the DB header from disk and compares the on-disk `file_change_counter` against the in-memory one
+- After that stable lock is acquired, the pager reloads the DB header from disk and compares the on-disk `file_change_counter` against the in-memory one
 - If the counters match, the pager keeps its current cache contents
 - If the counters differ, the pager purges its cache, updates the cached DB header, and continues
 - Purging the cache means:
@@ -193,7 +193,7 @@ Before mapping individual functions, there are a couple of global rules that mat
 - `NOLOCK` implies that the pager has zero outstanding page refs
 - If the pager has one or more outstanding page refs, it must hold at least `SHARED`
 - `unref_page()` is the operation that may release the last `SHARED` lock if the ref count drops to zero and there is no active write transaction
-- `ref_page()` should not be treated as the normal external read entrypoint from `NOLOCK`; `get()` is the operation that establishes a fresh read privilege
+- `ref_page()` is still cache-only. From `NOLOCK` it may reacquire `SHARED`, but if header refresh purges the stale page out of cache it returns `PageNotCached` instead of loading from disk
 - If a write transaction is active, dropping the last page ref does not automatically force the pager back to `NOLOCK`
 
 ## Hot journal detection and recovery rules

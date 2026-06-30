@@ -203,6 +203,107 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAndTruncatesAppendedPages) {
     EXPECT_EQ(get_result.data, nullptr);
 }
 
+TEST_F(PagerIntegrationTest, GetFromNoLockSeesPageCountAfterAnotherProcessAppends) {
+    Pager stale_reader_pager;
+    ASSERT_EQ(stale_reader_pager.open(db_path.string()), PagerResult::Success);
+
+    {
+        Pager writer_pager;
+        ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        ASSERT_EQ(allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(allocate_result.page_num, 1);
+
+        auto page_bytes = make_filled_page('Z');
+        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    // stale_reader_pager still has the old header snapshot from open() where db_page_count was 1.
+    // get() now has to refresh under SHARED before it decides this page is out of range.
+    PagerGetResult get_result = stale_reader_pager.get(1);
+    ASSERT_EQ(get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_result.data[i], 'Z');
+    }
+}
+
+TEST_F(PagerIntegrationTest, RefPageFromNoLockReacquiresShared) {
+    Pager pager;
+    ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+
+    PagerAllocateResult allocate_result = pager.allocate_page();
+    ASSERT_EQ(allocate_result.status, PagerResult::Success);
+    ASSERT_EQ(allocate_result.page_num, 1);
+
+    auto page_bytes = make_filled_page('R');
+    std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+
+    ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+    ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+    ASSERT_EQ(pager.unref_page(1), PagerResult::Success);
+
+    ASSERT_EQ(pager.ref_page(1), PagerResult::Success);
+    ASSERT_EQ(pager.unref_page(1), PagerResult::Success);
+
+    PagerGetResult get_result = pager.get(1);
+    ASSERT_EQ(get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_result.data[i], 'R');
+    }
+}
+
+TEST_F(PagerIntegrationTest, RefPageFromNoLockReturnsPageNotCachedAfterPurge) {
+    auto original_page_bytes = make_filled_page('S');
+    auto updated_page_bytes = make_filled_page('T');
+
+    {
+        Pager setup_pager;
+        ASSERT_EQ(setup_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult allocate_result = setup_pager.allocate_page();
+        ASSERT_EQ(allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(allocate_result.page_num, 1);
+        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(setup_pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(setup_pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    Pager stale_reader_pager;
+    ASSERT_EQ(stale_reader_pager.open(db_path.string()), PagerResult::Success);
+
+    PagerGetResult stale_get_result = stale_reader_pager.get(1);
+    ASSERT_EQ(stale_get_result.status, PagerResult::Success);
+    ASSERT_EQ(stale_reader_pager.unref_page(1), PagerResult::Success);
+
+    {
+        Pager writer_pager;
+        ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerGetResult writer_get_result = writer_pager.get(1);
+        ASSERT_EQ(writer_get_result.status, PagerResult::Success);
+        ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
+        std::memcpy(writer_get_result.data, updated_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    // ref_page() is still cache-only. If refresh from NOLOCK purges stale pages, it should not
+    // silently reload from disk and pretend the cached page survived.
+    ASSERT_EQ(stale_reader_pager.ref_page(1), PagerResult::PageNotCached);
+
+    PagerGetResult refreshed_get_result = stale_reader_pager.get(1);
+    ASSERT_EQ(refreshed_get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(refreshed_get_result.data[i], 'T');
+    }
+}
+
 TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageCommitsUpdatedBytes) {
     Pager writer_pager;
     ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);

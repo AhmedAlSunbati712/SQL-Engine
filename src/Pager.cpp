@@ -47,6 +47,7 @@ bool close_fd_if_open(int &fd) {
 
 Pager::Pager() {
     pCache = new PCache();
+    lock_manager = new LockMgr();
 }
 
 Pager::~Pager() {
@@ -58,6 +59,7 @@ Pager::~Pager() {
     close_fd_if_open(db_fd);
     close_fd_if_open(journal_fd);
     delete pCache;
+    delete lock_manager;
 }
 
 PagerResult Pager::open(std::string db_file) {
@@ -118,7 +120,17 @@ PagerResult Pager::open(std::string db_file) {
     is_open = true;
 
     // Make sure to rollback in case there's a hot journal on disk
-    PagerResult recovery_result = maybe_recover_hot_journal();
+    // We need to retry if there's a journal and we failed to grab the exclusive lock
+    // By the next time we return success, the database would have recovered by another process
+    PagerResult recovery_result;
+    for (int i = 0; i < BUSY_RETRIES; i++) {
+        recovery_result = maybe_recover_hot_journal();
+        if (recovery_result != PagerResult::Busy) {
+            // If the issue is not due to failure of grabbing an exclusive lock, break out
+            break;
+        }
+    }
+        
     if (recovery_result != PagerResult::Success) {
         // If recovery failed, close the db file handler and return the failure state
         // we cant continue.
@@ -134,6 +146,7 @@ PagerResult Pager::open(std::string db_file) {
 
     // Now, we need to load the header into our Pager state
     // so it can be referenced by the different operations (allocate_page, free_page for example)
+    // TODO: Do we need to gain a shared lock for this? do we ref the the header and pin it down?
     PagerResult header_result = load_db_header_from_disk();
     if (header_result != PagerResult::Success) {
         // If we cant load the header, something went wrong.
@@ -163,18 +176,32 @@ PagerGetResult Pager::get(int page_num) {
         return result;
     }
 
-    // Make sure we are not accessing a page that is not in the valid boundary
+    // Make sure we are not accessing the header page or anything below it.
+    // The upper boundary has to wait until we refresh the header under a stable read lock.
     assert(page_num > DB_HEADER_PAGE_NUM);
-    if (page_num <= DB_HEADER_PAGE_NUM || page_num >= static_cast<int>(db_header.db_page_count)) {
+    if (page_num <= DB_HEADER_PAGE_NUM) {
         result.status = PagerResult::PageOutOfRange;
         return result;
     }
+    Lock pre_lock = lock_manager->get_curr_lock();
+    if (pre_lock == Lock::NOLOCK) {
+        PagerResult entry_result = enter_from_nolock(Lock::SHARED);
+        if (entry_result != PagerResult::Success) {
+            result.status = entry_result;
+            return result;
+        }
+    } else {
+        // If we were already holding at least SHARED, no one could have committed underneath us.
+        assert(pre_lock == Lock::SHARED || pre_lock == Lock::RESERVED || pre_lock == Lock::EXCLUSIVE);
+    }
 
-    // So, in case another process crashed in the middle of writing, we need to make sure
-    // to rollback any changes before reading
-    PagerResult recovery_result = maybe_recover_hot_journal();
-    if (recovery_result != PagerResult::Success) {
-        result.status = recovery_result;
+    // The header is now stable relative to our read privilege, so the upper boundary is meaningful.
+    if (page_num >= static_cast<int>(db_header.db_page_count)) {
+        if (pre_lock == Lock::NOLOCK) {
+            PagerResult finish_result = finish_after_clean_state();
+            if (finish_result != PagerResult::Success) std::abort();
+        }
+        result.status = PagerResult::PageOutOfRange;
         return result;
     }
 
@@ -183,6 +210,10 @@ PagerGetResult Pager::get(int page_num) {
     Page *page = nullptr;
     PagerResult load_result = get_or_load_page(page_num, page);
     if (load_result != PagerResult::Success) {
+        if (pre_lock == Lock::NOLOCK) {
+            PagerResult finish_result = finish_after_clean_state();
+            if (finish_result != PagerResult::Success) std::abort();
+        }
         result.status = load_result;
         return result;
     }
@@ -206,11 +237,21 @@ PagerAllocateResult Pager::allocate_page() {
         return result;
     }
 
-    // Before requesting a new page, make sure to rollback the database to a consistent state
-    PagerResult recovery_result = maybe_recover_hot_journal();
-    if (recovery_result != PagerResult::Success) {
-        result.status = recovery_result;
-        return result;
+    Lock pre_lock = lock_manager->get_curr_lock();
+    if (pre_lock == Lock::NOLOCK) {
+        PagerResult entry_result = enter_from_nolock(Lock::RESERVED);
+        if (entry_result != PagerResult::Success) {
+            result.status = entry_result;
+            return result;
+        }
+    } else if (pre_lock == Lock::SHARED) {
+        LockMgrStatus reserved_lock_acquire_result = lock_manager->lock(db_fd, Lock::RESERVED);
+        if (reserved_lock_acquire_result == LockMgrStatus::Busy) {
+            result.status = PagerResult::Busy;
+            return result;
+        }
+    } else {
+        assert(pre_lock == Lock::RESERVED || pre_lock == Lock::EXCLUSIVE);
     }
 
     // Check the freelist to avoid increasing the db size
@@ -224,6 +265,7 @@ PagerAllocateResult Pager::allocate_page() {
         PagerResult load_head_result = get_or_load_page(freelist_head_page_num, freelist_head_page);
         if (load_head_result != PagerResult::Success) {
             result.status = load_head_result;
+            restore_lock_after_failure(pre_lock);
             return result;
         }
 
@@ -242,6 +284,7 @@ PagerAllocateResult Pager::allocate_page() {
             PagerResult load_next_result = get_or_load_page(static_cast<int>(next_free_page_num), next_free_page);
             if (load_next_result != PagerResult::Success) {
                 result.status = load_next_result;
+                restore_lock_after_failure(pre_lock);
                 return result;
             }
         }
@@ -250,6 +293,7 @@ PagerAllocateResult Pager::allocate_page() {
         PagerResult header_result = mark_header_dirty_for_mutation();
         if (header_result != PagerResult::Success) {
             result.status = header_result;
+            restore_lock_after_failure(pre_lock);
             return result;
         }
 
@@ -257,6 +301,7 @@ PagerAllocateResult Pager::allocate_page() {
         PagerResult dirty_head_result = mark_loaded_page_dirty(freelist_head_page);
         if (dirty_head_result != PagerResult::Success) {
             result.status = dirty_head_result;
+            restore_lock_after_failure(pre_lock);
             return result;
         }
 
@@ -265,6 +310,7 @@ PagerAllocateResult Pager::allocate_page() {
             PagerResult dirty_next_result = mark_loaded_page_dirty(next_free_page);
             if (dirty_next_result != PagerResult::Success) {
                 result.status = dirty_next_result;
+                restore_lock_after_failure(pre_lock);
                 return result;
             }
 
@@ -297,6 +343,7 @@ PagerAllocateResult Pager::allocate_page() {
     PagerResult header_result = mark_header_dirty_for_mutation();
     if (header_result != PagerResult::Success) {
         result.status = header_result;
+        restore_lock_after_failure(pre_lock);
         return result;
     }
 
@@ -315,6 +362,7 @@ PagerAllocateResult Pager::allocate_page() {
         db_header.db_page_count--;
         sync_db_header_to_cached_header_page();
         result.status = cache_result;
+        restore_lock_after_failure(pre_lock);
         return result;
     }
 
@@ -337,41 +385,70 @@ PagerAllocateResult Pager::allocate_page() {
 PagerResult Pager::free_page(int page_num) {
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
-    // Boundary check
+    // Boundary check for anything below the first real payload page.
+    // The upper boundary has to wait until the header is stable under lock.
     assert(page_num > DB_HEADER_PAGE_NUM);
-    if (page_num <= DB_HEADER_PAGE_NUM || page_num >= static_cast<int>(db_header.db_page_count)) {
+    if (page_num <= DB_HEADER_PAGE_NUM) {
         return PagerResult::PageOutOfRange;
     }
 
-    // Make sure the database is in a consistent state
-    PagerResult recovery_result = maybe_recover_hot_journal();
-    if (recovery_result != PagerResult::Success) return recovery_result;
+    Lock pre_lock = lock_manager->get_curr_lock();
+    if (pre_lock == Lock::NOLOCK) {
+        PagerResult entry_result = enter_from_nolock(Lock::RESERVED);
+        if (entry_result != PagerResult::Success) return entry_result;
+    } else if (pre_lock == Lock::SHARED) {
+        LockMgrStatus reserved_lock_acquire_result = lock_manager->lock(db_fd, Lock::RESERVED);
+        if (reserved_lock_acquire_result == LockMgrStatus::Busy) return PagerResult::Busy;
+    } else {
+        assert(pre_lock == Lock::RESERVED || pre_lock == Lock::EXCLUSIVE);
+    }
+
+    if (page_num >= static_cast<int>(db_header.db_page_count)) {
+        PagerResult restore_result = restore_lock_after_failure(pre_lock);
+        if (restore_result != PagerResult::Success) std::abort();
+        return PagerResult::PageOutOfRange;
+    }
 
     // Get from cache or load from disk
     Page *page_to_free = nullptr;
     PagerResult load_page_result = get_or_load_page(page_num, page_to_free);
-    if (load_page_result != PagerResult::Success) return load_page_result;
+    if (load_page_result != PagerResult::Success) {
+        restore_lock_after_failure(pre_lock);
+        return load_page_result;
+    }
 
     // get the head of the freelist if it exists
     Page *old_freelist_head = nullptr;
     if (db_header.freelist_head_page_num != FREELIST_NULL_PAGE_NUM) {
         assert(db_header.freelist_head_page_num != static_cast<std::uint32_t>(page_num));
         PagerResult load_head_result = get_or_load_page(static_cast<int>(db_header.freelist_head_page_num), old_freelist_head);
-        if (load_head_result != PagerResult::Success) return load_head_result;
+        if (load_head_result != PagerResult::Success) {
+            restore_lock_after_failure(pre_lock);
+            return load_head_result;
+        }
     }
 
     // Mark the header as dirty
     PagerResult header_result = mark_header_dirty_for_mutation();
-    if (header_result != PagerResult::Success) return header_result;
+    if (header_result != PagerResult::Success){
+        restore_lock_after_failure(pre_lock);
+        return header_result;
+    }
 
     // Mark the page to free as dirty since we are going to modify it
     PagerResult dirty_page_result = mark_loaded_page_dirty(page_to_free);
-    if (dirty_page_result != PagerResult::Success) return dirty_page_result;
+    if (dirty_page_result != PagerResult::Success) {
+        restore_lock_after_failure(pre_lock);
+        return dirty_page_result;
+    }
 
     if (old_freelist_head) {
         // if there's an old page, stitch the links and pointers
         PagerResult dirty_head_result = mark_loaded_page_dirty(old_freelist_head);
-        if (dirty_head_result != PagerResult::Success) return dirty_head_result;
+        if (dirty_head_result != PagerResult::Success) {
+            restore_lock_after_failure(pre_lock);
+            return dirty_head_result;
+        }
 
         std::uint32_t old_head_next_page_num = FREELIST_NULL_PAGE_NUM;
         std::uint32_t old_head_prev_page_num = FREELIST_NULL_PAGE_NUM;
@@ -396,19 +473,39 @@ PagerResult Pager::begin_write(int page_num) {
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     assert(page_num > DB_HEADER_PAGE_NUM);
-    if (page_num <= DB_HEADER_PAGE_NUM || page_num >= static_cast<int>(db_header.db_page_count)) {
+    if (page_num <= DB_HEADER_PAGE_NUM) {
         return PagerResult::PageOutOfRange;
     }
 
-    PagerResult recovery_result = maybe_recover_hot_journal();
-    if (recovery_result != PagerResult::Success) return recovery_result;
+    Lock pre_lock = lock_manager->get_curr_lock();
+    if (pre_lock == Lock::NOLOCK) {
+        PagerResult entry_result = enter_from_nolock(Lock::RESERVED);
+        if (entry_result != PagerResult::Success) return entry_result;
+    } else if (pre_lock == Lock::SHARED) {
+        LockMgrStatus reserved_byte_acquire_result = lock_manager->lock(db_fd, Lock::RESERVED);
+        if (reserved_byte_acquire_result == LockMgrStatus::Busy) return PagerResult::Busy;
+    } else {
+        assert(pre_lock == Lock::RESERVED || pre_lock == Lock::EXCLUSIVE);
+    }
+
+    if (page_num >= static_cast<int>(db_header.db_page_count)) {
+        PagerResult restore_result = restore_lock_after_failure(pre_lock);
+        if (restore_result != PagerResult::Success) std::abort();
+        return PagerResult::PageOutOfRange;
+    }
 
     Page *page = nullptr;
     PagerResult load_result = get_or_load_page(page_num, page);
-    if (load_result != PagerResult::Success) return load_result;
+    if (load_result != PagerResult::Success) {
+        restore_lock_after_failure(pre_lock);
+        return load_result;
+    }
 
     PagerResult txn_result = ensure_transaction_started();
-    if (txn_result != PagerResult::Success) return txn_result;
+    if (txn_result != PagerResult::Success){
+        restore_lock_after_failure(pre_lock);
+        return txn_result;
+    }
 
     return mark_loaded_page_dirty(page);
 }
@@ -416,8 +513,27 @@ PagerResult Pager::begin_write(int page_num) {
 PagerResult Pager::ref_page(int page_num) {
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
+    assert(page_num > DB_HEADER_PAGE_NUM);
+    if (page_num <= DB_HEADER_PAGE_NUM) return PagerResult::PageOutOfRange;
+
+    Lock pre_lock = lock_manager->get_curr_lock();
+    if (pre_lock == Lock::NOLOCK) {
+        PagerResult entry_result = enter_from_nolock(Lock::SHARED);
+        if (entry_result != PagerResult::Success) return entry_result;
+    } else {
+        assert(pre_lock == Lock::SHARED || pre_lock == Lock::RESERVED || pre_lock == Lock::EXCLUSIVE);
+    }
+
     Page *page = pCache->get(page_num);
-    assert(page != nullptr);
+    if (!page) {
+        // If reacquiring SHARED forced us to purge stale cache entries, this page may no longer be around.
+        if (pre_lock == Lock::NOLOCK) {
+            PagerResult finish_result = finish_after_clean_state();
+            if (finish_result != PagerResult::Success) std::abort();
+        }
+        return PagerResult::PageNotCached;
+    }
+
     page->refs_num++;
     if (page->refs_num == 1) pCache->pin_page(page_num);
     return PagerResult::Success;
@@ -431,6 +547,13 @@ PagerResult Pager::unref_page(int page_num) {
 
     page->refs_num--;
     if (page->refs_num == 0) pCache->unpin_page(page_num);
+
+    // Only release the final read privilege once we are fully back in a clean state.
+    // If a write transaction is active, the current write-side lock has to stay alive.
+    if (write_txn_state == WriteTxnState::None && pCache->unpinned_len() == pCache->len()) {
+        PagerResult finish_result = finish_after_clean_state();
+        if (finish_result != PagerResult::Success) std::abort();
+    }
     return PagerResult::Success;
 }
 
@@ -444,6 +567,7 @@ PagerResult Pager::commit_phase_one() {
      * once the journal is durable, write the modified pages to the db file and flush those too
      */
     if (!is_open) return PagerResult::DatabaseNotOpen;
+    assert(lock_manager->get_curr_lock() == Lock::RESERVED || lock_manager->get_curr_lock() == Lock::EXCLUSIVE);
 
     // If there are no pages that still need flushing, there is nothing to commit here
     bool has_pages_to_flush = false;
@@ -458,11 +582,28 @@ PagerResult Pager::commit_phase_one() {
         return PagerResult::Success;
     }
 
+    // commit_phase_one is the point where we have to stop being just an in-memory writer.
+    // If we dont own EXCLUSIVE before touching the journal, we are not allowed to proceed.
+    Lock pre_lock = lock_manager->get_curr_lock();
+    bool had_durable_journal_already = (write_txn_state == WriteTxnState::JournalDurable);
+    if (pre_lock != Lock::EXCLUSIVE) {
+        LockMgrStatus exclusive_lock_result = lock_manager->lock(db_fd, Lock::EXCLUSIVE);
+        if (exclusive_lock_result == LockMgrStatus::Busy) return PagerResult::Busy;
+    }
+
+    auto fail_before_durable_boundary = [&](PagerResult failure_result) -> PagerResult {
+        if (!had_durable_journal_already && write_txn_state != WriteTxnState::JournalDurable) {
+            // If we havent crossed the durable boundary yet, we can back out to the earlier write state.
+            if (lock_manager->unlock(db_fd, pre_lock) != LockMgrStatus::Success) std::abort();
+        }
+        return failure_result;
+    };
+
     // Check if we already started a journal for this transaction before.
     // If yes, then this is a spillover phase 1 and we append a new section.
     bool journal_exists = false;
     PagerResult journal_check = journal_has_contents(journal_exists);
-    if (journal_check != PagerResult::Success) return journal_check;
+    if (journal_check != PagerResult::Success) return fail_before_durable_boundary(journal_check);
     JournalHeader jHeader;
 
     if (!journal_exists) {
@@ -474,7 +615,7 @@ PagerResult Pager::commit_phase_one() {
                 disk::truncate_file(journal_fd, 0);
             }
         } catch (const std::exception &) {
-            return PagerResult::JournalCreateFailed;
+            return fail_before_durable_boundary(PagerResult::JournalCreateFailed);
         }
 
     } else {
@@ -484,7 +625,7 @@ PagerResult Pager::commit_phase_one() {
             try {
                 journal_fd = disk::open_file(jFile_name, O_RDWR);
             } catch (const std::exception &) {
-                return PagerResult::JournalOpenFailed;
+                return fail_before_durable_boundary(PagerResult::JournalOpenFailed);
             }
         }
 
@@ -493,14 +634,14 @@ PagerResult Pager::commit_phase_one() {
             std::span<char> header_bytes_span(header_bytes, JOURNAL_HEADER_SIZE);
             disk::read_exact_at(journal_fd, header_bytes_span, 0);
         } catch (const std::exception &) {
-            return PagerResult::JournalOpenFailed;
+            return fail_before_durable_boundary(PagerResult::JournalOpenFailed);
         }
 
         Journal::deserialize_jHeader(jHeader, header_bytes);
 
         bool valid_journal = Journal::validate_journal_header(jHeader);
         if (!valid_journal) {
-            return PagerResult::JournalCorrupt;
+            return fail_before_durable_boundary(PagerResult::JournalCorrupt);
         }
     }
 
@@ -509,7 +650,7 @@ PagerResult Pager::commit_phase_one() {
     try {
         curr_offset = static_cast<std::streamoff>(disk::file_size(journal_fd));
     } catch (const std::exception &) {
-        return PagerResult::JournalHeaderWriteFailed;
+        return fail_before_durable_boundary(PagerResult::JournalHeaderWriteFailed);
     }
     curr_offset = align_to_page_boundary(curr_offset);
 
@@ -528,7 +669,7 @@ PagerResult Pager::commit_phase_one() {
         std::span<const char> jHeader_bytes_span(jHeader_bytes, JOURNAL_HEADER_SIZE);
         disk::write_exact_at(journal_fd, jHeader_bytes_span, curr_offset);
     } catch (const std::exception &) {
-        return PagerResult::JournalHeaderWriteFailed;
+        return fail_before_durable_boundary(PagerResult::JournalHeaderWriteFailed);
     }
 
     std::streamoff journal_write_offset = curr_offset + static_cast<std::streamoff>(PAGE_SIZE);
@@ -556,7 +697,7 @@ PagerResult Pager::commit_phase_one() {
             std::span<const char> jPage_record_bytes_span(jPage_record_bytes, JOURNAL_PAGE_RECORD);
             disk::write_exact_at(journal_fd, jPage_record_bytes_span, journal_write_offset);
         } catch (const std::exception &) {
-            return PagerResult::JournalRecordWriteFailed;
+            return fail_before_durable_boundary(PagerResult::JournalRecordWriteFailed);
         }
         journal_write_offset += static_cast<std::streamoff>(JOURNAL_PAGE_RECORD);
     }
@@ -566,7 +707,7 @@ PagerResult Pager::commit_phase_one() {
     try {
         disk::sync_file_to_disk_fd(journal_fd);
     } catch (const std::exception &) {
-        return PagerResult::JournalFlushFailed;
+        return fail_before_durable_boundary(PagerResult::JournalFlushFailed);
     }
 
     // Now rewrite the header with the real page_count and flush again.
@@ -577,13 +718,13 @@ PagerResult Pager::commit_phase_one() {
         std::span<const char> jHeader_bytes_final_span(jHeader_bytes_final, JOURNAL_HEADER_SIZE);
         disk::write_exact_at(journal_fd, jHeader_bytes_final_span, curr_offset);
     } catch (const std::exception &) {
-        return PagerResult::JournalHeaderWriteFailed;
+        return fail_before_durable_boundary(PagerResult::JournalHeaderWriteFailed);
     }
 
     try {
         disk::sync_file_to_disk_fd(journal_fd);
     } catch (const std::exception &) {
-        return PagerResult::JournalFlushFailed;
+        return fail_before_durable_boundary(PagerResult::JournalFlushFailed);
     }
     write_txn_state = WriteTxnState::JournalDurable;
 
@@ -619,7 +760,8 @@ PagerResult Pager::commit_phase_one() {
 
 PagerResult Pager::commit_phase_two() {
     if (!is_open) return PagerResult::DatabaseNotOpen;
-    assert(write_txn_state != WriteTxnState::DirtyInMemory);
+    assert(write_txn_state == WriteTxnState::JournalDurable);
+    assert(lock_manager->get_curr_lock() == Lock::EXCLUSIVE);
 
     // Phase 2 only makes sense if there is a journal on disk that we can invalidate
     bool valid_journal = false;
@@ -655,7 +797,7 @@ PagerResult Pager::commit_phase_two() {
     }
     write_txn_state = WriteTxnState::None;
     txn_init_header_valid = false;
-    return PagerResult::Success;
+    return finish_after_clean_state();
 }
 
 PagerResult Pager::rollback_transaction() {
@@ -667,11 +809,21 @@ PagerResult Pager::rollback_transaction() {
     // The transaction never made it to a durable journal.
     // Just restore the in-memory cache state.
     if (write_txn_state == WriteTxnState::DirtyInMemory) {
-        return cleanup_transaction_cache();
+        PagerResult cleanup_result = cleanup_transaction_cache();
+        if (cleanup_result != PagerResult::Success) return cleanup_result;
+        return finish_after_clean_state();
     }
 
     // A durable journal exists, so rollback has to replay it.
-    return rollback_hot_journal();
+    assert(write_txn_state == WriteTxnState::JournalDurable);
+    assert(lock_manager->get_curr_lock() == Lock::EXCLUSIVE);
+
+    PagerResult replay_result = replay_hot_journal_under_exclusive();
+    if (replay_result != PagerResult::Success) return replay_result;
+
+    PagerResult header_result = load_db_header_from_disk();
+    if (header_result != PagerResult::Success) return header_result;
+    return finish_after_clean_state();
 }
 
 PagerResult Pager::rollback_hot_journal() {
@@ -685,6 +837,155 @@ PagerResult Pager::rollback_hot_journal() {
      * Then eventually go over each page in dirty pages and clean up by removing it from the cache. does that sound like a good plan?
      */
     if (!is_open) return PagerResult::DatabaseNotOpen;
+    Lock curr_lock = lock_manager->get_curr_lock();
+    if (curr_lock == Lock::NOLOCK) {
+        LockMgrStatus exclusive_lock_status = lock_manager->lock(db_fd, Lock::EXCLUSIVE);
+        if (exclusive_lock_status != LockMgrStatus::Success) return PagerResult::Busy;
+
+        PagerResult replay_result = replay_hot_journal_under_exclusive();
+        if (replay_result != PagerResult::Success) return replay_result;
+
+        if (lock_manager->unlock(db_fd, Lock::NOLOCK) != LockMgrStatus::Success) std::abort();
+        return PagerResult::Success;
+    }
+
+    assert(curr_lock == Lock::EXCLUSIVE);
+    PagerResult replay_result = replay_hot_journal_under_exclusive();
+    if (replay_result != PagerResult::Success) return replay_result;
+
+    PagerResult header_result = load_db_header_from_disk();
+    if (header_result != PagerResult::Success) return header_result;
+    return finish_after_clean_state();
+}
+
+/** Private helpers */
+
+PagerResult Pager::journal_has_contents(bool &has_contents) {
+    // A journal has contents if it exists and its fd reports a non-zero size.
+    has_contents = false;
+
+    if (journal_fd != -1) {
+        try {
+            has_contents = disk::file_size(journal_fd) > 0;
+        } catch (const std::exception &) {
+            return PagerResult::JournalOpenFailed;
+        }
+        return PagerResult::Success;
+    }
+
+    try {
+        has_contents = std::filesystem::exists(jFile_name);
+    } catch (const std::exception &) {
+        return PagerResult::JournalOpenFailed;
+    }
+
+    if (!has_contents) return PagerResult::Success;
+
+    try {
+        journal_fd = disk::open_file(jFile_name, O_RDWR);
+        has_contents = disk::file_size(journal_fd) > 0;
+    } catch (const std::exception &) {
+        close_fd_if_open(journal_fd);
+        return PagerResult::JournalOpenFailed;
+    }
+
+    return PagerResult::Success;
+}
+
+PagerResult Pager::maybe_recover_hot_journal() {
+    // This is mainly used in the following places:
+    // - Opening a db: If we try to open a db, and then find that there's a hot journal, we need to rollback
+    // - Get: A process calling get could either be the process doing the write transaction or another process 
+    //        that is reading after a writer process crashed. In the first case, we don't want to rollback. that's
+    //        what the if statement is doing. In the latter, we do want to rollback
+    // - begin_write: similar reasoning
+    if (write_txn_state != WriteTxnState::None) return PagerResult::Success;
+    if (lock_manager->get_curr_lock() != Lock::NOLOCK) return PagerResult::Success;
+
+    bool hot_journal_exists = false;
+    PagerResult journal_check = journal_has_contents(hot_journal_exists);
+    if (journal_check != PagerResult::Success) return journal_check;
+    if (!hot_journal_exists) return PagerResult::Success;
+    return rollback_hot_journal();
+}
+
+PagerResult Pager::enter_from_nolock(Lock target_lock) {
+    // This is the common entry point whenever the pager is completely idle and needs
+    // to become an active reader or writer again.
+    assert(lock_manager->get_curr_lock() == Lock::NOLOCK);
+    assert(write_txn_state == WriteTxnState::None);
+    assert(target_lock == Lock::SHARED || target_lock == Lock::RESERVED);
+
+    // First recover if another process crashed and left a hot journal behind.
+    PagerResult recovery_result;
+    for (int i = 0; i < BUSY_RETRIES; i++) {
+        recovery_result = maybe_recover_hot_journal();
+        if (recovery_result != PagerResult::Busy) break;
+    }
+    if (recovery_result != PagerResult::Success) return recovery_result;
+
+    // Then acquire the stable privilege we actually need for the caller.
+    LockMgrStatus lock_result = lock_manager->lock(db_fd, target_lock);
+    if (lock_result == LockMgrStatus::Busy) return PagerResult::Busy;
+
+    // Only after the lock is stable is it safe to trust the header we reload here.
+    PagerResult header_result = load_db_header_from_disk();
+    if (header_result != PagerResult::Success) {
+        if (lock_manager->unlock(db_fd, Lock::NOLOCK) != LockMgrStatus::Success) std::abort();
+        return header_result;
+    }
+    return PagerResult::Success;
+}
+
+PagerResult Pager::finish_after_clean_state() {
+    assert(write_txn_state == WriteTxnState::None);
+    assert(dirty_pages.empty());
+
+    bool has_page_refs = (pCache->len() != pCache->unpinned_len());
+    Lock curr_lock = lock_manager->get_curr_lock();
+
+    if (has_page_refs) {
+        // If any refs are still alive, we must hold at least SHARED when we leave this helper.
+        assert(curr_lock != Lock::NOLOCK);
+        if (lock_manager->unlock(db_fd, Lock::SHARED) != LockMgrStatus::Success) std::abort();
+        return PagerResult::Success;
+    }
+
+    if (lock_manager->unlock(db_fd, Lock::NOLOCK) != LockMgrStatus::Success) std::abort();
+    return PagerResult::Success;
+}
+
+PagerResult Pager::restore_lock_after_failure(Lock pre_lock) {
+    if (write_txn_state == WriteTxnState::JournalDurable) {
+        // If the journal is durable already, we should still be sitting in EXCLUSIVE here.
+        // Trying to reacquire it would just hide a bug in the lock flow.
+        assert(lock_manager->get_curr_lock() == Lock::EXCLUSIVE);
+        return PagerResult::Success;
+    }
+
+    if (write_txn_state == WriteTxnState::DirtyInMemory) {
+        // Every current caller reaches here only after it already acquired RESERVED.
+        // So if we somehow lost it, that is a pager bug and not something to silently repair.
+        Lock curr_lock = lock_manager->get_curr_lock();
+        assert(curr_lock == Lock::RESERVED || curr_lock == Lock::EXCLUSIVE);
+        return PagerResult::Success;
+    }
+
+    assert(write_txn_state == WriteTxnState::None);
+    assert(dirty_pages.empty());
+
+    if (pre_lock == Lock::NOLOCK) {
+        return finish_after_clean_state();
+    }
+
+    if (lock_manager->unlock(db_fd, pre_lock) != LockMgrStatus::Success) std::abort();
+    return PagerResult::Success;
+}
+
+PagerResult Pager::replay_hot_journal_under_exclusive() {
+    // By the time we enter here, the caller already decided this recovery is real and
+    // made sure we are the only process allowed to touch the DB image.
+    assert(lock_manager->get_curr_lock() == Lock::EXCLUSIVE);
 
     // Check if a journal has already been started for this transaction
     bool valid_journal = false;
@@ -716,12 +1017,12 @@ PagerResult Pager::rollback_hot_journal() {
     }
     // Store the number of pages we restored. This is used in case multiple backup images for the same page
     // were written to the journal. We want to keep the first one only
-    std::unordered_set<int> restored_page_nums; 
+    std::unordered_set<int> restored_page_nums;
     std::streamoff curr_offset = 0;
     bool stop_recovery = false;
     bool has_recovery_target_page_count = false; // Have we already seen at least one valid journal header from which we learned the database size to restore to?
     std::uint32_t recovery_target_page_count = 0;
-    
+
     // Keep looping until we hit end of file or we abruptly stop the recovery process
     while (curr_offset < static_cast<std::streamoff>(journal_file_size) && !stop_recovery) {
         // We are at the start of a new section probably
@@ -851,60 +1152,7 @@ PagerResult Pager::rollback_hot_journal() {
         if (cleanup_result != PagerResult::Success) return cleanup_result;
     }
 
-    return load_db_header_from_disk();
-}
-
-/** Private helpers */
-
-PagerResult Pager::journal_has_contents(bool &has_contents) {
-    // A journal has contents if it exists and its fd reports a non-zero size.
-    has_contents = false;
-
-    if (journal_fd != -1) {
-        try {
-            has_contents = disk::file_size(journal_fd) > 0;
-        } catch (const std::exception &) {
-            return PagerResult::JournalOpenFailed;
-        }
-        return PagerResult::Success;
-    }
-
-    try {
-        has_contents = std::filesystem::exists(jFile_name);
-    } catch (const std::exception &) {
-        return PagerResult::JournalOpenFailed;
-    }
-
-    if (!has_contents) return PagerResult::Success;
-
-    try {
-        journal_fd = disk::open_file(jFile_name, O_RDWR);
-        has_contents = disk::file_size(journal_fd) > 0;
-    } catch (const std::exception &) {
-        close_fd_if_open(journal_fd);
-        return PagerResult::JournalOpenFailed;
-    }
-
     return PagerResult::Success;
-}
-
-PagerResult Pager::maybe_recover_hot_journal() {
-    // This is mainly used in the following places:
-    // - Opening a db: If we try to open a db, and then find that there's a hot journal, we need to rollback
-    // - Get: A process calling get could either be the process doing the write transaction or another process 
-    //        that is reading after a writer process crashed. In the first case, we don't want to rollback. that's
-    //        what the if statement is doing. In the latter, we do want to rollback
-    // - begin_write: similar reasoning
-    if (write_txn_state != WriteTxnState::None) return PagerResult::Success;
-
-    bool hot_journal_exists = false;
-    PagerResult journal_check = journal_has_contents(hot_journal_exists);
-    if (journal_check != PagerResult::Success) return journal_check;
-    if (!hot_journal_exists) return PagerResult::Success;
-
-    PagerResult recovery_result = rollback_hot_journal();
-    if (recovery_result != PagerResult::Success) return recovery_result;
-    return load_db_header_from_disk();
 }
 
 PagerResult Pager::cleanup_transaction_cache() {
@@ -946,6 +1194,18 @@ PagerResult Pager::cleanup_transaction_cache() {
     }
     write_txn_state = WriteTxnState::None;
     txn_init_header_valid = false;
+    return PagerResult::Success;
+}
+
+PagerResult Pager::purge_cache() {
+    // This is only safe when we are not in the middle of our own write transaction.
+    // If the file change counter moved forward, any older cached pages must be thrown away.
+    assert(write_txn_state == WriteTxnState::None);
+    assert(dirty_pages.empty());
+    assert(pCache->len() == pCache->unpinned_len());
+
+    delete pCache;
+    pCache = new PCache();
     return PagerResult::Success;
 }
 
@@ -992,6 +1252,7 @@ PagerResult Pager::create_new_database_file() {
 }
 
 PagerResult Pager::load_db_header_from_disk() {
+    // TODO: Should we acquire a shared lock here?
     char header_page[PAGE_SIZE] = {};
     try {
         std::span<char> header_page_span(header_page, PAGE_SIZE);
@@ -1018,6 +1279,13 @@ PagerResult Pager::load_db_header_from_disk() {
     if (file_size % PAGE_SIZE != 0) return PagerResult::DbHeaderCorrupt;
     if (loaded_header.db_page_count > file_size / PAGE_SIZE) return PagerResult::DbHeaderCorrupt;
 
+    // Before assigning the db_header to the loaded one
+    // let's check first the file change count. 
+    // If the loaded has a higher file change count, we purge the cache
+    if (db_header.db_page_count != 0 && db_header.file_change_counter < loaded_header.file_change_counter) {
+        PagerResult purge_result = purge_cache();
+        if (purge_result != PagerResult::Success) return purge_result;
+    }
     db_header = loaded_header;
     
     // if page 0 already happens to be cached, update that cached copy so it matches the disk/header we just loaded

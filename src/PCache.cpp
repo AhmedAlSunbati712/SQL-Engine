@@ -178,3 +178,7 @@ void PCache::unpin_page(int page_num) {
 int PCache::len() {
     return length;
 }
+
+int PCache::unpinned_len() {
+    return unpinned_pages->len();
+}

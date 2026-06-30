@@ -34,6 +34,7 @@ class PCache {
 		void pin_page(int page_num); // Called after refs_num increments. On a 0 -> 1 transition, move out of unpinned pages
 		void unpin_page(int page_num); // Called after refs_num decrements. On a 1 -> 0 transition, move into unpinned pages
 		int len();
+		int unpinned_len();
 	private:
 		static const int DEFAULT_CAPACITY = 64;
 		int capacity = DEFAULT_CAPACITY;
