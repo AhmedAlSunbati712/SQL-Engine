@@ -6,10 +6,15 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -59,6 +64,54 @@ class PagerIntegrationTest : public ::testing::Test {
         std::uintmax_t journal_size() const {
             if (!std::filesystem::exists(journal_path)) return 0;
             return std::filesystem::file_size(journal_path);
+        }
+
+        void write_exact_fd(int fd, const void *buffer, std::size_t size) {
+            const char *bytes = static_cast<const char *>(buffer);
+            std::size_t written = 0;
+            while (written < size) {
+                ssize_t rc = ::write(fd, bytes + written, size - written);
+                if (rc == -1) continue;
+                written += static_cast<std::size_t>(rc);
+            }
+        }
+
+        void read_exact_fd(int fd, void *buffer, std::size_t size) {
+            char *bytes = static_cast<char *>(buffer);
+            std::size_t read_bytes = 0;
+            while (read_bytes < size) {
+                ssize_t rc = ::read(fd, bytes + read_bytes, size - read_bytes);
+                if (rc == -1) continue;
+                read_bytes += static_cast<std::size_t>(rc);
+            }
+        }
+
+        void send_pager_result(int fd, PagerResult result) {
+            auto raw = static_cast<std::uint8_t>(result);
+            write_exact_fd(fd, &raw, sizeof(raw));
+        }
+
+        PagerResult recv_pager_result(int fd) {
+            std::uint8_t raw = 0;
+            read_exact_fd(fd, &raw, sizeof(raw));
+            return static_cast<PagerResult>(raw);
+        }
+
+        void send_signal(int fd) {
+            char signal = 'x';
+            write_exact_fd(fd, &signal, sizeof(signal));
+        }
+
+        void wait_signal(int fd) {
+            char signal = '\0';
+            read_exact_fd(fd, &signal, sizeof(signal));
+        }
+
+        void expect_child_exit_ok(pid_t pid) {
+            int status = 0;
+            ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+            ASSERT_TRUE(WIFEXITED(status));
+            EXPECT_EQ(WEXITSTATUS(status), 0);
         }
 
         std::filesystem::path temp_dir;
@@ -301,6 +354,278 @@ TEST_F(PagerIntegrationTest, RefPageFromNoLockReturnsPageNotCachedAfterPurge) {
     ASSERT_EQ(refreshed_get_result.status, PagerResult::Success);
     for (int i = 0; i < PAGE_SIZE; i++) {
         EXPECT_EQ(refreshed_get_result.data[i], 'T');
+    }
+}
+
+TEST_F(PagerIntegrationTest, MultipleProcessesCanReadSamePageConcurrently) {
+    {
+        Pager setup_pager;
+        ASSERT_EQ(setup_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult allocate_result = setup_pager.allocate_page();
+        ASSERT_EQ(allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(allocate_result.page_num, 1);
+
+        auto page_bytes = make_filled_page('U');
+        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(setup_pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(setup_pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    int child_to_parent[2];
+    int parent_to_child[2];
+    ASSERT_EQ(::pipe(child_to_parent), 0);
+    ASSERT_EQ(::pipe(parent_to_child), 0);
+
+    pid_t child_pid = ::fork();
+    ASSERT_NE(child_pid, -1);
+
+    if (child_pid == 0) {
+        ::close(child_to_parent[0]);
+        ::close(parent_to_child[1]);
+
+        Pager child_pager;
+        send_pager_result(child_to_parent[1], child_pager.open(db_path.string()));
+        PagerGetResult child_get_result = child_pager.get(1);
+        send_pager_result(child_to_parent[1], child_get_result.status);
+        wait_signal(parent_to_child[0]);
+        child_pager.unref_page(1);
+
+        ::close(child_to_parent[1]);
+        ::close(parent_to_child[0]);
+        _exit(0);
+    }
+
+    ::close(child_to_parent[1]);
+    ::close(parent_to_child[0]);
+
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+
+    Pager parent_pager;
+    ASSERT_EQ(parent_pager.open(db_path.string()), PagerResult::Success);
+    PagerGetResult parent_get_result = parent_pager.get(1);
+    ASSERT_EQ(parent_get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(parent_get_result.data[i], 'U');
+    }
+
+    send_signal(parent_to_child[1]);
+    ASSERT_EQ(parent_pager.unref_page(1), PagerResult::Success);
+
+    ::close(child_to_parent[0]);
+    ::close(parent_to_child[1]);
+    expect_child_exit_ok(child_pid);
+}
+
+TEST_F(PagerIntegrationTest, SecondWriterReturnsBusyWhileReservedHeldByAnotherProcess) {
+    int child_to_parent[2];
+    int parent_to_child[2];
+    ASSERT_EQ(::pipe(child_to_parent), 0);
+    ASSERT_EQ(::pipe(parent_to_child), 0);
+
+    pid_t child_pid = ::fork();
+    ASSERT_NE(child_pid, -1);
+
+    if (child_pid == 0) {
+        ::close(child_to_parent[0]);
+        ::close(parent_to_child[1]);
+
+        Pager child_pager;
+        send_pager_result(child_to_parent[1], child_pager.open(db_path.string()));
+        PagerAllocateResult child_allocate_result = child_pager.allocate_page();
+        send_pager_result(child_to_parent[1], child_allocate_result.status);
+        wait_signal(parent_to_child[0]);
+        child_pager.rollback_transaction();
+
+        ::close(child_to_parent[1]);
+        ::close(parent_to_child[0]);
+        _exit(0);
+    }
+
+    ::close(child_to_parent[1]);
+    ::close(parent_to_child[0]);
+
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+
+    Pager parent_pager;
+    ASSERT_EQ(parent_pager.open(db_path.string()), PagerResult::Success);
+    PagerAllocateResult parent_allocate_result = parent_pager.allocate_page();
+    ASSERT_EQ(parent_allocate_result.status, PagerResult::Busy);
+
+    send_signal(parent_to_child[1]);
+    ::close(child_to_parent[0]);
+    ::close(parent_to_child[1]);
+    expect_child_exit_ok(child_pid);
+}
+
+TEST_F(PagerIntegrationTest, CommitPhaseOneReturnsBusyWhileAnotherProcessStillReads) {
+    {
+        Pager setup_pager;
+        ASSERT_EQ(setup_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult allocate_result = setup_pager.allocate_page();
+        ASSERT_EQ(allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(allocate_result.page_num, 1);
+
+        auto page_bytes = make_filled_page('V');
+        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(setup_pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(setup_pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    int child_to_parent[2];
+    int parent_to_child[2];
+    ASSERT_EQ(::pipe(child_to_parent), 0);
+    ASSERT_EQ(::pipe(parent_to_child), 0);
+
+    pid_t child_pid = ::fork();
+    ASSERT_NE(child_pid, -1);
+
+    if (child_pid == 0) {
+        ::close(child_to_parent[0]);
+        ::close(parent_to_child[1]);
+
+        Pager child_pager;
+        send_pager_result(child_to_parent[1], child_pager.open(db_path.string()));
+        PagerGetResult child_get_result = child_pager.get(1);
+        send_pager_result(child_to_parent[1], child_get_result.status);
+        wait_signal(parent_to_child[0]);
+        child_pager.unref_page(1);
+
+        ::close(child_to_parent[1]);
+        ::close(parent_to_child[0]);
+        _exit(0);
+    }
+
+    ::close(child_to_parent[1]);
+    ::close(parent_to_child[0]);
+
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+
+    Pager writer_pager;
+    ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
+    PagerGetResult writer_get_result = writer_pager.get(1);
+    ASSERT_EQ(writer_get_result.status, PagerResult::Success);
+    ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
+
+    auto updated_page_bytes = make_filled_page('W');
+    std::memcpy(writer_get_result.data, updated_page_bytes.data(), PAGE_SIZE);
+
+    ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Busy);
+
+    send_signal(parent_to_child[1]);
+    ::close(child_to_parent[0]);
+    ::close(parent_to_child[1]);
+    expect_child_exit_ok(child_pid);
+
+    ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
+    ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
+    EXPECT_EQ(read_db_page(1), updated_page_bytes);
+}
+
+TEST_F(PagerIntegrationTest, GetRecoversHotJournalWrittenByAnotherProcess) {
+    auto original_page_bytes = make_filled_page('X');
+    auto updated_page_bytes = make_filled_page('Y');
+
+    {
+        Pager setup_pager;
+        ASSERT_EQ(setup_pager.open(db_path.string()), PagerResult::Success);
+
+        PagerAllocateResult allocate_result = setup_pager.allocate_page();
+        ASSERT_EQ(allocate_result.status, PagerResult::Success);
+        ASSERT_EQ(allocate_result.page_num, 1);
+        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+
+        ASSERT_EQ(setup_pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(setup_pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    Pager recovery_pager;
+    ASSERT_EQ(recovery_pager.open(db_path.string()), PagerResult::Success);
+
+    int child_to_parent[2];
+    ASSERT_EQ(::pipe(child_to_parent), 0);
+
+    pid_t child_pid = ::fork();
+    ASSERT_NE(child_pid, -1);
+
+    if (child_pid == 0) {
+        ::close(child_to_parent[0]);
+
+        Pager writer_pager;
+        send_pager_result(child_to_parent[1], writer_pager.open(db_path.string()));
+        PagerGetResult writer_get_result = writer_pager.get(1);
+        send_pager_result(child_to_parent[1], writer_get_result.status);
+        send_pager_result(child_to_parent[1], writer_pager.begin_write(1));
+        std::memcpy(writer_get_result.data, updated_page_bytes.data(), PAGE_SIZE);
+        send_pager_result(child_to_parent[1], writer_pager.commit_phase_one());
+
+        ::close(child_to_parent[1]);
+        _exit(0);
+    }
+
+    ::close(child_to_parent[1]);
+
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ::close(child_to_parent[0]);
+    expect_child_exit_ok(child_pid);
+
+    PagerGetResult recovery_get_result = recovery_pager.get(1);
+    ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.data[i], 'X');
+    }
+    EXPECT_EQ(read_db_page(1), original_page_bytes);
+    EXPECT_TRUE(journal_exists());
+    EXPECT_EQ(journal_size(), 0u);
+}
+
+TEST_F(PagerIntegrationTest, GetRefreshesStaleHeaderAfterOtherProcessAppendCommit) {
+    Pager stale_reader_pager;
+    ASSERT_EQ(stale_reader_pager.open(db_path.string()), PagerResult::Success);
+
+    int child_to_parent[2];
+    ASSERT_EQ(::pipe(child_to_parent), 0);
+
+    pid_t child_pid = ::fork();
+    ASSERT_NE(child_pid, -1);
+
+    if (child_pid == 0) {
+        ::close(child_to_parent[0]);
+
+        Pager writer_pager;
+        send_pager_result(child_to_parent[1], writer_pager.open(db_path.string()));
+        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        send_pager_result(child_to_parent[1], allocate_result.status);
+        auto page_bytes = make_filled_page('Q');
+        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+        send_pager_result(child_to_parent[1], writer_pager.commit_phase_one());
+        send_pager_result(child_to_parent[1], writer_pager.commit_phase_two());
+
+        ::close(child_to_parent[1]);
+        _exit(0);
+    }
+
+    ::close(child_to_parent[1]);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ASSERT_EQ(recv_pager_result(child_to_parent[0]), PagerResult::Success);
+    ::close(child_to_parent[0]);
+    expect_child_exit_ok(child_pid);
+
+    PagerGetResult get_result = stale_reader_pager.get(1);
+    ASSERT_EQ(get_result.status, PagerResult::Success);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_result.data[i], 'Q');
     }
 }
 
