@@ -1,0 +1,65 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <vector>
+#include <Value.h>
+
+enum class PageType : std::uint8_t {
+    Internal = 0,
+    Leaf
+};
+
+class BTreePage {
+    public:
+        explicit BTreePage(char *page);
+        virtual ~BTreePage() = default;
+        static PageType peek_page_type(const char *page);
+
+        bool is_leaf() const;
+        std::size_t key_count() const;
+        void write_back();
+        virtual bool remove(std::uint64_t key) = 0;
+
+    protected:
+        virtual void decode() = 0;
+        virtual void flush() = 0;
+
+        char *page;
+        std::vector<std::uint64_t> keys;
+        PageType page_type;
+        std::uint16_t free_offset_start;
+        std::uint16_t free_offset_end;
+};
+
+class BInternalTreePage : public BTreePage {
+    public:
+        explicit BInternalTreePage(char *page);
+        // Route a search key to the child subtree whose key interval contains it.
+        std::optional<std::uint32_t> child_for_key(std::uint64_t key) const;
+        bool remove(std::uint64_t key) override;
+
+    protected:
+        void decode() override;
+        void flush() override;
+
+    private:
+        // Internal pages hold M separator keys and M + 1 child page numbers.
+        std::vector<std::uint32_t> child_page_nums;
+};
+
+class BLeafPage : public BTreePage {
+    public:
+        explicit BLeafPage(char *page);
+
+        std::optional<Value> get(std::uint64_t key) const;
+        bool set(std::uint64_t key, const Value &value);
+        bool remove(std::uint64_t key) override;
+
+    protected:
+        void decode() override;
+        void flush() override;
+
+    private:
+        std::vector<Value> values;
+};

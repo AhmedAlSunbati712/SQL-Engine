@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -I/opt/homebrew/include
+CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -I/opt/homebrew/include
 LDFLAGS = -L/opt/homebrew/lib
 LDLIBS = -lgtest -lgtest_main
 AR = ar
@@ -8,7 +8,7 @@ ARFLAGS = rcs
 LIB = build/libsqlengine.a
 
 SRC = \
-	src/DLList.cpp \
+	src/containers/DLList.cpp \
 	src/JournalCodec.cpp \
 	src/LockMgr.cpp \
 	src/PCache.cpp \
@@ -18,7 +18,7 @@ SRC = \
 	src/DBHeaderCodec.cpp
 
 OBJ = \
-	build/DLList.o \
+	build/containers/DLList.o \
 	build/JournalCodec.o \
 	build/LockMgr.o \
 	build/PCache.o \
