@@ -13,3 +13,21 @@ std::uint32_t get_u32_be(const char *in) {
             static_cast<std::uint32_t>(static_cast<unsigned char>(in[2])) << 8  |
             static_cast<std::uint32_t>(static_cast<unsigned char>(in[3])));
 }
+
+void put_u16_be(char *out, std::uint16_t value) {
+    out[0] = static_cast<char>((value >> 8) & 0xFF);
+    out[1] = static_cast<char>(value & 0xFF);
+}
+
+std::uint16_t get_u16_be(const char *in) {
+    return (static_cast<std::uint32_t>(static_cast<unsigned char>(in[0])) << 8  |
+            static_cast<std::uint32_t>(static_cast<unsigned char>(in[1])));
+}
+
+void put_u8_be(char *out, std::uint8_t value) {
+    out[0] = static_cast<char>(value & 0xFF);
+}
+
+std::uint8_t get_u8_be(const char *in) {
+    return static_cast<std::uint8_t>(static_cast<unsigned char>(in[0]));
+}

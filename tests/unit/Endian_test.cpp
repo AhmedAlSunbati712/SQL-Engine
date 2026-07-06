@@ -58,4 +58,60 @@ TEST(EndianTest, RoundTripMixedByteValue) {
     EXPECT_EQ(value, 0xA1B2C3D4u);
 }
 
+TEST(EndianTest, PutU16BeWritesBytesInBigEndianOrder) {
+    std::array<char, 2> buffer{};
+
+    put_u16_be(buffer.data(), 0x1234u);
+
+    EXPECT_EQ(static_cast<unsigned char>(buffer[0]), 0x12);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[1]), 0x34);
+}
+
+TEST(EndianTest, GetU16BeReadsBytesInBigEndianOrder) {
+    std::array<char, 2> buffer{
+        static_cast<char>(0x12),
+        static_cast<char>(0x34),
+    };
+
+    std::uint16_t value = get_u16_be(buffer.data());
+
+    EXPECT_EQ(value, 0x1234u);
+}
+
+TEST(EndianTest, RoundTripU16MaxValue) {
+    std::array<char, 2> buffer{};
+
+    put_u16_be(buffer.data(), 0xFFFFu);
+    std::uint16_t value = get_u16_be(buffer.data());
+
+    EXPECT_EQ(value, 0xFFFFu);
+}
+
+TEST(EndianTest, PutU8BeWritesByte) {
+    std::array<char, 1> buffer{};
+
+    put_u8_be(buffer.data(), 0xABu);
+
+    EXPECT_EQ(static_cast<unsigned char>(buffer[0]), 0xAB);
+}
+
+TEST(EndianTest, GetU8BeReadsByte) {
+    std::array<char, 1> buffer{
+        static_cast<char>(0xAB),
+    };
+
+    std::uint8_t value = get_u8_be(buffer.data());
+
+    EXPECT_EQ(value, 0xABu);
+}
+
+TEST(EndianTest, RoundTripU8MaxValue) {
+    std::array<char, 1> buffer{};
+
+    put_u8_be(buffer.data(), 0xFFu);
+    std::uint8_t value = get_u8_be(buffer.data());
+
+    EXPECT_EQ(value, 0xFFu);
+}
+
 }
