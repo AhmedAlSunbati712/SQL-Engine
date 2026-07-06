@@ -38,7 +38,7 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
      * if descent failed, return failure status
      *
      * leaf <- BTreeLeafPage(descent.leaf_page.data)
-     * idx <- lower_bound_key(leaf, key)
+     * idx <- leaf.lower_bound_key(key)
      * if idx is out of bounds or leaf.keys[idx] != key {
      *      pager->unref(descent.leaf_page_num)
      *      status.status <- not_found
@@ -58,7 +58,7 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
      * if descent failed, return failure
      *
      * leaf <- BTreeLeafPage(descent.leaf_page.data)
-     * idx <- lower_bound_key(leaf, key)
+     * idx <- leaf.lower_bound_key(key)
      *
      * if idx is in bounds and leaf.keys[idx] == key {
      *      leaf.values[idx] <- value
@@ -102,7 +102,7 @@ BTreeRemoveStatus BTree::remove(std::uint64_t key) {
      * if descent failed, return failure
      *
      * leaf <- BTreeLeafPage(descent.leaf_page.data)
-     * idx <- lower_bound_key(leaf, key)
+     * idx <- leaf.lower_bound_key(key)
      * if idx is out of bounds or leaf.keys[idx] != key {
      *      pager->unref(descent.leaf_page_num)
      *      return not_found

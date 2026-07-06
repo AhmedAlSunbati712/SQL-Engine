@@ -51,7 +51,6 @@ class BTree {
         BTreeRemoveStatus remove(std::uint64_t key);
     private:
         LeafDescentResult descend_from_root_to_leaf(std::uint64_t key);
-        std::size_t lower_bound_key(const BLeafPage &leaf, std::uint64_t key) const;
         std::size_t minimum_allowed_keys() const;
         BTreeStatus propagate_separator_change_upward(const std::vector<TraversalPathEntry> &path, std::uint64_t new_subtree_min);
         BTreeStatus propagate_splitting(std::uint32_t split_page_num, const std::vector<TraversalPathEntry> &path, std::uint64_t split_key);

@@ -18,6 +18,9 @@ class BTreePage {
 
         bool is_leaf() const;
         std::size_t key_count() const;
+        std::size_t lower_bound_key(std::uint64_t key) const;
+        std::optional<std::uint64_t> first_key() const;
+        std::optional<std::uint64_t> key_at(std::size_t idx) const;
         void write_back();
         virtual bool remove(std::uint64_t key) = 0;
 
@@ -32,11 +35,13 @@ class BTreePage {
         std::uint16_t free_offset_end;
 };
 
-class BInternalTreePage : public BTreePage {
+class BInternalPage : public BTreePage {
     public:
-        explicit BInternalTreePage(char *page);
-        // Route a search key to the child subtree whose key interval contains it.
-        std::optional<std::uint32_t> child_for_key(std::uint64_t key) const;
+        explicit BInternalPage(char *page);
+        bool insert_at(std::size_t idx, std::uint64_t key, std::uint32_t right_child_page_num);
+        bool remove_at(std::size_t idx);
+        std::optional<std::uint32_t> get_left_child(std::size_t separator_idx) const;
+        std::optional<std::uint32_t> get_right_child(std::size_t separator_idx) const;
         bool remove(std::uint64_t key) override;
 
     protected:
@@ -53,6 +58,8 @@ class BLeafPage : public BTreePage {
         explicit BLeafPage(char *page);
 
         std::optional<Value> get(std::uint64_t key) const;
+        bool insert_at(std::size_t idx, std::uint64_t key, const Value &value);
+        bool remove_at(std::size_t idx);
         bool set(std::uint64_t key, const Value &value);
         bool remove(std::uint64_t key) override;
 

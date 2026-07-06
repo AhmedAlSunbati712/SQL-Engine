@@ -1,7 +1,7 @@
 #include <BTreePage.h>
 
 
-void BInternalTreePage::decode() {
+void BInternalPage::decode() {
     /**
      * Structure of an internal page
      *  <----------------------------------------------------------------                  4KB                  ---------------------------------------------------------------->
