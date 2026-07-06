@@ -5,6 +5,10 @@
 #include <string>
 #include <vector>
 
+constexpr std::size_t BTREE_ORDER = 200;
+constexpr std::size_t MAX_KEYS(std::size_t order) { return order - 1; }
+constexpr std::size_t MIN_KEYS(std::size_t order) { return ((order + 1) / 2) - 1; }
+
 enum class BTreeStatus : std::uint8_t {
     Success = 0,
     FailedToOpenDB,
