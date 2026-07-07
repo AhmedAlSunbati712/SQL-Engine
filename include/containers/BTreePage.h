@@ -17,7 +17,6 @@ class BTreePage {
         static PageType peek_page_type(const char *page);
 
         bool is_leaf() const;
-        std::size_t key_count() const;
         std::size_t lower_bound_key(std::uint64_t key) const;
         std::optional<std::uint64_t> first_key() const;
         std::optional<std::uint64_t> key_at(std::size_t idx) const;
@@ -33,6 +32,7 @@ class BTreePage {
         PageType page_type;
         std::uint16_t free_offset_start;
         std::uint16_t free_offset_end;
+        std::uint16_t key_count;
 };
 
 class BInternalPage : public BTreePage {
@@ -47,6 +47,7 @@ class BInternalPage : public BTreePage {
     protected:
         void decode() override;
         void flush() override;
+        void parse_internal_cell(const char *in, std::uint64_t *key, std::uint32_t *right_child_page_num);
 
     private:
         // Internal pages hold M separator keys and M + 1 child page numbers.

@@ -31,6 +31,38 @@ TEST(EndianTest, GetU32BeReadsBytesInBigEndianOrder) {
     EXPECT_EQ(value, 0x12345678u);
 }
 
+TEST(EndianTest, PutU64BeWritesBytesInBigEndianOrder) {
+    std::array<char, 8> buffer{};
+
+    put_u64_be(buffer.data(), 0x0123456789ABCDEFuLL);
+
+    EXPECT_EQ(static_cast<unsigned char>(buffer[0]), 0x01);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[1]), 0x23);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[2]), 0x45);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[3]), 0x67);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[4]), 0x89);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[5]), 0xAB);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[6]), 0xCD);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[7]), 0xEF);
+}
+
+TEST(EndianTest, GetU64BeReadsBytesInBigEndianOrder) {
+    std::array<char, 8> buffer{
+        static_cast<char>(0x01),
+        static_cast<char>(0x23),
+        static_cast<char>(0x45),
+        static_cast<char>(0x67),
+        static_cast<char>(0x89),
+        static_cast<char>(0xAB),
+        static_cast<char>(0xCD),
+        static_cast<char>(0xEF),
+    };
+
+    std::uint64_t value = get_u64_be(buffer.data());
+
+    EXPECT_EQ(value, 0x0123456789ABCDEFuLL);
+}
+
 TEST(EndianTest, RoundTripZeroValue) {
     std::array<char, 4> buffer{};
 
@@ -56,6 +88,15 @@ TEST(EndianTest, RoundTripMixedByteValue) {
     std::uint32_t value = get_u32_be(buffer.data());
 
     EXPECT_EQ(value, 0xA1B2C3D4u);
+}
+
+TEST(EndianTest, RoundTripU64MixedByteValue) {
+    std::array<char, 8> buffer{};
+
+    put_u64_be(buffer.data(), 0x0F1E2D3C4B5A6978uLL);
+    std::uint64_t value = get_u64_be(buffer.data());
+
+    EXPECT_EQ(value, 0x0F1E2D3C4B5A6978uLL);
 }
 
 TEST(EndianTest, PutU16BeWritesBytesInBigEndianOrder) {
