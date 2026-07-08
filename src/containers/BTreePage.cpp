@@ -1,9 +1,16 @@
 #include <BTreePage.h>
 #include <Endian.h>
 #include <Value.h>
+#include <cstdlib>
 #include <cstring>
 
 BTreePage::BTreePage(char *page) : page(page) {}
+
+PageType BTreePage::peek_page_type(const char *page) {
+    std::uint8_t page_type_int = get_u8_be(page);
+    if (page_type_int > 1) std::abort(); // TODO: REPLACE WITH SOMETHING ELSE LATER
+    return static_cast<PageType>(page_type_int);
+}
 
 bool BTreePage::is_leaf() const {
     return page_type == PageType::Leaf;
@@ -40,6 +47,10 @@ void BTreePage::write_back() {
 }
 
 // ========================================= Internal Pages ======================================
+
+BInternalPage::BInternalPage(char *page) : BTreePage(page) {
+    decode();
+}
 
 void BInternalPage::decode() {
     /**
@@ -136,6 +147,25 @@ bool BInternalPage::remove_separator_at(std::size_t idx) {
     return true;
 }
 
+std::optional<std::uint32_t> BInternalPage::get_left_child(std::size_t separator_idx) const {
+    if (separator_idx >= keys.size()) return std::nullopt;
+    if (child_page_nums.size() != keys.size() + 1) return std::nullopt;
+    return child_page_nums[separator_idx];
+}
+
+std::optional<std::uint32_t> BInternalPage::get_right_child(std::size_t separator_idx) const {
+    if (separator_idx >= keys.size()) return std::nullopt;
+    if (child_page_nums.size() != keys.size() + 1) return std::nullopt;
+    return child_page_nums[separator_idx + 1];
+}
+
+bool BInternalPage::remove(std::uint64_t key) {
+    std::size_t idx = lower_bound_key(key);
+    if (idx >= keys.size()) return false;
+    if (keys[idx] != key) return false;
+    return remove_separator_at(idx);
+}
+
 void BInternalPage::flush() {
     // Clear the page first so any stale bytes from older layouts do not survive after flush.
     std::memset(page, 0, 4096);
@@ -174,6 +204,11 @@ void BInternalPage::parse_internal_cell(const char *in, std::uint64_t *key, std:
 
 
 // ====================================== Leaf Page =======================================
+
+BLeafPage::BLeafPage(char *page) : BTreePage(page) {
+    decode();
+}
+
 void BLeafPage::decode() {
     /**
      * Structure of a leaf page

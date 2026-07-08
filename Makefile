@@ -8,6 +8,7 @@ ARFLAGS = rcs
 LIB = build/libsqlengine.a
 
 SRC = \
+	src/containers/BTreePage.cpp \
 	src/containers/DLList.cpp \
 	src/JournalCodec.cpp \
 	src/LockMgr.cpp \
@@ -18,6 +19,7 @@ SRC = \
 	src/DBHeaderCodec.cpp
 
 OBJ = \
+	build/containers/BTreePage.o \
 	build/containers/DLList.o \
 	build/JournalCodec.o \
 	build/LockMgr.o \
