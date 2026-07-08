@@ -20,7 +20,7 @@ class BTreePage {
         std::size_t lower_bound_key(std::uint64_t key) const;
         std::optional<std::uint64_t> first_key() const;
         std::optional<std::uint64_t> key_at(std::size_t idx) const;
-        void write_back();
+        virtual void write_back();
         virtual bool remove(std::uint64_t key) = 0;
 
     protected:
@@ -43,6 +43,7 @@ class BInternalPage : public BTreePage {
         std::optional<std::uint32_t> get_left_child(std::size_t separator_idx) const;
         std::optional<std::uint32_t> get_right_child(std::size_t separator_idx) const;
         bool remove(std::uint64_t key) override;
+        void write_back() override;
 
     protected:
         void decode() override;
@@ -63,10 +64,12 @@ class BLeafPage : public BTreePage {
         bool remove_at(std::size_t idx);
         bool set(std::uint64_t key, const Value &value);
         bool remove(std::uint64_t key) override;
+        void write_back() override;
 
     protected:
         void decode() override;
         void flush() override;
+        void parse_leaf_cell(const char *in, std::uint64_t *key, Value *value);
 
     private:
         std::vector<Value> values;
