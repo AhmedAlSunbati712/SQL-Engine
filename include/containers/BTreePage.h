@@ -38,8 +38,8 @@ class BTreePage {
 class BInternalPage : public BTreePage {
     public:
         explicit BInternalPage(char *page);
-        bool insert_at(std::size_t idx, std::uint64_t key, std::uint32_t right_child_page_num);
-        bool remove_at(std::size_t idx);
+        bool insert_separator_at(std::size_t idx, std::uint64_t key, std::uint32_t right_child_page_num);
+        bool remove_separator_at(std::size_t idx);
         std::optional<std::uint32_t> get_left_child(std::size_t separator_idx) const;
         std::optional<std::uint32_t> get_right_child(std::size_t separator_idx) const;
         bool remove(std::uint64_t key) override;

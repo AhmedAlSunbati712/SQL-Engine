@@ -3,6 +3,42 @@
 #include <Value.h>
 #include <cstring>
 
+BTreePage::BTreePage(char *page) : page(page) {}
+
+bool BTreePage::is_leaf() const {
+    return page_type == PageType::Leaf;
+}
+
+std::size_t BTreePage::lower_bound_key(std::uint64_t key) const {
+    std::size_t left = 0;
+    std::size_t right = keys.size();
+
+    while (left < right) {
+        std::size_t mid = left + (right - left) / 2;
+        if (keys[mid] < key) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+
+    return left;
+}
+
+std::optional<std::uint64_t> BTreePage::first_key() const {
+    if (keys.empty()) return std::nullopt;
+    return keys[0];
+}
+
+std::optional<std::uint64_t> BTreePage::key_at(std::size_t idx) const {
+    if (idx >= keys.size()) return std::nullopt;
+    return keys[idx];
+}
+
+void BTreePage::write_back() {
+    flush();
+}
+
 // ========================================= Internal Pages ======================================
 
 void BInternalPage::decode() {
@@ -78,6 +114,26 @@ void BInternalPage::decode() {
 
 void BInternalPage::write_back() {
     flush();
+}
+
+bool BInternalPage::insert_separator_at(std::size_t idx, std::uint64_t key, std::uint32_t right_child_page_num) {
+    if (idx > keys.size()) return false;
+    if (child_page_nums.size() != keys.size() + 1) return false;
+
+    keys.insert(keys.begin() + idx, key);
+    child_page_nums.insert(child_page_nums.begin() + idx + 1, right_child_page_num);
+    key_count = static_cast<std::uint16_t>(keys.size());
+    return true;
+}
+
+bool BInternalPage::remove_separator_at(std::size_t idx) {
+    if (idx >= keys.size()) return false;
+    if (child_page_nums.size() != keys.size() + 1) return false;
+
+    keys.erase(keys.begin() + idx);
+    child_page_nums.erase(child_page_nums.begin() + idx + 1);
+    key_count = static_cast<std::uint16_t>(keys.size());
+    return true;
 }
 
 void BInternalPage::flush() {
@@ -191,6 +247,48 @@ void BLeafPage::decode() {
 void BLeafPage::write_back() {
     flush();
     return;
+}
+
+std::optional<Value> BLeafPage::get(std::uint64_t key) const {
+    std::size_t idx = lower_bound_key(key);
+    if (idx >= keys.size()) return std::nullopt;
+    if (keys[idx] != key) return std::nullopt;
+    return values[idx];
+}
+
+bool BLeafPage::insert_at(std::size_t idx, std::uint64_t key, const Value &value) {
+    if (idx > keys.size()) return false;
+
+    keys.insert(keys.begin() + idx, key);
+    values.insert(values.begin() + idx, value);
+    key_count = static_cast<std::uint16_t>(keys.size());
+    return true;
+}
+
+bool BLeafPage::remove_at(std::size_t idx) {
+    if (idx >= keys.size()) return false;
+    if (values.size() != keys.size()) return false;
+
+    keys.erase(keys.begin() + idx);
+    values.erase(values.begin() + idx);
+    key_count = static_cast<std::uint16_t>(keys.size());
+    return true;
+}
+
+bool BLeafPage::set(std::uint64_t key, const Value &value) {
+    std::size_t idx = lower_bound_key(key);
+    if (idx >= keys.size()) return false;
+    if (keys[idx] != key) return false;
+
+    values[idx] = value;
+    return true;
+}
+
+bool BLeafPage::remove(std::uint64_t key) {
+    std::size_t idx = lower_bound_key(key);
+    if (idx >= keys.size()) return false;
+    if (keys[idx] != key) return false;
+    return remove_at(idx);
 }
 
 void BLeafPage::flush() {
