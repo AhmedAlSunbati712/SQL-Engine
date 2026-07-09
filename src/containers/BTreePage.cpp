@@ -16,6 +16,9 @@ bool BTreePage::is_leaf() const {
     return page_type == PageType::Leaf;
 }
 
+std::uint16_t BTreePage::get_key_count() {
+    return key_count;
+}
 std::size_t BTreePage::lower_bound_key(std::uint64_t key) const {
     std::size_t left = 0;
     std::size_t right = keys.size();

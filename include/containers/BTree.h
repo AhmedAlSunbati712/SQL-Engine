@@ -13,8 +13,26 @@ enum class BTreeStatus : std::uint8_t {
     Success = 0,
     FailedToOpenDB,
     FailedToCloseDB,
+    KeyNotInTree,
+    FailedToGetRoot,
+    FailedToRead,
     FailedToInsert,
     FailedToRemove,
+};
+
+enum class BTreeCommitStatus : std::uint8_t {
+    Success = 0,
+    Failed
+};
+
+enum class BTreeRollbackStatus : std::uint8_t {
+    Success = 0,
+    Failed
+};
+
+enum class ChildDirection : std::uint8_t {
+    Right = 0,
+    Left
 };
 
 struct BTreeGetStatus {
@@ -29,28 +47,30 @@ struct BTreeRemoveStatus {
 
 struct TraversalPathEntry {
     std::uint32_t parent_page_num;
-    std::size_t child_index_taken;
     std::size_t separator_index_used;
+    ChildDirection child_dir;
 };
 
 struct LeafDescentResult {
-    BTreeStatus status;
-    Page *leaf_page = nullptr;
+    BTreeStatus status = BTreeStatus::Success;
+    char *leaf_page = nullptr;
     std::uint32_t leaf_page_num = 0;
     std::vector<TraversalPathEntry> path;
 };
+
 
 class BTree {
     public:
         BTree() = default;
         ~BTree();
         BTreeStatus open(std::string db_file);
-        BTreeStatus close();
+        BTreeCommitStatus commit();
+        BTreeRollbackStatus rollback();
         BTreeGetStatus get(std::uint64_t key);
         BTreeStatus insert(std::uint64_t key, Value &value);
         BTreeRemoveStatus remove(std::uint64_t key);
     private:
-        LeafDescentResult descend_from_root_to_leaf(std::uint64_t key);
+        LeafDescentResult descend_from_root_to_leaf(std::uint64_t key, bool include_path);
         std::size_t minimum_allowed_keys() const;
         BTreeStatus propagate_separator_change_upward(const std::vector<TraversalPathEntry> &path, std::uint64_t new_subtree_min);
         BTreeStatus propagate_splitting(std::uint32_t split_page_num, const std::vector<TraversalPathEntry> &path, std::uint64_t split_key);

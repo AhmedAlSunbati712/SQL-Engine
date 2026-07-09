@@ -27,6 +27,7 @@ enum class PagerResult : std::uint8_t {
     RollbackRecordCorrupt,
     Busy,
     PageNotCached,
+    EmptyBTree
 };
 
 struct PagerGetResult {
@@ -40,11 +41,17 @@ struct PagerAllocateResult {
     char *data = nullptr;
 };
 
+struct PagerGetRootResult {
+    PagerResult status = PagerResult::Success;
+    char *data = nullptr;
+    std::uint64_t root_page_num;
+};
+
 class Pager {
 	public:
 		Pager();
 		~Pager();
-		PagerResult open(std::string db_file);
+		PagerResult open(std::string db_file); // TODO: Should also create a btree head page if it doesn't exist. Should configure a constant defining the default order
 		PagerGetResult get(int page_num);
         PagerAllocateResult allocate_page();
         PagerResult free_page(int page_num);
@@ -55,6 +62,7 @@ class Pager {
 		PagerResult commit_phase_two();
 		PagerResult rollback_transaction();
 		PagerResult rollback_hot_journal();
+        PagerGetRootResult get_btree_root(); //  TODO: should also return root page nuumber. 
 	private:
 		struct PagerReadPageResult {
 			PagerResult status = PagerResult::Success;

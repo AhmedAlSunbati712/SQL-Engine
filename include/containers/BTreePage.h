@@ -17,6 +17,7 @@ class BTreePage {
         static PageType peek_page_type(const char *page);
 
         bool is_leaf() const;
+        std::uint16_t get_key_count();
         std::size_t lower_bound_key(std::uint64_t key) const;
         std::optional<std::uint64_t> first_key() const;
         std::optional<std::uint64_t> key_at(std::size_t idx) const;
