@@ -179,6 +179,8 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
         descent_result.status = BTreeStatus::FailedToGetRoot;
         return descent_result;
     }
+
+    // If the root is already a leaf, return the root
     PageType root_page_type = BTreePage::peek_page_type(root_get_result.data);
     if (root_page_type == PageType::Leaf) {
         descent_result.leaf_page = root_get_result.data;
@@ -186,44 +188,58 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
         return descent_result;
     }
 
+    // Otherwise, keep on descending downwards until we hit a leaf
     std::uint32_t curr_page_num = root_get_result.root_page_num;
     char *curr_data = root_get_result.data; 
     while (true) {
-        BInternalPage curr(root_get_result.data);
-        std::size_t idx = curr.lower_bound_key(key);
-        std::size_t adjusted_idx = ((idx == static_cast<std::size_t>(curr.get_key_count())) ? idx - 1 : idx);
+        // Decode the current node raw bytes into an in-memory internal page object
+        BInternalPage curr(curr_data);
+        std::size_t idx = curr.lower_bound_key(key); // The idx of the first key greater or equal to the key
 
-        std::optional<std::uint64_t> key_at_idx = curr.key_at(adjusted_idx);
         std::optional<std::uint32_t> target_child_page_num;
         ChildDirection child_dir;
-        if (*key_at_idx == key) {
-            target_child_page_num = curr.get_right_child(adjusted_idx);
+        if (idx == curr.get_key_count()) {
+            // The target key is greater than all keys in the current node
+            target_child_page_num = curr.get_right_child(idx - 1);
+            child_dir = ChildDirection::Right;
+        } else if (*curr.key_at(idx) == key) { 
+            // The key at the idx is equal to the target
+            target_child_page_num = curr.get_right_child(idx);
             child_dir = ChildDirection::Right;
         } else {
-            target_child_page_num = curr.get_left_child(adjusted_idx);
+            // The key at the idx is greater than the target
+            target_child_page_num = curr.get_left_child(idx);
             child_dir = ChildDirection::Left;
         }
 
+        // Get the computed child page number. That's the next page in our traversal
         PagerGetResult pager_get_result = pager->get(*target_child_page_num);
-        pager->unref_page(curr_page_num);
+        pager->unref_page(curr_page_num); // Make sure to unref the parent page since we don't need it anymore.
 
+        // Handle failure of reading
         if (pager_get_result.status != PagerResult::Success) {
             descent_result.status = BTreeStatus::FailedToRead;
             return descent_result;
         }
 
+        // If the caller wants us to record our path to the target leaf, record the page num 
+        // of the current internal node + the key idx we took
         if (include_path) {
-            TraversalPathEntry entry{curr_page_num, adjusted_idx, child_dir};
+            std::size_t pivot_idx = ((idx == curr.get_key_count()) ? idx - 1 : idx);
+            TraversalPathEntry entry{curr_page_num, pivot_idx, child_dir};
             descent_result.path.push_back(entry);
         }
 
+        // Set the new curr values
         curr_page_num = *target_child_page_num;
         curr_data = pager_get_result.data;
 
+        // If the next page is a leaf, terminate the search here
         PageType child_page_type = BTreePage::peek_page_type(pager_get_result.data);
         if (child_page_type == PageType::Leaf) break;
     }
 
+    // Finalize result
     descent_result.leaf_page = curr_data;
     descent_result.leaf_page_num = curr_page_num;
     return descent_result;
