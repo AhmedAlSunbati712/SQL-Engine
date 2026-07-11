@@ -55,6 +55,10 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
     // Descend from the root tohe leaf. We pass false to the second arg
     // Since we are not interested in keeping the parent pointers
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, false);
+    if (descent_result.status == BTreeStatus::EmptyTree) {
+        get_result.status = BTreeStatus::KeyNotInTree;
+        return get_result;
+    }
     if (descent_result.status != BTreeStatus::Success) {
         get_result.status = descent_result.status;
         return get_result;
@@ -88,7 +92,18 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
 BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
     /**
      * descent <- descend_from_root_to_leaf(key)
-     * if descent failed, return failure
+     *
+     * if descent reports an empty tree {
+     *      root_page <- pager.allocate_page()
+     *      initialize root_page as a leaf
+     *      insert the first key-value pair into it
+     *      write it back
+     *      pager.set_btree_root(root_page)
+     *      pager->unref(root_page)
+     *      return success
+     * }
+     *
+     * if descent failed for any other reason, return failure
      *
      * leaf <- BTreeLeafPage(descent.leaf_page.data)
      * idx <- leaf.lower_bound_key(key)
@@ -101,7 +116,6 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
      * }
      *
      * leaf.insert_at(idx, key, value)
-     * first_key_changed <- (idx == 0)
      * needs_split <- (leaf.key_count() == m)
      *
      * leaf.write_back()
@@ -110,17 +124,11 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
      *      # Recursive helper handles all parent splits and also handles the root case itself
      *      split_result <- propagate_splitting(
      *          split_page_num = descent.leaf_page_num,
-     *          path = descent.path,
-     *          split_page_type = leaf,
-     *          split_key = leaf.first_key_of_right_split()
+     *          path = descent.path
      *      )
      *
      *      pager->unref(descent.leaf_page_num)
      *      return split_result.status
-     * }
-     *
-     * if first_key_changed {
-     *      propagate_separator_change_upward(descent.path, leaf.first_key())
      * }
      *
      * pager->unref(descent.leaf_page_num)
@@ -129,6 +137,26 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
     // Descend from the root to the target leaf.
     // We need the path this time in case the insert changes separators or causes a split.
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
+    if (descent_result.status == BTreeStatus::EmptyTree) {
+        PagerAllocateResult allocation_result = pager->allocate_page();
+        if (allocation_result.status != PagerResult::Success) return BTreeStatus::FailedToInsert;
+
+        std::uint32_t root_page_num = allocation_result.page_num;
+        BLeafPage::fill_initial_layout(allocation_result.data);
+        BLeafPage root_leaf(allocation_result.data);
+
+        bool insert_result = root_leaf.insert_at(0, key, value);
+        if (!insert_result) {
+            pager->unref_page(root_page_num);
+            return BTreeStatus::FailedToInsert;
+        }
+
+        root_leaf.write_back();
+        PagerResult set_root_result = pager->set_btree_root(root_page_num);
+        pager->unref_page(root_page_num);
+        if (set_root_result != PagerResult::Success) return BTreeStatus::FailedToInsert;
+        return BTreeStatus::Success;
+    }
     if (descent_result.status != BTreeStatus::Success) return descent_result.status;
 
     // Before mutating the page bytes, tell the pager we are beginning a write on this page.
@@ -156,7 +184,6 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
         return BTreeStatus::Success;
     }
 
-    bool first_key_changed = (idx == 0);
     bool insert_result = target_leaf.insert_at(idx, key, value);
     if (!insert_result) {
         pager->unref_page(descent_result.leaf_page_num);
@@ -170,35 +197,12 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
     target_leaf.write_back();
 
     if (needs_split) {
-        // After an overflow insert, the right split begins at the midpoint of the overflowed leaf.
-        std::size_t split_idx = target_leaf.get_key_count() / 2;
-        std::optional<std::uint64_t> split_key = target_leaf.key_at(split_idx);
-        if (split_key == std::nullopt) {
-            pager->unref_page(descent_result.leaf_page_num);
-            return BTreeStatus::FailedToInsert;
-        }
-
         BTreeStatus split_result = propagate_splitting(
             descent_result.leaf_page_num,
-            descent_result.path,
-            *split_key
+            descent_result.path
         );
         pager->unref_page(descent_result.leaf_page_num);
         return split_result;
-    }
-
-    if (first_key_changed) {
-        std::optional<std::uint64_t> new_subtree_min = target_leaf.first_key();
-        if (new_subtree_min == std::nullopt) {
-            pager->unref_page(descent_result.leaf_page_num);
-            return BTreeStatus::FailedToInsert;
-        }
-
-        BTreeStatus separator_result = propagate_separator_change_upward(descent_result.path, *new_subtree_min);
-        if (separator_result != BTreeStatus::Success) {
-            pager->unref_page(descent_result.leaf_page_num);
-            return separator_result;
-        }
     }
 
     pager->unref_page(descent_result.leaf_page_num);
@@ -251,6 +255,10 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
     LeafDescentResult descent_result{};
     PagerGetRootResult root_get_result = pager->get_btree_root();
 
+    if (root_get_result.status == PagerResult::EmptyBTree) {
+        descent_result.status = BTreeStatus::EmptyTree;
+        return descent_result;
+    }
     if (root_get_result.status != PagerResult::Success) {
         descent_result.status = BTreeStatus::FailedToGetRoot;
         return descent_result;
@@ -321,7 +329,7 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
     return descent_result;
 }
 
-BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, const std::vector<TraversalPathEntry> &path, std::uint64_t split_key) {
+BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector<TraversalPathEntry> &path) {
     /**
      * Purpose:
      * The page split_page_num overflowed after an insert.
@@ -346,6 +354,7 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, const std::
      * For a leaf split:
      * - the promoted separator is the first key of the new right leaf
      * - that promoted key stays inside the right leaf
+     * - no existing parent separator needs readjustment
      *
      * So here:
      *  promoted_key = 30
@@ -386,6 +395,7 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, const std::
      * For an internal split:
      * - the promoted median key does NOT stay in either child
      * - it moves upward into the parent only
+     * - no existing parent separator needs readjustment
      *
      * Parent repair is the same pattern:
      * - replace the one child pointer to the old page with:
@@ -415,11 +425,279 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, const std::
      * 6. If there is no parent in path:
      *    - allocate a new root
      *    - install promoted_key and the two child pointers
+     *    - update the pager's root page number in the DB header
      *    - return success
      * 7. Otherwise:
      *    - load the parent page
      *    - insert promoted_key and the new right child immediately to the right of the old child
      *    - if the parent overflowed, recursively call propagate_splitting on the parent
      *    - otherwise write back the parent and return success
+     * 
      */
+    PagerGetResult get_split_page_result = pager->get(split_page_num);
+    if (get_split_page_result.status != PagerResult::Success) {
+        pager->unref_page(split_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    PageType page_type = BTreePage::peek_page_type(get_split_page_result.data);
+    pager->begin_write(split_page_num);
+    if (page_type == PageType::Leaf) {
+        BLeafPage split_page(get_split_page_result.data);
+
+        PagerAllocateResult allocation_result = pager->allocate_page();
+        if (allocation_result.status != PagerResult::Success) {
+            pager->unref_page(split_page_num);
+            return BTreeStatus::FailedToAllocateNewPage;
+        }
+        
+        std::uint32_t new_leaf_page_num = allocation_result.page_num;
+        BLeafPage::fill_initial_layout(allocation_result.data);
+        BLeafPage new_leaf_page(allocation_result.data);
+
+        std::size_t median_separator_idx = split_page.get_key_count() / 2;
+        BTree::migrate_leaf(split_page, new_leaf_page, median_separator_idx); // Assumes it does the write_back on both
+
+        if (path.size() == 0) {
+            // The current node we are splitting is a root node
+            // Handle the splitting of the root and return
+            BTreeStatus split_root = handle_splitting_root(split_page_num, new_leaf_page_num, *new_leaf_page.key_at(0));
+            pager->unref_page(split_page_num);
+            pager->unref_page(new_leaf_page_num);
+            return split_root;
+        }
+
+        TraversalPathEntry parent_path_entry = path.back();
+        path.pop_back();
+
+        // Get the parent page
+        PagerGetResult get_parent_result = pager->get(parent_path_entry.parent_page_num);
+        if (get_parent_result.status != PagerResult::Success) {
+            pager->unref_page(split_page_num);
+            pager->unref_page(new_leaf_page_num);
+            return BTreeStatus::FailedToRead;
+        }
+        pager->begin_write(parent_path_entry.parent_page_num);
+
+        // The parent page is surely definitely an internal page
+        // Insert the new separator key at the idx after the parent separator_index_used
+        BInternalPage parent_page(get_parent_result.data);
+        std::uint64_t key = *new_leaf_page.key_at(0);
+        bool insert_separator_result = false;
+        if (parent_path_entry.child_dir == ChildDirection::Right) {
+            insert_separator_result = parent_page.insert_separator_at(parent_path_entry.separator_index_used + 1, key, new_leaf_page_num);
+        } else {
+            // This also handles the case of inserting at the start of the page. The leftmost child remains at the same page number
+            insert_separator_result = parent_page.insert_separator_at(parent_path_entry.separator_index_used, key, new_leaf_page_num);
+        }
+        if (!insert_separator_result) {
+            pager->unref_page(parent_path_entry.parent_page_num);
+            pager->unref_page(split_page_num);
+            pager->unref_page(new_leaf_page_num);
+            return BTreeStatus::FailedToInsert;
+        }
+
+        // Leaf splits need no key adjustments on the separators. Ignored
+        // Now check if we need to split the parent
+        bool parent_needs_split = (parent_page.get_key_count() > MAX_KEYS(BTREE_ORDER));
+        parent_page.write_back();
+
+        pager->unref_page(split_page_num);
+        pager->unref_page(new_leaf_page_num);
+
+        if (parent_needs_split) {
+            pager->unref_page(parent_path_entry.parent_page_num);
+            return propagate_splitting(parent_path_entry.parent_page_num, path);
+        }
+
+        pager->unref_page(parent_path_entry.parent_page_num);
+        return BTreeStatus::Success;
+    } else {
+        BInternalPage split_page(get_split_page_result.data);
+
+        // Allocate the new internal page that is going to hold everything to the right
+        // of the promoted median separator.
+        PagerAllocateResult allocation_result = pager->allocate_page();
+        if (allocation_result.status != PagerResult::Success) {
+            pager->unref_page(split_page_num);
+            return BTreeStatus::FailedToAllocateNewPage;
+        }
+
+        std::uint32_t new_internal_page_num = allocation_result.page_num;
+        BInternalPage::fill_initial_layout(allocation_result.data);
+        BInternalPage new_internal_page(allocation_result.data);
+
+        // Capture the median key before mutating the original page.
+        // This is the key that gets promoted upward and does not stay in either child page.
+        std::size_t median_separator_idx = split_page.get_key_count() / 2;
+        std::optional<std::uint64_t> promoted_key = split_page.key_at(median_separator_idx);
+        if (promoted_key == std::nullopt) {
+            pager->unref_page(split_page_num);
+            pager->unref_page(new_internal_page_num);
+            return BTreeStatus::FailedToInsert;
+        }
+
+        // Move everything strictly to the right of the promoted median into the new internal page.
+        // The helper also installs the new page's leftmost child and removes the promoted median
+        // from the old page.
+        BTree::migrate_internal(split_page, new_internal_page, median_separator_idx);
+
+        split_page.write_back();
+        new_internal_page.write_back();
+
+        if (path.size() == 0) {
+            // The current internal page being split is the root.
+            // Create a new root above the two split children.
+            BTreeStatus split_root = handle_splitting_root(split_page_num, new_internal_page_num, *promoted_key);
+            pager->unref_page(split_page_num);
+            pager->unref_page(new_internal_page_num);
+            return split_root;
+        }
+
+        TraversalPathEntry parent_path_entry = path.back();
+        path.pop_back();
+
+        // Load the parent internal page and insert the promoted key together with
+        // the new right internal child page number.
+        PagerGetResult get_parent_result = pager->get(parent_path_entry.parent_page_num);
+        if (get_parent_result.status != PagerResult::Success) {
+            pager->unref_page(split_page_num);
+            pager->unref_page(new_internal_page_num);
+            return BTreeStatus::FailedToRead;
+        }
+        pager->begin_write(parent_path_entry.parent_page_num);
+
+        BInternalPage parent_page(get_parent_result.data);
+        bool insert_separator_result = false;
+        if (parent_path_entry.child_dir == ChildDirection::Right) {
+            insert_separator_result = parent_page.insert_separator_at(
+                parent_path_entry.separator_index_used + 1,
+                *promoted_key,
+                new_internal_page_num
+            );
+        } else {
+            insert_separator_result = parent_page.insert_separator_at(
+                parent_path_entry.separator_index_used,
+                *promoted_key,
+                new_internal_page_num
+            );
+        }
+        if (!insert_separator_result) {
+            pager->unref_page(parent_path_entry.parent_page_num);
+            pager->unref_page(split_page_num);
+            pager->unref_page(new_internal_page_num);
+            return BTreeStatus::FailedToInsert;
+        }
+
+        // Internal-page splits also need no readjustment of existing parent separators.
+        // The promoted median already becomes the new separator for the new right child.
+        bool parent_needs_split = (parent_page.get_key_count() > MAX_KEYS(BTREE_ORDER));
+        parent_page.write_back();
+
+        pager->unref_page(split_page_num);
+        pager->unref_page(new_internal_page_num);
+
+        if (parent_needs_split) {
+            pager->unref_page(parent_path_entry.parent_page_num);
+            return propagate_splitting(parent_path_entry.parent_page_num, path);
+        }
+
+        pager->unref_page(parent_path_entry.parent_page_num);
+        return BTreeStatus::Success;
+    }
+
+    return BTreeStatus::FailedToInsert;
+}
+
+void BTree::migrate_leaf(BLeafPage src, BLeafPage dst, std::size_t separator_idx) {
+    // Move every key-value pair starting at the split point into the new right leaf.
+    // We keep removing from the same logical index because the left leaf shrinks after each move.
+    while (src.get_key_count() > separator_idx) {
+        std::optional<std::uint64_t> move_key = src.key_at(separator_idx);
+        if (move_key == std::nullopt) std::abort();
+
+        std::optional<Value> move_value = src.get(*move_key);
+        if (move_value == std::nullopt) std::abort();
+
+        bool insert_result = dst.insert_at(dst.get_key_count(), *move_key, *move_value);
+        if (!insert_result) std::abort();
+
+        bool remove_result = src.remove_at(separator_idx);
+        if (!remove_result) std::abort();
+    }
+
+    // Flush both in-memory page objects back into their raw page bytes before the caller
+    // starts repairing parent pointers and separators.
+    src.write_back();
+    dst.write_back();
+}
+
+void BTree::migrate_internal(BInternalPage src, BInternalPage dst, std::size_t median_separator_idx) {
+    // The child immediately to the right of the promoted median becomes the leftmost
+    // child of the new internal page.
+    std::optional<std::uint32_t> new_leftmost_child = src.get_right_child(median_separator_idx);
+    if (new_leftmost_child == std::nullopt) std::abort();
+
+    bool set_leftmost_result = dst.set_leftmost_child(*new_leftmost_child);
+    if (!set_leftmost_result) std::abort();
+
+    // Move every separator strictly to the right of the median into the new right page.
+    // We keep removing from the same logical index because the vector shrinks after each removal.
+    while (src.get_key_count() > median_separator_idx + 1) {
+        std::optional<std::uint64_t> move_key = src.key_at(median_separator_idx + 1);
+        std::optional<std::uint32_t> move_right_child = src.get_right_child(median_separator_idx + 1);
+        if (move_key == std::nullopt || move_right_child == std::nullopt) std::abort();
+
+        bool insert_separator_result = dst.insert_separator_at(
+            dst.get_key_count(),
+            *move_key,
+            *move_right_child
+        );
+        if (!insert_separator_result) std::abort();
+
+        bool remove_separator_result = src.remove_separator_at(median_separator_idx + 1);
+        if (!remove_separator_result) std::abort();
+    }
+
+    // Finally remove the promoted median from the original page.
+    // Its right child already became the leftmost child of the new page.
+    bool remove_promoted_result = src.remove_separator_at(median_separator_idx);
+    if (!remove_promoted_result) std::abort();
+}
+
+BTreeStatus BTree::handle_splitting_root(
+    std::uint32_t left_child_page_num,
+    std::uint32_t right_child_page_num,
+    std::uint64_t separator_key
+) {
+    // A root split means we need to allocate a brand new internal root above the
+    // two children that just came out of the split.
+    PagerAllocateResult allocation_result = pager->allocate_page();
+    if (allocation_result.status != PagerResult::Success) return BTreeStatus::FailedToAllocateNewPage;
+
+    std::uint32_t new_root_page_num = allocation_result.page_num;
+    BInternalPage::fill_initial_layout(allocation_result.data);
+    BInternalPage new_root_page(allocation_result.data);
+
+    // The old root becomes the leftmost child, and the split-off page becomes the child
+    // to the right of the one separator key stored in the new root.
+    bool set_leftmost_result = new_root_page.set_leftmost_child(left_child_page_num);
+    if (!set_leftmost_result) {
+        pager->unref_page(new_root_page_num);
+        return BTreeStatus::FailedToInsert;
+    }
+
+    bool insert_separator_result = new_root_page.insert_separator_at(0, separator_key, right_child_page_num);
+    if (!insert_separator_result) {
+        pager->unref_page(new_root_page_num);
+        return BTreeStatus::FailedToInsert;
+    }
+
+    new_root_page.write_back();
+
+    PagerResult set_root_result = pager->set_btree_root(new_root_page_num);
+    pager->unref_page(new_root_page_num);
+    if (set_root_result != PagerResult::Success) return BTreeStatus::FailedToInsert;
+
+    return BTreeStatus::Success;
 }
