@@ -2,19 +2,56 @@
 #include <Pager.h>
 #include <cassert>
 BTree::~BTree() {
-    // Ensuring the precondition is met
-    assert((pager_open == false && pager == nullptr) || (pager_open && pager));
-    if (pager_open) {
+    // The BTree owns the pager. If it exists, tear it down.
+    // Any transactional cleanup policy is the pager's job at this point.
+    if (pager) {
         delete pager;
+        pager = nullptr;
     }
-    return;
+
+    // Reset the local state too so the object is fully torn down.
+    pager_open = false;
+    currently_open_db_file.clear();
 }
 
 BTreeStatus BTree::open(std::string db_file) {
+    assert(!pager_open && pager == nullptr);
+
     pager = new Pager();
     PagerResult open_result = pager->open(db_file);
-    if (open_result != PagerResult::Success) return BTreeStatus::FailedToOpenDB;
+    if (open_result != PagerResult::Success) {
+        delete pager;
+        pager = nullptr;
+        return BTreeStatus::FailedToOpenDB;
+    }
+
+    currently_open_db_file = std::move(db_file);
+    pager_open = true;
     return BTreeStatus::Success;
+}
+
+BTreeCommitStatus BTree::commit() {
+    if (!pager_open || !pager) return BTreeCommitStatus::Failed;
+
+    // Phase one makes the journal durable and pushes dirty pages to the db file.
+    PagerResult phase_one_result = pager->commit_phase_one();
+    if (phase_one_result != PagerResult::Success) return BTreeCommitStatus::Failed;
+
+    // Phase two truncates the journal and releases / downgrades locks as needed.
+    PagerResult phase_two_result = pager->commit_phase_two();
+    if (phase_two_result != PagerResult::Success) return BTreeCommitStatus::Failed;
+
+    return BTreeCommitStatus::Success;
+}
+
+BTreeRollbackStatus BTree::rollback() {
+    if (!pager_open || !pager) return BTreeRollbackStatus::Failed;
+
+    // Let the pager unwind either the in-memory write set or the durable journal.
+    PagerResult rollback_result = pager->rollback_transaction();
+    if (rollback_result != PagerResult::Success) return BTreeRollbackStatus::Failed;
+
+    return BTreeRollbackStatus::Success;
 }
 
 

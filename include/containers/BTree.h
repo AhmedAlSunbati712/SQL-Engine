@@ -73,7 +73,6 @@ class BTree {
         BTreeRemoveStatus remove(std::uint64_t key);
     private:
         LeafDescentResult descend_from_root_to_leaf(std::uint64_t key, bool include_path);
-        std::size_t minimum_allowed_keys() const;
         struct MergeParentContext {
             std::uint32_t parent_page_num;
             std::size_t child_idx;
