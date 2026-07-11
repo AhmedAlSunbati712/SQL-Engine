@@ -43,7 +43,7 @@ struct BTreeGetStatus {
 };
 
 struct BTreeRemoveStatus {
-    BTreeStatus status;
+    BTreeStatus status = BTreeStatus::Success;
     Value value;
 };
 
@@ -74,10 +74,30 @@ class BTree {
     private:
         LeafDescentResult descend_from_root_to_leaf(std::uint64_t key, bool include_path);
         std::size_t minimum_allowed_keys() const;
+        struct MergeParentContext {
+            std::uint32_t parent_page_num;
+            std::size_t child_idx;
+            std::optional<std::uint32_t> right_sibling_page_num;
+            std::optional<std::uint32_t> left_sibling_page_num;
+        };
+
         BTreeStatus propagate_separator_change_upward(const std::vector<TraversalPathEntry> &path, std::uint64_t new_subtree_min);
         BTreeStatus propagate_splitting(std::uint32_t split_page_num, std::vector<TraversalPathEntry> &path);
         BTreeStatus propagate_merging(std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path);
         BTreeStatus handle_splitting_root(std::uint32_t left_child_page_num, std::uint32_t right_child_page_num, std::uint64_t separator_key);
+        BTreeStatus handle_root_underflow(std::uint32_t underflow_page_num, PageType underflow_page_type, char *underflow_page_data);
+        MergeParentContext build_merge_parent_context(const TraversalPathEntry &parent_path_entry, BInternalPage &parent_page);
+        BTreeStatus finish_parent_after_merge(BInternalPage &parent_page, std::uint32_t parent_page_num, std::vector<TraversalPathEntry> &path);
+
+        BTreeStatus borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num);
+        BTreeStatus borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num);
+        BTreeStatus merge_with_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path);
+        BTreeStatus merge_with_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path);
+
+        BTreeStatus borrow_from_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num);
+        BTreeStatus borrow_from_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num);
+        BTreeStatus merge_with_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path);
+        BTreeStatus merge_with_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path);
 
         static void migrate_leaf(BLeafPage src, BLeafPage dst, std::size_t separator_idx);
         static void migrate_internal(BInternalPage src, BInternalPage dst, std::size_t median_separator_idx);

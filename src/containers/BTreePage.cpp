@@ -150,10 +150,27 @@ bool BInternalPage::remove_separator_at(std::size_t idx) {
     return true;
 }
 
+bool BInternalPage::set_separator_key_at(std::size_t idx, std::uint64_t key) {
+    if (idx >= keys.size()) return false;
+    keys[idx] = key;
+    return true;
+}
+
 bool BInternalPage::set_leftmost_child(std::uint32_t leftmost_child_page_num) {
     if (!child_page_nums.empty()) return false;
     child_page_nums.push_back(leftmost_child_page_num);
     return true;
+}
+
+bool BInternalPage::replace_leftmost_child(std::uint32_t leftmost_child_page_num) {
+    if (child_page_nums.empty()) return false;
+    child_page_nums[0] = leftmost_child_page_num;
+    return true;
+}
+
+std::optional<std::uint32_t> BInternalPage::get_leftmost_child() const {
+    if (child_page_nums.empty()) return std::nullopt;
+    return child_page_nums[0];
 }
 
 std::optional<std::uint32_t> BInternalPage::get_left_child(std::size_t separator_idx) const {

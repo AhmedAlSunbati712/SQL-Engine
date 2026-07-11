@@ -246,7 +246,75 @@ BTreeRemoveStatus BTree::remove(std::uint64_t key) {
      * pager->unref(descent.leaf_page_num)
      * return success
      */
-    return BTreeRemoveStatus{};
+    BTreeRemoveStatus remove_result{};
+    LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
+    if (descent_result.status == BTreeStatus::EmptyTree) {
+        remove_result.status = BTreeStatus::KeyNotInTree;
+        return remove_result;
+    }
+
+    if (descent_result.status != BTreeStatus::Success) {
+        remove_result.status = descent_result.status;
+        return remove_result;
+    }
+
+    // Parse the leaf page and find the key
+    BLeafPage target_leaf_page(descent_result.leaf_page);
+    std::uint32_t leaf_page_num = descent_result.leaf_page_num;
+    std::size_t key_idx = target_leaf_page.lower_bound_key(key);
+    if (key_idx == target_leaf_page.get_key_count() || *target_leaf_page.key_at(key_idx) != key) {
+        remove_result.status = BTreeStatus::KeyNotInTree;
+        pager->unref_page(leaf_page_num);
+        return remove_result;
+    }
+
+    // Flag to keep track to whether we removed the first key or not
+    bool is_first_key = (key_idx == 0);
+    Value value = *target_leaf_page.get_at(key_idx);
+    remove_result.value = value;
+
+    // Remove the key
+    // Make sure to prep the page for writing first
+    PagerResult begin_write_result = pager->begin_write(leaf_page_num);
+    if (begin_write_result != PagerResult::Success) {
+        remove_result.status = BTreeStatus::FailedToRemove;
+        pager->unref_page(leaf_page_num);
+        return remove_result;
+    }
+
+    bool remove_key_result = target_leaf_page.remove_at(key_idx);
+    if (!remove_key_result) {
+        remove_result.status = BTreeStatus::FailedToRemove;
+        pager->unref_page(leaf_page_num);
+        return remove_result;
+    }
+
+    // Flush the updated logical leaf state back into the raw page bytes before we
+    // start borrowing, merging, or changing separator keys higher up the tree.
+    target_leaf_page.write_back();
+    
+    // Now check if we went under the min size
+    if (target_leaf_page.get_key_count() < MIN_KEYS(BTREE_ORDER)) {
+        BTreeStatus merging_status = propagate_merging(leaf_page_num, descent_result.path);
+        pager->unref_page(leaf_page_num);
+        remove_result.status = merging_status;
+        return remove_result;
+    }
+
+    // We are assuming in practice that deleting a key from a non-root leaf node will leave at least one key left in the node
+    // That's so we don't have to deal with empty leaf nodes and removing the corresponding separator key
+
+    // If the first key got deleted, propagate it up
+    if (is_first_key) {
+        BTreeStatus separator_change_status = propagate_separator_change_upward(descent_result.path, *target_leaf_page.key_at(0));
+        pager->unref_page(leaf_page_num);
+        remove_result.status = separator_change_status;
+        return remove_result;
+    }
+
+    pager->unref_page(leaf_page_num);
+
+    return remove_result;
 }
 
 
@@ -331,108 +399,29 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
 
 BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector<TraversalPathEntry> &path) {
     /**
-     * Purpose:
      * The page split_page_num overflowed after an insert.
-     * Split it into:
-     *  - the original left page
-     *  - a newly allocated right sibling
-     * Then repair the parent. If the parent overflows, recurse upward.
+     * Split it into the old left page plus a new right sibling, then repair the parent.
+     * If the parent overflows too, recurse upward.
      *
-     * ============================================================
-     * Splitting a leaf page
-     * ============================================================
+     * Leaf split:
+     * - move the upper half of the key-value pairs into a new right leaf
+     * - promote the first key of that new right leaf
+     * - that promoted key stays in the right leaf
      *
-     * Example:
-     * max keys = 4
-     * overflowing leaf:
-     *  [10, 20, 30, 40, 50]
-     *
-     * After split:
-     *  left leaf  = [10, 20]
-     *  right leaf = [30, 40, 50]
-     *
-     * For a leaf split:
-     * - the promoted separator is the first key of the new right leaf
-     * - that promoted key stays inside the right leaf
-     * - no existing parent separator needs readjustment
-     *
-     * So here:
-     *  promoted_key = 30
+     * Internal split:
+     * - split around the median separator
+     * - move the separators to the right of the median, plus their children, into a new right internal page
+     * - promote the median key upward
+     * - that promoted key does not stay in either child
      *
      * Parent repair:
-     * - if the parent currently has:
-     *      keys:     [k1, k2, k3]
-     *      children: [c0, c1, c2, c3]
-     * - and c1 is the leaf that split
-     * - then after allocating new right leaf c_new:
-     *      keys:     [k1, promoted_key, k2, k3]
-     *      children: [c0, c1, c_new, c2, c3]
+     * - if there is a parent, insert the promoted key and the new right child
+     *   immediately to the right of the old split page
+     * - if there is no parent, the split page was the root, so allocate a new internal root
+     *   and update the pager's root page number
      *
-     * Special case:
-     * - if the split leaf was the root and there is no parent:
-     *   allocate a new internal root
-     *   root.keys     = [promoted_key]
-     *   root.children = [old_leaf, new_right_leaf]
-     *
-     * ============================================================
-     * Splitting an internal page
-     * ============================================================
-     *
-     * Example:
-     * overflowing internal page:
-     *  keys:     [10, 20, 30, 40, 50]
-     *  children: [c0, c1, c2, c3, c4, c5]
-     *
-     * Split around the median:
-     * - promoted_key = 30
-     * - left page keeps:
-     *      keys:     [10, 20]
-     *      children: [c0, c1, c2]
-     * - right page gets:
-     *      keys:     [40, 50]
-     *      children: [c3, c4, c5]
-     *
-     * For an internal split:
-     * - the promoted median key does NOT stay in either child
-     * - it moves upward into the parent only
-     * - no existing parent separator needs readjustment
-     *
-     * Parent repair is the same pattern:
-     * - replace the one child pointer to the old page with:
-     *      left child  = old page
-     *      separator   = promoted_key
-     *      right child = new right page
-     *
-     * Special case:
-     * - if the split internal page was the root:
-     *   allocate a new internal root
-     *   root.keys     = [promoted_key]
-     *   root.children = [old_internal, new_right_internal]
-     *
-     * ============================================================
-     * Recursive flow
-     * ============================================================
-     *
-     * 1. Load split_page_num and inspect whether it is a leaf or internal page.
-     * 2. Allocate a new right sibling page.
-     * 3. Redistribute keys between left and right.
-     *    - for a leaf: move key-value pairs
-     *    - for an internal page: move keys and child page numbers
-     * 4. Compute promoted_key:
-     *    - leaf split: first key of the new right leaf
-     *    - internal split: the median key removed from the old page
-     * 5. Write back both child pages.
-     * 6. If there is no parent in path:
-     *    - allocate a new root
-     *    - install promoted_key and the two child pointers
-     *    - update the pager's root page number in the DB header
-     *    - return success
-     * 7. Otherwise:
-     *    - load the parent page
-     *    - insert promoted_key and the new right child immediately to the right of the old child
-     *    - if the parent overflowed, recursively call propagate_splitting on the parent
-     *    - otherwise write back the parent and return success
-     * 
+     * Insert splits do not readjust any older separator keys.
+     * The only new separator here is the one produced by the split itself.
      */
     PagerGetResult get_split_page_result = pager->get(split_page_num);
     if (get_split_page_result.status != PagerResult::Success) {
@@ -700,4 +689,803 @@ BTreeStatus BTree::handle_splitting_root(
     if (set_root_result != PagerResult::Success) return BTreeStatus::FailedToInsert;
 
     return BTreeStatus::Success;
+}
+
+BTreeStatus BTree::propagate_separator_change_upward(
+    const std::vector<TraversalPathEntry> &path,
+    std::uint64_t new_subtree_min
+) {
+    /**
+     * A delete changed the minimum key of some subtree.
+     *
+     * Walk upward from the parent of that subtree:
+     * - if the subtree is not the leftmost child at this level, update the one
+     *   separator key that names it and stop
+     * - if the subtree is the leftmost child, this parent stores nothing for it,
+     *   so keep climbing
+     *
+     * If we stay on the leftmost spine all the way to the root, then no separator
+     * anywhere stores this minimum and there is nothing to update.
+     */
+    for (std::size_t i = path.size(); i > 0; i--) {
+        const TraversalPathEntry &entry = path[i - 1];
+
+        // If we reached this subtree by taking the right side of a separator, then
+        // that separator stores this subtree's minimum. Update it and stop.
+        if (entry.child_dir == ChildDirection::Right) {
+            PagerGetResult get_parent_result = pager->get(entry.parent_page_num);
+            if (get_parent_result.status != PagerResult::Success) return BTreeStatus::FailedToRead;
+
+            PagerResult begin_write_result = pager->begin_write(entry.parent_page_num);
+            if (begin_write_result != PagerResult::Success) {
+                pager->unref_page(entry.parent_page_num);
+                return BTreeStatus::FailedToRemove;
+            }
+
+            BInternalPage parent_page(get_parent_result.data);
+            bool set_result = parent_page.set_separator_key_at(entry.separator_index_used, new_subtree_min);
+            if (!set_result) {
+                pager->unref_page(entry.parent_page_num);
+                return BTreeStatus::FailedToRemove;
+            }
+
+            parent_page.write_back();
+            pager->unref_page(entry.parent_page_num);
+            return BTreeStatus::Success;
+        }
+
+        // If we took the left side of separator 0, then this subtree is still the
+        // leftmost child at this level. There is nothing to update here, so keep
+        // walking upward.
+        if (entry.separator_index_used == 0) continue;
+
+        // Otherwise we took the left side of some separator strictly after the first.
+        // That means this subtree is not the leftmost child overall, and the separator
+        // immediately before it stores its minimum.
+        PagerGetResult get_parent_result = pager->get(entry.parent_page_num);
+        if (get_parent_result.status != PagerResult::Success) return BTreeStatus::FailedToRead;
+
+        PagerResult begin_write_result = pager->begin_write(entry.parent_page_num);
+        if (begin_write_result != PagerResult::Success) {
+            pager->unref_page(entry.parent_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+
+        BInternalPage parent_page(get_parent_result.data);
+        bool set_result = parent_page.set_separator_key_at(entry.separator_index_used - 1, new_subtree_min);
+        if (!set_result) {
+            pager->unref_page(entry.parent_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+
+        parent_page.write_back();
+        pager->unref_page(entry.parent_page_num);
+        return BTreeStatus::Success;
+    }
+
+    return BTreeStatus::Success;
+}
+BTreeStatus BTree::handle_root_underflow(std::uint32_t underflow_page_num, PageType underflow_page_type, char *underflow_page_data) {
+    // The root is special. It is allowed to violate the usual min-size rules.
+    if (underflow_page_type == PageType::Leaf) {
+        BLeafPage root_leaf(underflow_page_data);
+
+        // If this leaf root still has data in it, nothing to repair.
+        if (root_leaf.get_key_count() > 0) {
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::Success;
+        }
+
+        // The tree became empty. Clear the root pointer in the header and free this page.
+        PagerResult clear_root_result = pager->set_btree_root(0);
+        if (clear_root_result != PagerResult::Success) {
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+
+        PagerResult free_root_result = pager->free_page(underflow_page_num);
+        pager->unref_page(underflow_page_num);
+        if (free_root_result != PagerResult::Success) return BTreeStatus::FailedToRemove;
+        return BTreeStatus::Success;
+    }
+
+    BInternalPage root_page(underflow_page_data);
+
+    // Non-empty internal roots are fine. Root nodes can stay below the usual minimum.
+    if (root_page.get_key_count() > 0) {
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::Success;
+    }
+
+    // A 0-key internal root must collapse into its only child.
+    std::optional<std::uint32_t> only_child_page_num = root_page.get_leftmost_child();
+    if (only_child_page_num == std::nullopt) {
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    PagerResult set_root_result = pager->set_btree_root(*only_child_page_num);
+    if (set_root_result != PagerResult::Success) {
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    PagerResult free_root_result = pager->free_page(underflow_page_num);
+    pager->unref_page(underflow_page_num);
+    if (free_root_result != PagerResult::Success) return BTreeStatus::FailedToRemove;
+    return BTreeStatus::Success;
+}
+
+BTree::MergeParentContext BTree::build_merge_parent_context(const TraversalPathEntry &parent_path_entry, BInternalPage &parent_page) {
+    MergeParentContext ctx{};
+
+    // Translate the path metadata into the actual child idx inside the parent page.
+    // Once we have that idx, sibling lookup becomes straightforward.
+    ctx.parent_page_num = parent_path_entry.parent_page_num;
+    ctx.child_idx = parent_path_entry.separator_index_used;
+    if (parent_path_entry.child_dir == ChildDirection::Right) ctx.child_idx += 1;
+
+    // The right sibling sits to the right of separator child_idx if that separator exists.
+    if (ctx.child_idx < parent_page.get_key_count()) {
+        ctx.right_sibling_page_num = parent_page.get_right_child(ctx.child_idx);
+    }
+
+    // The left sibling is either the parent's leftmost child or the child to the right
+    // of the separator immediately before us.
+    if (ctx.child_idx > 0) {
+        if (ctx.child_idx == 1) {
+            ctx.left_sibling_page_num = parent_page.get_left_child(0);
+        } else {
+            ctx.left_sibling_page_num = parent_page.get_right_child(ctx.child_idx - 2);
+        }
+    }
+
+    return ctx;
+}
+
+BTreeStatus BTree::finish_parent_after_merge(BInternalPage &parent_page, std::uint32_t parent_page_num, std::vector<TraversalPathEntry> &path) {
+    // Merging deleted one separator from the parent. If that pushed the parent below
+    // the minimum, keep repairing upward recursively.
+    bool parent_underflow = parent_page.get_key_count() < MIN_KEYS(BTREE_ORDER);
+    path.pop_back();
+    pager->unref_page(parent_page_num);
+    if (parent_underflow) return propagate_merging(parent_page_num, path);
+    return BTreeStatus::Success;
+}
+
+BTreeStatus BTree::borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num) {
+    if (ctx.right_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
+
+    // Load the right sibling and first make sure it can actually spare a key.
+    PagerGetResult get_right_result = pager->get(static_cast<int>(*ctx.right_sibling_page_num));
+    if (get_right_result.status != PagerResult::Success) {
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    BLeafPage right_sibling(get_right_result.data);
+    if (right_sibling.get_key_count() <= MIN_KEYS(BTREE_ORDER)) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        return BTreeStatus::FailedToRemove;
+    }
+
+    PagerResult begin_write_right_result = pager->begin_write(static_cast<int>(*ctx.right_sibling_page_num));
+    if (begin_write_right_result != PagerResult::Success) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    // Borrow the first record from the right sibling and append it to the current leaf.
+    // Then update the parent separator so it names the new minimum of the right subtree.
+    std::optional<std::uint64_t> borrowed_key = right_sibling.key_at(0);
+    std::optional<Value> borrowed_value = right_sibling.get_at(0);
+    if (borrowed_key == std::nullopt || borrowed_value == std::nullopt) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    bool insert_result = current_leaf.insert_at(current_leaf.get_key_count(), *borrowed_key, *borrowed_value);
+    bool remove_result = right_sibling.remove_at(0);
+    std::optional<std::uint64_t> new_right_first_key = right_sibling.first_key();
+    bool set_sep_result = (new_right_first_key != std::nullopt) &&
+        parent_page.set_separator_key_at(ctx.child_idx, *new_right_first_key);
+    if (!insert_result || !remove_result || !set_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    current_leaf.write_back();
+    right_sibling.write_back();
+    parent_page.write_back();
+
+    pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+    pager->unref_page(ctx.parent_page_num);
+    pager->unref_page(underflow_page_num);
+    return BTreeStatus::Success;
+}
+
+BTreeStatus BTree::borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num) {
+    if (ctx.left_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
+
+    // Load the left sibling and make sure it can actually lend.
+    PagerGetResult get_left_result = pager->get(static_cast<int>(*ctx.left_sibling_page_num));
+    if (get_left_result.status != PagerResult::Success) {
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    BLeafPage left_sibling(get_left_result.data);
+    if (left_sibling.get_key_count() <= MIN_KEYS(BTREE_ORDER)) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        return BTreeStatus::FailedToRemove;
+    }
+
+    PagerResult begin_write_left_result = pager->begin_write(static_cast<int>(*ctx.left_sibling_page_num));
+    if (begin_write_left_result != PagerResult::Success) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    // Borrow the last record from the left sibling and prepend it to the current leaf.
+    // The current leaf's minimum changed, so we must update the separator that names it.
+    std::size_t left_last_idx = left_sibling.get_key_count() - 1;
+    std::optional<std::uint64_t> borrowed_key = left_sibling.key_at(left_last_idx);
+    std::optional<Value> borrowed_value = left_sibling.get_at(left_last_idx);
+    if (borrowed_key == std::nullopt || borrowed_value == std::nullopt) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    bool remove_result = left_sibling.remove_at(left_last_idx);
+    bool insert_result = current_leaf.insert_at(0, *borrowed_key, *borrowed_value);
+    std::optional<std::uint64_t> new_current_first_key = current_leaf.first_key();
+    bool set_sep_result = (new_current_first_key != std::nullopt) &&
+        parent_page.set_separator_key_at(ctx.child_idx - 1, *new_current_first_key);
+    if (!remove_result || !insert_result || !set_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    left_sibling.write_back();
+    current_leaf.write_back();
+    parent_page.write_back();
+
+    pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+    pager->unref_page(ctx.parent_page_num);
+    pager->unref_page(underflow_page_num);
+    return BTreeStatus::Success;
+}
+
+BTreeStatus BTree::merge_with_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+    if (ctx.right_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
+
+    // Merge the right sibling into the current leaf.
+    // The current leaf survives, the right sibling page gets freed, and the parent
+    // loses the separator that used to name that right sibling.
+    PagerGetResult get_right_result = pager->get(static_cast<int>(*ctx.right_sibling_page_num));
+    if (get_right_result.status != PagerResult::Success) {
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    BLeafPage right_sibling(get_right_result.data);
+    while (right_sibling.get_key_count() > 0) {
+        std::optional<std::uint64_t> move_key = right_sibling.key_at(0);
+        std::optional<Value> move_value = right_sibling.get_at(0);
+        if (move_key == std::nullopt || move_value == std::nullopt) {
+            pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+            pager->unref_page(ctx.parent_page_num);
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+
+        bool insert_result = current_leaf.insert_at(current_leaf.get_key_count(), *move_key, *move_value);
+        bool remove_result = right_sibling.remove_at(0);
+        if (!insert_result || !remove_result) {
+            pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+            pager->unref_page(ctx.parent_page_num);
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+    }
+
+    bool remove_parent_sep_result = parent_page.remove_separator_at(ctx.child_idx);
+    if (!remove_parent_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    current_leaf.write_back();
+    parent_page.write_back();
+
+    PagerResult free_result = pager->free_page(static_cast<int>(*ctx.right_sibling_page_num));
+    if (free_result != PagerResult::Success) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+    pager->unref_page(underflow_page_num);
+    return finish_parent_after_merge(parent_page, ctx.parent_page_num, path);
+}
+
+BTreeStatus BTree::merge_with_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+    if (ctx.left_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
+
+    // Merge the current leaf into the left sibling.
+    // The left sibling survives, the current page gets freed, and the parent loses
+    // the separator that used to name the current leaf.
+    PagerGetResult get_left_result = pager->get(static_cast<int>(*ctx.left_sibling_page_num));
+    if (get_left_result.status != PagerResult::Success) {
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    BLeafPage left_sibling(get_left_result.data);
+    while (current_leaf.get_key_count() > 0) {
+        std::optional<std::uint64_t> move_key = current_leaf.key_at(0);
+        std::optional<Value> move_value = current_leaf.get_at(0);
+        if (move_key == std::nullopt || move_value == std::nullopt) {
+            pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+            pager->unref_page(ctx.parent_page_num);
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+
+        bool insert_result = left_sibling.insert_at(left_sibling.get_key_count(), *move_key, *move_value);
+        bool remove_result = current_leaf.remove_at(0);
+        if (!insert_result || !remove_result) {
+            pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+            pager->unref_page(ctx.parent_page_num);
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+    }
+
+    bool remove_parent_sep_result = parent_page.remove_separator_at(ctx.child_idx - 1);
+    if (!remove_parent_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    left_sibling.write_back();
+    parent_page.write_back();
+
+    PagerResult free_result = pager->free_page(underflow_page_num);
+    if (free_result != PagerResult::Success) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+    pager->unref_page(underflow_page_num);
+    return finish_parent_after_merge(parent_page, ctx.parent_page_num, path);
+}
+
+BTreeStatus BTree::borrow_from_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num) {
+    if (ctx.right_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
+
+    // Load the right internal sibling and make sure it can lend one separator.
+    PagerGetResult get_right_result = pager->get(static_cast<int>(*ctx.right_sibling_page_num));
+    if (get_right_result.status != PagerResult::Success) {
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    BInternalPage right_sibling(get_right_result.data);
+    if (right_sibling.get_key_count() <= MIN_KEYS(BTREE_ORDER)) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        return BTreeStatus::FailedToRemove;
+    }
+
+    PagerResult begin_write_right_result = pager->begin_write(static_cast<int>(*ctx.right_sibling_page_num));
+    if (begin_write_right_result != PagerResult::Success) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    // Rotate through the parent:
+    // - parent separator moves down into the current page
+    // - the right sibling's old leftmost child comes with it
+    // - the right sibling's old first separator moves up to become the new parent separator
+    std::optional<std::uint64_t> parent_sep = parent_page.key_at(ctx.child_idx);
+    std::optional<std::uint32_t> right_old_leftmost_child = right_sibling.get_leftmost_child();
+    std::optional<std::uint64_t> new_parent_sep = right_sibling.key_at(0);
+    std::optional<std::uint32_t> right_new_leftmost_child = right_sibling.get_right_child(0);
+    if (parent_sep == std::nullopt || right_old_leftmost_child == std::nullopt ||
+        new_parent_sep == std::nullopt || right_new_leftmost_child == std::nullopt) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    bool insert_result = current_page.insert_separator_at(
+        current_page.get_key_count(),
+        *parent_sep,
+        *right_old_leftmost_child
+    );
+    bool replace_leftmost_result = right_sibling.replace_leftmost_child(*right_new_leftmost_child);
+    bool remove_sep_result = right_sibling.remove_separator_at(0);
+    bool set_parent_sep_result = parent_page.set_separator_key_at(ctx.child_idx, *new_parent_sep);
+    if (!insert_result || !replace_leftmost_result || !remove_sep_result || !set_parent_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    current_page.write_back();
+    right_sibling.write_back();
+    parent_page.write_back();
+
+    pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+    pager->unref_page(ctx.parent_page_num);
+    pager->unref_page(underflow_page_num);
+    return BTreeStatus::Success;
+}
+
+BTreeStatus BTree::borrow_from_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num) {
+    if (ctx.left_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
+
+    // Load the left internal sibling and make sure it can lend one separator.
+    PagerGetResult get_left_result = pager->get(static_cast<int>(*ctx.left_sibling_page_num));
+    if (get_left_result.status != PagerResult::Success) {
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    BInternalPage left_sibling(get_left_result.data);
+    if (left_sibling.get_key_count() <= MIN_KEYS(BTREE_ORDER)) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        return BTreeStatus::FailedToRemove;
+    }
+
+    PagerResult begin_write_left_result = pager->begin_write(static_cast<int>(*ctx.left_sibling_page_num));
+    if (begin_write_left_result != PagerResult::Success) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    // Rotate through the parent from the left side:
+    // - parent separator moves down into the current page as its first separator
+    // - the left sibling's old rightmost child becomes the new leftmost child of the current page
+    // - the left sibling's old rightmost separator moves up to become the new parent separator
+    std::size_t left_last_idx = left_sibling.get_key_count() - 1;
+    std::optional<std::uint64_t> parent_sep = parent_page.key_at(ctx.child_idx - 1);
+    std::optional<std::uint64_t> borrowed_sep = left_sibling.key_at(left_last_idx);
+    std::optional<std::uint32_t> borrowed_child = left_sibling.get_right_child(left_last_idx);
+    std::optional<std::uint32_t> old_current_leftmost = current_page.get_leftmost_child();
+    if (parent_sep == std::nullopt || borrowed_sep == std::nullopt ||
+        borrowed_child == std::nullopt || old_current_leftmost == std::nullopt) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    bool replace_leftmost_result = current_page.replace_leftmost_child(*borrowed_child);
+    bool insert_result = current_page.insert_separator_at(0, *parent_sep, *old_current_leftmost);
+    bool set_parent_sep_result = parent_page.set_separator_key_at(ctx.child_idx - 1, *borrowed_sep);
+    bool remove_sep_result = left_sibling.remove_separator_at(left_last_idx);
+    if (!replace_leftmost_result || !insert_result || !set_parent_sep_result || !remove_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    left_sibling.write_back();
+    current_page.write_back();
+    parent_page.write_back();
+
+    pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+    pager->unref_page(ctx.parent_page_num);
+    pager->unref_page(underflow_page_num);
+    return BTreeStatus::Success;
+}
+
+BTreeStatus BTree::merge_with_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+    if (ctx.right_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
+
+    // Merge the right internal page into the current page.
+    // The parent separator between them has to move down first, then the rest of the
+    // right sibling comes after it.
+    PagerGetResult get_right_result = pager->get(static_cast<int>(*ctx.right_sibling_page_num));
+    if (get_right_result.status != PagerResult::Success) {
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    BInternalPage right_sibling(get_right_result.data);
+    std::optional<std::uint64_t> parent_sep = parent_page.key_at(ctx.child_idx);
+    std::optional<std::uint32_t> right_leftmost_child = right_sibling.get_leftmost_child();
+    if (parent_sep == std::nullopt || right_leftmost_child == std::nullopt) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    // Move the parent separator down first, then pull over the rest of the right page.
+    bool insert_parent_sep_result = current_page.insert_separator_at(
+        current_page.get_key_count(),
+        *parent_sep,
+        *right_leftmost_child
+    );
+    if (!insert_parent_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    while (right_sibling.get_key_count() > 0) {
+        std::optional<std::uint64_t> move_key = right_sibling.key_at(0);
+        std::optional<std::uint32_t> move_right_child = right_sibling.get_right_child(0);
+        if (move_key == std::nullopt || move_right_child == std::nullopt) {
+            pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+            pager->unref_page(ctx.parent_page_num);
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+
+        bool insert_result = current_page.insert_separator_at(
+            current_page.get_key_count(),
+            *move_key,
+            *move_right_child
+        );
+        bool new_leftmost_result = true;
+        if (right_sibling.get_key_count() > 1) {
+            std::optional<std::uint32_t> new_leftmost = right_sibling.get_right_child(0);
+            if (new_leftmost == std::nullopt) {
+                pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+                pager->unref_page(ctx.parent_page_num);
+                pager->unref_page(underflow_page_num);
+                return BTreeStatus::FailedToRemove;
+            }
+            new_leftmost_result = right_sibling.replace_leftmost_child(*new_leftmost);
+        }
+        bool remove_result = right_sibling.remove_separator_at(0);
+        if (!insert_result || !new_leftmost_result || !remove_result) {
+            pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+            pager->unref_page(ctx.parent_page_num);
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+    }
+
+    bool remove_parent_sep_result = parent_page.remove_separator_at(ctx.child_idx);
+    if (!remove_parent_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    current_page.write_back();
+    parent_page.write_back();
+
+    PagerResult free_result = pager->free_page(static_cast<int>(*ctx.right_sibling_page_num));
+    if (free_result != PagerResult::Success) {
+        pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
+    pager->unref_page(underflow_page_num);
+    return finish_parent_after_merge(parent_page, ctx.parent_page_num, path);
+}
+
+BTreeStatus BTree::merge_with_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+    if (ctx.left_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
+
+    // Merge the current internal page into the left sibling.
+    // The parent separator between them moves down into the left sibling first, then
+    // the rest of the current page follows after it.
+    PagerGetResult get_left_result = pager->get(static_cast<int>(*ctx.left_sibling_page_num));
+    if (get_left_result.status != PagerResult::Success) {
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    BInternalPage left_sibling(get_left_result.data);
+    std::optional<std::uint64_t> parent_sep = parent_page.key_at(ctx.child_idx - 1);
+    std::optional<std::uint32_t> current_leftmost_child = current_page.get_leftmost_child();
+    if (parent_sep == std::nullopt || current_leftmost_child == std::nullopt) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    bool insert_parent_sep_result = left_sibling.insert_separator_at(
+        left_sibling.get_key_count(),
+        *parent_sep,
+        *current_leftmost_child
+    );
+    if (!insert_parent_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    while (current_page.get_key_count() > 0) {
+        std::optional<std::uint64_t> move_key = current_page.key_at(0);
+        std::optional<std::uint32_t> move_right_child = current_page.get_right_child(0);
+        if (move_key == std::nullopt || move_right_child == std::nullopt) {
+            pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+            pager->unref_page(ctx.parent_page_num);
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+
+        bool insert_result = left_sibling.insert_separator_at(
+            left_sibling.get_key_count(),
+            *move_key,
+            *move_right_child
+        );
+        bool new_leftmost_result = true;
+        if (current_page.get_key_count() > 1) {
+            std::optional<std::uint32_t> new_leftmost = current_page.get_right_child(0);
+            if (new_leftmost == std::nullopt) {
+                pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+                pager->unref_page(ctx.parent_page_num);
+                pager->unref_page(underflow_page_num);
+                return BTreeStatus::FailedToRemove;
+            }
+            new_leftmost_result = current_page.replace_leftmost_child(*new_leftmost);
+        }
+        bool remove_result = current_page.remove_separator_at(0);
+        if (!insert_result || !new_leftmost_result || !remove_result) {
+            pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+            pager->unref_page(ctx.parent_page_num);
+            pager->unref_page(underflow_page_num);
+            return BTreeStatus::FailedToRemove;
+        }
+    }
+
+    bool remove_parent_sep_result = parent_page.remove_separator_at(ctx.child_idx - 1);
+    if (!remove_parent_sep_result) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    left_sibling.write_back();
+    parent_page.write_back();
+
+    PagerResult free_result = pager->free_page(underflow_page_num);
+    if (free_result != PagerResult::Success) {
+        pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+        pager->unref_page(ctx.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
+    pager->unref_page(underflow_page_num);
+    return finish_parent_after_merge(parent_page, ctx.parent_page_num, path);
+}
+
+BTreeStatus BTree::propagate_merging(std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+    /**
+     * Repair an underflow after delete.
+     *
+     * Order of attack:
+     * - handle the root special case
+     * - try borrowing from the right sibling
+     * - then try borrowing from the left sibling
+     * - if neither can lend, merge with the right sibling if it exists
+     * - otherwise merge with the left sibling
+     */
+    // Load the underflowing page first so we can inspect whether we are dealing
+    // with a leaf or an internal page.
+    PagerGetResult get_underflow_result = pager->get(underflow_page_num);
+    if (get_underflow_result.status != PagerResult::Success) return BTreeStatus::FailedToRead;
+
+    PageType underflow_page_type = BTreePage::peek_page_type(get_underflow_result.data);
+
+    // Roots are handled separately because they are allowed to break the normal
+    // min-key invariant.
+    if (path.empty()) {
+        return handle_root_underflow(underflow_page_num, underflow_page_type, get_underflow_result.data);
+    }
+
+    // Load the parent and compute the sibling context around the underflowing page.
+    TraversalPathEntry parent_path_entry = path.back();
+    PagerGetResult get_parent_result = pager->get(parent_path_entry.parent_page_num);
+    if (get_parent_result.status != PagerResult::Success) {
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRead;
+    }
+
+    PagerResult begin_write_parent_result = pager->begin_write(parent_path_entry.parent_page_num);
+    if (begin_write_parent_result != PagerResult::Success) {
+        pager->unref_page(parent_path_entry.parent_page_num);
+        pager->unref_page(underflow_page_num);
+        return BTreeStatus::FailedToRemove;
+    }
+
+    BInternalPage parent_page(get_parent_result.data);
+    MergeParentContext ctx = build_merge_parent_context(parent_path_entry, parent_page);
+
+    if (underflow_page_type == PageType::Leaf) {
+        BLeafPage current_leaf(get_underflow_result.data);
+
+        // Try to repair the leaf by borrowing before we merge anything.
+        if (ctx.right_sibling_page_num != std::nullopt) {
+            BTreeStatus right_borrow_result = borrow_from_right_leaf(current_leaf, parent_page, ctx, underflow_page_num);
+            if (right_borrow_result == BTreeStatus::Success) return BTreeStatus::Success;
+            if (right_borrow_result == BTreeStatus::FailedToRead) return right_borrow_result;
+        }
+
+        if (ctx.left_sibling_page_num != std::nullopt) {
+            BTreeStatus left_borrow_result = borrow_from_left_leaf(current_leaf, parent_page, ctx, underflow_page_num);
+            if (left_borrow_result == BTreeStatus::Success) return BTreeStatus::Success;
+            if (left_borrow_result == BTreeStatus::FailedToRead) return left_borrow_result;
+        }
+
+        // If borrowing failed from both sides, we have to merge.
+        if (ctx.right_sibling_page_num != std::nullopt) {
+            return merge_with_right_leaf(current_leaf, parent_page, ctx, underflow_page_num, path);
+        }
+        return merge_with_left_leaf(current_leaf, parent_page, ctx, underflow_page_num, path);
+    }
+
+    BInternalPage current_page(get_underflow_result.data);
+
+    // Same flow for internal pages: try borrowing first, then fall back to merging.
+    if (ctx.right_sibling_page_num != std::nullopt) {
+        BTreeStatus right_borrow_result = borrow_from_right_internal(current_page, parent_page, ctx, underflow_page_num);
+        if (right_borrow_result == BTreeStatus::Success) return BTreeStatus::Success;
+        if (right_borrow_result == BTreeStatus::FailedToRead) return right_borrow_result;
+    }
+
+    if (ctx.left_sibling_page_num != std::nullopt) {
+        BTreeStatus left_borrow_result = borrow_from_left_internal(current_page, parent_page, ctx, underflow_page_num);
+        if (left_borrow_result == BTreeStatus::Success) return BTreeStatus::Success;
+        if (left_borrow_result == BTreeStatus::FailedToRead) return left_borrow_result;
+    }
+
+    if (ctx.right_sibling_page_num != std::nullopt) {
+        return merge_with_right_internal(current_page, parent_page, ctx, underflow_page_num, path);
+    }
+    return merge_with_left_internal(current_page, parent_page, ctx, underflow_page_num, path);
 }
