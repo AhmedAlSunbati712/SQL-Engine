@@ -66,6 +66,7 @@ class BTree {
         BTree() = default;
         ~BTree();
         BTreeStatus open(std::string db_file);
+        BTreeStatus close();
         BTreeCommitStatus commit();
         BTreeRollbackStatus rollback();
         BTreeGetStatus get(std::uint64_t key);

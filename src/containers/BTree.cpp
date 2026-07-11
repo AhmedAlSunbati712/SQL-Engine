@@ -2,16 +2,7 @@
 #include <Pager.h>
 #include <cassert>
 BTree::~BTree() {
-    // The BTree owns the pager. If it exists, tear it down.
-    // Any transactional cleanup policy is the pager's job at this point.
-    if (pager) {
-        delete pager;
-        pager = nullptr;
-    }
-
-    // Reset the local state too so the object is fully torn down.
-    pager_open = false;
-    currently_open_db_file.clear();
+    close();
 }
 
 BTreeStatus BTree::open(std::string db_file) {
@@ -28,6 +19,32 @@ BTreeStatus BTree::open(std::string db_file) {
     currently_open_db_file = std::move(db_file);
     pager_open = true;
     return BTreeStatus::Success;
+}
+
+BTreeStatus BTree::close() {
+    // If we are already closed, there is nothing to do.
+    if (!pager_open && pager == nullptr) return BTreeStatus::Success;
+
+    // If the client closes while a write txn is still alive, try to roll it back first.
+    // Even if rollback fails, we still tear down the pager and report the failure.
+    BTreeStatus close_status = BTreeStatus::Success;
+    if (pager_open && pager) {
+        PagerResult rollback_result = pager->rollback_transaction();
+        if (rollback_result != PagerResult::Success) {
+            close_status = BTreeStatus::FailedToCloseDB;
+        }
+    }
+
+    // The BTree owns the pager. Delete it and reset the local session state
+    // so this object can open another database later.
+    if (pager) {
+        delete pager;
+        pager = nullptr;
+    }
+
+    pager_open = false;
+    currently_open_db_file.clear();
+    return close_status;
 }
 
 BTreeCommitStatus BTree::commit() {
