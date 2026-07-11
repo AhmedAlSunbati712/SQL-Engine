@@ -150,6 +150,12 @@ bool BInternalPage::remove_separator_at(std::size_t idx) {
     return true;
 }
 
+bool BInternalPage::set_leftmost_child(std::uint32_t leftmost_child_page_num) {
+    if (!child_page_nums.empty()) return false;
+    child_page_nums.push_back(leftmost_child_page_num);
+    return true;
+}
+
 std::optional<std::uint32_t> BInternalPage::get_left_child(std::size_t separator_idx) const {
     if (separator_idx >= keys.size()) return std::nullopt;
     if (child_page_nums.size() != keys.size() + 1) return std::nullopt;
@@ -202,6 +208,15 @@ void BInternalPage::parse_internal_cell(const char *in, std::uint64_t *key, std:
     // Internal cell format: 8-byte separator key, then 4-byte right child page number.
     *key = get_u64_be(in);
     *right_child_page_num = get_u32_be(&in[8]);
+}
+
+void BInternalPage::fill_initial_layout(char *out) {
+    std::memset(out, 0, 4096);
+    put_u8_be(out, static_cast<std::uint8_t>(PageType::Internal));
+    put_u16_be(&out[1], 0);
+    put_u16_be(&out[3], 11);
+    put_u16_be(&out[5], 4095);
+    put_u32_be(&out[7], 0);
 }
 
 
@@ -378,4 +393,12 @@ void BLeafPage::parse_leaf_cell(const char *in, std::uint64_t *key, Value *value
 
     value->size = get_u16_be(&in[9]);
     value->data.assign(&in[11], &in[11] + value->size);
+}
+
+void BLeafPage::fill_initial_layout(char *out) {
+    std::memset(out, 0, 4096);
+    put_u8_be(out, static_cast<std::uint8_t>(PageType::Leaf));
+    put_u16_be(&out[1], 0);
+    put_u16_be(&out[3], 7);
+    put_u16_be(&out[5], 4095);
 }

@@ -41,10 +41,12 @@ class BInternalPage : public BTreePage {
         explicit BInternalPage(char *page);
         bool insert_separator_at(std::size_t idx, std::uint64_t key, std::uint32_t right_child_page_num);
         bool remove_separator_at(std::size_t idx);
+        bool set_leftmost_child(std::uint32_t leftmost_child_page_num);
         std::optional<std::uint32_t> get_left_child(std::size_t separator_idx) const;
         std::optional<std::uint32_t> get_right_child(std::size_t separator_idx) const;
         bool remove(std::uint64_t key) override;
         void write_back() override;
+        static void fill_initial_layout(char *out);
 
     protected:
         void decode() override;
@@ -66,6 +68,7 @@ class BLeafPage : public BTreePage {
         bool set(std::uint64_t key, const Value &value);
         bool remove(std::uint64_t key) override;
         void write_back() override;
+        static void fill_initial_layout(char *out);
 
     protected:
         void decode() override;
