@@ -63,6 +63,7 @@ class Pager {
 		PagerResult rollback_transaction();
 		PagerResult rollback_hot_journal();
         PagerGetRootResult get_btree_root(); //  TODO: should also return root page nuumber. 
+        PagerResult set_btree_root(std::uint32_t root_page_num);
 	private:
 		struct PagerReadPageResult {
 			PagerResult status = PagerResult::Success;

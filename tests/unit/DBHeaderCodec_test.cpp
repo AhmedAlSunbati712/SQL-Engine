@@ -13,8 +13,9 @@ TEST(DBHeaderCodecTest, SerializeAndDeserializeHeaderRoundTrip) {
     header.db_page_count = 42u;
     header.freelist_head_page_num = 9u;
     header.freelist_page_count = 3u;
+    header.btree_root_page_num = 11u;
 
-    std::array<char, 32> buffer{};
+    std::array<char, DB_HEADER_SIZE> buffer{};
     DBHeaderCodec::serialize_DBHeader(header, buffer.data());
 
     DBHeader decoded{};
@@ -27,6 +28,7 @@ TEST(DBHeaderCodecTest, SerializeAndDeserializeHeaderRoundTrip) {
     EXPECT_EQ(decoded.db_page_count, 42u);
     EXPECT_EQ(decoded.freelist_head_page_num, 9u);
     EXPECT_EQ(decoded.freelist_page_count, 3u);
+    EXPECT_EQ(decoded.btree_root_page_num, 11u);
 }
 
 TEST(DBHeaderCodecTest, HeaderSerializationUsesBigEndianForIntegers) {
@@ -35,8 +37,9 @@ TEST(DBHeaderCodecTest, HeaderSerializationUsesBigEndianForIntegers) {
     header.db_page_count = 0x11223344u;
     header.freelist_head_page_num = 0x55667788u;
     header.freelist_page_count = 0xA1B2C3D4u;
+    header.btree_root_page_num = 0x0A0B0C0Du;
 
-    std::array<char, 32> buffer{};
+    std::array<char, DB_HEADER_SIZE> buffer{};
     DBHeaderCodec::serialize_DBHeader(header, buffer.data());
 
     EXPECT_EQ(static_cast<unsigned char>(buffer[16]), 0x01);
@@ -58,6 +61,11 @@ TEST(DBHeaderCodecTest, HeaderSerializationUsesBigEndianForIntegers) {
     EXPECT_EQ(static_cast<unsigned char>(buffer[29]), 0xB2);
     EXPECT_EQ(static_cast<unsigned char>(buffer[30]), 0xC3);
     EXPECT_EQ(static_cast<unsigned char>(buffer[31]), 0xD4);
+
+    EXPECT_EQ(static_cast<unsigned char>(buffer[32]), 0x0A);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[33]), 0x0B);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[34]), 0x0C);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[35]), 0x0D);
 }
 
 TEST(DBHeaderCodecTest, ValidateReturnsTrueForValidHeaderWithEmptyFreelist) {
@@ -108,6 +116,14 @@ TEST(DBHeaderCodecTest, ValidateReturnsFalseWhenFreelistHeadExceedsPageCount) {
     header.db_page_count = 8u;
     header.freelist_head_page_num = 9u;
     header.freelist_page_count = 1u;
+
+    EXPECT_EQ(DBHeaderCodec::validate_DBHeader(header), false);
+}
+
+TEST(DBHeaderCodecTest, ValidateReturnsFalseWhenBTreeRootExceedsPageCount) {
+    DBHeader header{};
+    header.db_page_count = 8u;
+    header.btree_root_page_num = 8u;
 
     EXPECT_EQ(DBHeaderCodec::validate_DBHeader(header), false);
 }

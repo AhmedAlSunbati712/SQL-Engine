@@ -6,7 +6,7 @@
 #include <Endian.h>
 
 #define PAGE_SIZE 4096
-constexpr std::size_t DB_HEADER_SIZE = 32;
+constexpr std::size_t DB_HEADER_SIZE = 36;
 
 constexpr std::streamoff align_to_page_boundary(std::streamoff offset) {
     return (offset + PAGE_SIZE - 1) & ~(static_cast<std::streamoff>(PAGE_SIZE) - 1);
@@ -33,4 +33,5 @@ struct DBHeader {
     uint32_t db_page_count = 0;
     uint32_t freelist_head_page_num = 0;
     uint32_t freelist_page_count = 0;
+    uint32_t btree_root_page_num = 0;
 };

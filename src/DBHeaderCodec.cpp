@@ -11,6 +11,7 @@ namespace DBHeaderCodec {
         put_u32_be(&out[16 + 4], db_header.db_page_count);
         put_u32_be(&out[16 + 2 * 4], db_header.freelist_head_page_num);
         put_u32_be(&out[16 + 3 * 4], db_header.freelist_page_count);
+        put_u32_be(&out[16 + 4 * 4], db_header.btree_root_page_num);
     }
 
     void deserialize_DBHeader(DBHeader &db_header, char *in) {
@@ -21,11 +22,16 @@ namespace DBHeaderCodec {
         db_header.db_page_count = get_u32_be(&in[16 + 4]);
         db_header.freelist_head_page_num = get_u32_be(&in[16 + 2 * 4]);
         db_header.freelist_page_count = get_u32_be(&in[16 + 3 * 4]);
+        db_header.btree_root_page_num = get_u32_be(&in[16 + 4 * 4]);
     }
 
     bool validate_DBHeader(DBHeader &db_header) {
         for (int idx = 0; idx < 16; idx++) {
             if (db_header.magic_header[idx] != DBHeader_magic_string[idx]) return false;
+        }
+
+        if (db_header.btree_root_page_num != 0) {
+            if (db_header.btree_root_page_num >= db_header.db_page_count) return false;
         }
 
         if (db_header.freelist_page_count == 0) {

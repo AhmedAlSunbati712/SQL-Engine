@@ -557,6 +557,38 @@ PagerResult Pager::unref_page(int page_num) {
     return PagerResult::Success;
 }
 
+PagerGetRootResult Pager::get_btree_root() {
+    PagerGetRootResult result{};
+    if (!is_open) {
+        result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+
+    if (db_header.btree_root_page_num == 0) {
+        result.status = PagerResult::EmptyBTree;
+        result.data = nullptr;
+        result.root_page_num = 0;
+        return result;
+    }
+
+    PagerGetResult get_result = get(static_cast<int>(db_header.btree_root_page_num));
+    result.status = get_result.status;
+    result.data = get_result.data;
+    result.root_page_num = db_header.btree_root_page_num;
+    return result;
+}
+
+PagerResult Pager::set_btree_root(std::uint32_t root_page_num) {
+    if (!is_open) return PagerResult::DatabaseNotOpen;
+
+    PagerResult header_result = mark_header_dirty_for_mutation();
+    if (header_result != PagerResult::Success) return header_result;
+
+    db_header.btree_root_page_num = root_page_num;
+    sync_db_header_to_cached_header_page();
+    return PagerResult::Success;
+}
+
 
 PagerResult Pager::commit_phase_one() {
     /**
