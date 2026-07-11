@@ -63,7 +63,7 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
     // Build the in-memory object for the leaf page
     BLeafPage target_leaf(descent_result.leaf_page);
     
-    // Search for the idx of the first key that is less than or
+    // Search for the idx of the first key that is greater than or
     // equal to key. If the key doesn't exist or all the values
     // are less than the target key, then return status
     // key not in tree
@@ -126,7 +126,83 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
      * pager->unref(descent.leaf_page_num)
      * return success
      */
-    return BTreeStatus{};
+    // Descend from the root to the target leaf.
+    // We need the path this time in case the insert changes separators or causes a split.
+    LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
+    if (descent_result.status != BTreeStatus::Success) return descent_result.status;
+
+    // Before mutating the page bytes, tell the pager we are beginning a write on this page.
+    PagerResult begin_write_result = pager->begin_write(descent_result.leaf_page_num);
+    if (begin_write_result != PagerResult::Success) {
+        pager->unref_page(descent_result.leaf_page_num);
+        return BTreeStatus::FailedToInsert;
+    }
+
+    // Build the in-memory object for the leaf page.
+    BLeafPage target_leaf(descent_result.leaf_page);
+    std::size_t idx = target_leaf.lower_bound_key(key);
+    std::optional<std::uint64_t> key_at_idx = target_leaf.key_at(idx);
+
+    // If the key already exists, this insert is really just an overwrite of the stored value.
+    if (key_at_idx != std::nullopt && *key_at_idx == key) {
+        bool set_result = target_leaf.set(key, value);
+        if (!set_result) {
+            pager->unref_page(descent_result.leaf_page_num);
+            return BTreeStatus::FailedToInsert;
+        }
+
+        target_leaf.write_back();
+        pager->unref_page(descent_result.leaf_page_num);
+        return BTreeStatus::Success;
+    }
+
+    bool first_key_changed = (idx == 0);
+    bool insert_result = target_leaf.insert_at(idx, key, value);
+    if (!insert_result) {
+        pager->unref_page(descent_result.leaf_page_num);
+        return BTreeStatus::FailedToInsert;
+    }
+
+    bool needs_split = (target_leaf.get_key_count() > MAX_KEYS(BTREE_ORDER));
+
+    // Flush the modified in-memory vectors back into the raw page bytes before handing off
+    // to the structural repair helpers.
+    target_leaf.write_back();
+
+    if (needs_split) {
+        // After an overflow insert, the right split begins at the midpoint of the overflowed leaf.
+        std::size_t split_idx = target_leaf.get_key_count() / 2;
+        std::optional<std::uint64_t> split_key = target_leaf.key_at(split_idx);
+        if (split_key == std::nullopt) {
+            pager->unref_page(descent_result.leaf_page_num);
+            return BTreeStatus::FailedToInsert;
+        }
+
+        BTreeStatus split_result = propagate_splitting(
+            descent_result.leaf_page_num,
+            descent_result.path,
+            *split_key
+        );
+        pager->unref_page(descent_result.leaf_page_num);
+        return split_result;
+    }
+
+    if (first_key_changed) {
+        std::optional<std::uint64_t> new_subtree_min = target_leaf.first_key();
+        if (new_subtree_min == std::nullopt) {
+            pager->unref_page(descent_result.leaf_page_num);
+            return BTreeStatus::FailedToInsert;
+        }
+
+        BTreeStatus separator_result = propagate_separator_change_upward(descent_result.path, *new_subtree_min);
+        if (separator_result != BTreeStatus::Success) {
+            pager->unref_page(descent_result.leaf_page_num);
+            return separator_result;
+        }
+    }
+
+    pager->unref_page(descent_result.leaf_page_num);
+    return BTreeStatus::Success;
 }
 
 BTreeRemoveStatus BTree::remove(std::uint64_t key) {
@@ -243,4 +319,107 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
     descent_result.leaf_page = curr_data;
     descent_result.leaf_page_num = curr_page_num;
     return descent_result;
+}
+
+BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, const std::vector<TraversalPathEntry> &path, std::uint64_t split_key) {
+    /**
+     * Purpose:
+     * The page split_page_num overflowed after an insert.
+     * Split it into:
+     *  - the original left page
+     *  - a newly allocated right sibling
+     * Then repair the parent. If the parent overflows, recurse upward.
+     *
+     * ============================================================
+     * Splitting a leaf page
+     * ============================================================
+     *
+     * Example:
+     * max keys = 4
+     * overflowing leaf:
+     *  [10, 20, 30, 40, 50]
+     *
+     * After split:
+     *  left leaf  = [10, 20]
+     *  right leaf = [30, 40, 50]
+     *
+     * For a leaf split:
+     * - the promoted separator is the first key of the new right leaf
+     * - that promoted key stays inside the right leaf
+     *
+     * So here:
+     *  promoted_key = 30
+     *
+     * Parent repair:
+     * - if the parent currently has:
+     *      keys:     [k1, k2, k3]
+     *      children: [c0, c1, c2, c3]
+     * - and c1 is the leaf that split
+     * - then after allocating new right leaf c_new:
+     *      keys:     [k1, promoted_key, k2, k3]
+     *      children: [c0, c1, c_new, c2, c3]
+     *
+     * Special case:
+     * - if the split leaf was the root and there is no parent:
+     *   allocate a new internal root
+     *   root.keys     = [promoted_key]
+     *   root.children = [old_leaf, new_right_leaf]
+     *
+     * ============================================================
+     * Splitting an internal page
+     * ============================================================
+     *
+     * Example:
+     * overflowing internal page:
+     *  keys:     [10, 20, 30, 40, 50]
+     *  children: [c0, c1, c2, c3, c4, c5]
+     *
+     * Split around the median:
+     * - promoted_key = 30
+     * - left page keeps:
+     *      keys:     [10, 20]
+     *      children: [c0, c1, c2]
+     * - right page gets:
+     *      keys:     [40, 50]
+     *      children: [c3, c4, c5]
+     *
+     * For an internal split:
+     * - the promoted median key does NOT stay in either child
+     * - it moves upward into the parent only
+     *
+     * Parent repair is the same pattern:
+     * - replace the one child pointer to the old page with:
+     *      left child  = old page
+     *      separator   = promoted_key
+     *      right child = new right page
+     *
+     * Special case:
+     * - if the split internal page was the root:
+     *   allocate a new internal root
+     *   root.keys     = [promoted_key]
+     *   root.children = [old_internal, new_right_internal]
+     *
+     * ============================================================
+     * Recursive flow
+     * ============================================================
+     *
+     * 1. Load split_page_num and inspect whether it is a leaf or internal page.
+     * 2. Allocate a new right sibling page.
+     * 3. Redistribute keys between left and right.
+     *    - for a leaf: move key-value pairs
+     *    - for an internal page: move keys and child page numbers
+     * 4. Compute promoted_key:
+     *    - leaf split: first key of the new right leaf
+     *    - internal split: the median key removed from the old page
+     * 5. Write back both child pages.
+     * 6. If there is no parent in path:
+     *    - allocate a new root
+     *    - install promoted_key and the two child pointers
+     *    - return success
+     * 7. Otherwise:
+     *    - load the parent page
+     *    - insert promoted_key and the new right child immediately to the right of the old child
+     *    - if the parent overflowed, recursively call propagate_splitting on the parent
+     *    - otherwise write back the parent and return success
+     */
 }
