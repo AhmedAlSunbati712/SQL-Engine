@@ -319,6 +319,12 @@ void BLeafPage::write_back() {
     return;
 }
 
+std::optional<Value> BLeafPage::get_at(std::size_t idx) const {
+    if (idx >= values.size()) return std::nullopt;
+    if (values.size() != keys.size()) return std::nullopt;
+    return values[idx];
+}
+
 std::optional<Value> BLeafPage::get(std::uint64_t key) const {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return std::nullopt;
