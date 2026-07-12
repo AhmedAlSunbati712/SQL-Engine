@@ -99,8 +99,8 @@ class BTree {
         BTreeStatus merge_with_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path);
         BTreeStatus merge_with_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path);
 
-        static void migrate_leaf(BLeafPage src, BLeafPage dst, std::size_t separator_idx);
-        static void migrate_internal(BInternalPage src, BInternalPage dst, std::size_t median_separator_idx);
+        static void migrate_leaf(BLeafPage &src, BLeafPage &dst, std::size_t separator_idx);
+        static void migrate_internal(BInternalPage &src, BInternalPage &dst, std::size_t median_separator_idx);
         Pager *pager = nullptr;
         std::string currently_open_db_file;
         bool pager_open = false;

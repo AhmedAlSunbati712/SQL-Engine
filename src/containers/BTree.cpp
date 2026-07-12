@@ -652,7 +652,7 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
     return BTreeStatus::FailedToInsert;
 }
 
-void BTree::migrate_leaf(BLeafPage src, BLeafPage dst, std::size_t separator_idx) {
+void BTree::migrate_leaf(BLeafPage &src, BLeafPage &dst, std::size_t separator_idx) {
     // Move every key-value pair starting at the split point into the new right leaf.
     // We keep removing from the same logical index because the left leaf shrinks after each move.
     while (src.get_key_count() > separator_idx) {
@@ -675,7 +675,7 @@ void BTree::migrate_leaf(BLeafPage src, BLeafPage dst, std::size_t separator_idx
     dst.write_back();
 }
 
-void BTree::migrate_internal(BInternalPage src, BInternalPage dst, std::size_t median_separator_idx) {
+void BTree::migrate_internal(BInternalPage &src, BInternalPage &dst, std::size_t median_separator_idx) {
     // The child immediately to the right of the promoted median becomes the leftmost
     // child of the new internal page.
     std::optional<std::uint32_t> new_leftmost_child = src.get_right_child(median_separator_idx);
@@ -724,7 +724,10 @@ BTreeStatus BTree::handle_splitting_root(
 
     // The old root becomes the leftmost child, and the split-off page becomes the child
     // to the right of the one separator key stored in the new root.
-    bool set_leftmost_result = new_root_page.set_leftmost_child(left_child_page_num);
+    // fill_initial_layout writes a placeholder leftmost child into the raw page bytes.
+    // So once we decode this page object, the leftmost child slot already exists and
+    // we need to replace it instead of trying to append a brand new one.
+    bool set_leftmost_result = new_root_page.replace_leftmost_child(left_child_page_num);
     if (!set_leftmost_result) {
         pager->unref_page(new_root_page_num);
         return BTreeStatus::FailedToInsert;
