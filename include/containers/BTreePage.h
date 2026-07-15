@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <Key.h>
 #include <optional>
 #include <vector>
 #include <Value.h>

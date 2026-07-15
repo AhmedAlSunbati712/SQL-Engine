@@ -59,13 +59,13 @@ void BInternalPage::decode() {
     /**
      * Structure of an internal page
      *  <----------------------------------------------------------------                  4KB                  ---------------------------------------------------------------->
-     *  ___________.__________._____________________________.___________________________.__________________________.___________________.___________.___________________________.___________.
-     * |           |          |                             |                           |                          |                   |           |                           |           |
-     * | 1 Byte    | 2 Bytes  |           2 Bytes           |        2 Bytes -->        |         4 Bytes          |       ....        |    ....   | Key | Right Child PageNum |    ....   |
-     * |___________|__________|_____________________________|___________________________|__________________________|___________________|___________|___________________________|___________| PAGE END
-     * |           |          |                             |                           |                          |                   |           |                           |           |
-     * | Page Type | KeyCount | Free Region Start Offset    | Free Region End Offset    | Leftmost Child Page Num  | Cell Dir Region   |    ....   |     First Internal Cell   |    ....   |
-     * |___________|__________|_____________________________|___________________________|__________________________|___________________|___________|___________________________|___________|
+     *  ___________.__________._____________________________.___________________________.__________________________.___________________.___________.________________________________________________________.___________.
+     * |           |          |                             |                           |                          |                   |           |                                                        |           |
+     * | 1 Byte    | 2 Bytes  |           2 Bytes           |        2 Bytes -->        |         4 Bytes          |       ....        |    ....   | Key Type | Key Size | Encoded Separator Key | Right Child |    ....   |
+     * |___________|__________|_____________________________|___________________________|__________________________|___________________|___________|________________________________________________________|___________| PAGE END
+     * |           |          |                             |                           |                          |                   |           |                                                        |           |
+     * | Page Type | KeyCount | Free Region Start Offset    | Free Region End Offset    | Leftmost Child Page Num  | Cell Dir Region   |    ....   |                 First Internal Cell                    |    ....   |
+     * |___________|__________|_____________________________|___________________________|__________________________|___________________|___________|________________________________________________________|___________|
      *
      * KeyCount is the number of separator keys currently stored in the page.
      *
@@ -74,18 +74,25 @@ void BInternalPage::decode() {
      * are kept in sorted key order.
      *
      * Internal Cell layout
-     *  __________.______________________.
-     * |          |                      |
-     * | 8 Bytes  |       4 Bytes        |
-     * |__________|______________________|
-     * |          |                      |
-     * |   Key    | Right Child Page Num |
-     * |__________|______________________|
+     *  __________.______________.___________________________.______________________.
+     * |          |              |                           |                      |
+     * | 1 Byte   |   2 Bytes    |         Variable          |       4 Bytes        |
+     * |__________|______________|___________________________|______________________|
+     * |          |              |                           |                      |
+     * | Key Type |   Key Size   |   Encoded Separator Key   | Right Child Page Num |
+     * |__________|______________|___________________________|______________________|
      *
      * Internal pages hold M separator keys and M + 1 child page numbers.
      *
      * The leftmost child page number is stored in the page header. Then each internal cell stores
      * a separator key and the child page number to the right of that separator.
+     *
+     * Since separator keys are now going to be variable-length encoded byte strings, the cell
+     * directory is required. it lets us keep the keys logically sorted without forcing all cells
+     * themselves to stay packed in key order.
+     *
+     * The encoded separator key bytes must preserve the logical total order over keys. Cross-type
+     * ordering is determined by KeyType precedence plus the within-type key encoding.
      *
      * All fixed-width numbers are serialized in big-endian format.
      */
@@ -248,13 +255,13 @@ void BLeafPage::decode() {
     /**
      * Structure of a leaf page
      *  <---------------------------------------------------                     4KB                     --------------------------------------------------->
-     *  ___________.__________._____________________________.___________________________.___________________.___________.____________________________.___________.
-     * |           |          |                             |                           |                   |           |                            |           |
-     * | 1 Byte    |  2 Bytes |           2 Bytes           |        2 Bytes -->        |      ....         |    ....   |  Key | Type | Size | Value |    ....   |
-     * |___________|__________|_____________________________|___________________________|___________________|___________|____________________________|___________| PAGE END
-     * |           |          |                             |                           |                   |           |                            |           |
-     * | Page Type | KeyCount | Free Region Start Offset    | Free Region End Offset    | Cell Dir Region   |    ....   |    First Key-Value Entry   |    ....   |
-     * |___________|__________|_____________________________|___________________________|___________________|___________|____________________________|___________|
+     *  ___________.__________._____________________________.___________________________.___________________.___________.__________________________________________________________________.___________.
+     * |           |          |                             |                           |                   |           |                                                                  |           |
+     * | 1 Byte    |  2 Bytes |           2 Bytes           |        2 Bytes -->        |      ....         |    ....   | Key Type | Key Size | Encoded Key | Value Type | Value Size | Value |    ....   |
+     * |___________|__________|_____________________________|___________________________|___________________|___________|__________________________________________________________________|___________| PAGE END
+     * |           |          |                             |                           |                   |           |                                                                  |           |
+     * | Page Type | KeyCount | Free Region Start Offset    | Free Region End Offset    | Cell Dir Region   |    ....   |                      First Key-Value Entry                         |    ....   |
+     * |___________|__________|_____________________________|___________________________|___________________|___________|__________________________________________________________________|___________|
      *
      * KeyCount is the number of live key-value cells currently stored in the page.
      *
@@ -263,17 +270,22 @@ void BLeafPage::decode() {
      * are kept in sorted key order.
      * 
      * Key-Value Entry layout
-     *  __________.___________.____________________.__________________________.
-     * |          |           |                    |                          |
-     * | 8 Bytes  | 1 Byte    |     2   Bytes      |          Variable        | 
-     * |__________|___________|____________________|__________________________|
-     * |          |           |                    |                          |
-     * |   Key    | ValueType |     Value Size     |           Value          |
-     * |__________|___________|____________________|__________________________|
+     *  __________.______________.____________________.______________.____________________.__________________________.
+     * |          |              |                    |              |                    |                          |
+     * | 1 Byte   |   2 Bytes    |      Variable      | 1 Byte       |     2   Bytes      |          Variable        |
+     * |__________|______________|____________________|______________|____________________|__________________________|
+     * |          |              |                    |              |                    |                          |
+     * | Key Type |   Key Size   |    Encoded Key     |  ValueType   |     Value Size     |           Value          |
+     * |__________|______________|____________________|______________|____________________|__________________________|
      * 
+     * Key Size is the size in bytes of the encoded key payload only.
+     *
      * Value Size is stored as a 2-byte integer.
      *
      * If the ValueType is an integer type, the Value payload itself may be VarInt-encoded.
+     *
+     * The encoded key bytes must preserve the logical total order over keys. Cross-type ordering
+     * is determined by KeyType precedence plus the within-type key encoding.
      *
      * All fixed-width numbers are serialized in big-endian format.
      */
