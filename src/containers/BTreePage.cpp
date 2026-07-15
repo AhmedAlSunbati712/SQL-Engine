@@ -1,8 +1,48 @@
 #include <BTreePage.h>
+
 #include <Endian.h>
+#include <KeyCodec.h>
 #include <Value.h>
+
 #include <cstdlib>
 #include <cstring>
+
+namespace {
+
+constexpr std::uint16_t PAGE_SIZE = 4096;
+constexpr std::uint16_t INTERNAL_HEADER_SIZE = 11;
+constexpr std::uint16_t LEAF_HEADER_SIZE = 7;
+constexpr std::uint16_t CELL_DIR_ENTRY_SIZE = 2;
+
+std::uint16_t internal_cell_size(const Key &key) {
+    return static_cast<std::uint16_t>(1 + 2 + key.size + 4);
+}
+
+std::uint16_t leaf_cell_size(const Key &key, const Value &value) {
+    return static_cast<std::uint16_t>(1 + 2 + key.size + 1 + 2 + value.size);
+}
+
+void write_key_bytes(char *out, const Key &key) {
+    if (!keycodec::validate_key(key)) std::abort(); // TODO: replace with something appropriate
+    if (key.size > UINT16_MAX) std::abort(); // TODO: replace with something appropriate
+
+    put_u8_be(out, static_cast<std::uint8_t>(key.type));
+    put_u16_be(&out[1], static_cast<std::uint16_t>(key.size));
+    std::memcpy(&out[3], key.data.data(), key.size);
+}
+
+void parse_key_bytes(const char *in, Key *key) {
+    std::uint8_t key_type_int = get_u8_be(in);
+    if (key_type_int > static_cast<std::uint8_t>(KeyType::Bytes)) std::abort(); // TODO: replace with something appropriate
+
+    key->type = static_cast<KeyType>(key_type_int);
+    key->size = get_u16_be(&in[1]);
+    key->data.assign(&in[3], &in[3] + key->size);
+
+    if (!keycodec::validate_key(*key)) std::abort(); // TODO: replace with something appropriate
+}
+
+} // namespace
 
 BTreePage::BTreePage(char *page) : page(page) {}
 
@@ -19,13 +59,14 @@ bool BTreePage::is_leaf() const {
 std::uint16_t BTreePage::get_key_count() {
     return key_count;
 }
-std::size_t BTreePage::lower_bound_key(std::uint64_t key) const {
+
+std::size_t BTreePage::lower_bound_key(const Key &key) const {
     std::size_t left = 0;
     std::size_t right = keys.size();
 
     while (left < right) {
         std::size_t mid = left + (right - left) / 2;
-        if (keys[mid] < key) {
+        if (keycodec::compare(keys[mid], key) < 0) {
             left = mid + 1;
         } else {
             right = mid;
@@ -35,12 +76,12 @@ std::size_t BTreePage::lower_bound_key(std::uint64_t key) const {
     return left;
 }
 
-std::optional<std::uint64_t> BTreePage::first_key() const {
+std::optional<Key> BTreePage::first_key() const {
     if (keys.empty()) return std::nullopt;
     return keys[0];
 }
 
-std::optional<std::uint64_t> BTreePage::key_at(std::size_t idx) const {
+std::optional<Key> BTreePage::key_at(std::size_t idx) const {
     if (idx >= keys.size()) return std::nullopt;
     return keys[idx];
 }
@@ -116,9 +157,9 @@ void BInternalPage::decode() {
 
     // The cell directory starts immediately after the 11-byte header.
     // Each entry is a 2-byte offset to the start of one internal cell.
-    std::uint16_t start_ptr = 11;
+    std::uint16_t start_ptr = INTERNAL_HEADER_SIZE;
     for (std::uint16_t i = 0; i < key_count; i++) {
-        std::uint64_t key = 0;
+        Key key{};
         std::uint32_t right_child_page_num = 0;
         std::uint16_t cell_start_offset = get_u16_be(&page[start_ptr]);
 
@@ -129,7 +170,7 @@ void BInternalPage::decode() {
         child_page_nums.push_back(right_child_page_num);
 
         // Advance to the next 2-byte directory entry.
-        start_ptr += 2;
+        start_ptr += CELL_DIR_ENTRY_SIZE;
     }
 }
 
@@ -137,8 +178,9 @@ void BInternalPage::write_back() {
     flush();
 }
 
-bool BInternalPage::insert_separator_at(std::size_t idx, std::uint64_t key, std::uint32_t right_child_page_num) {
+bool BInternalPage::insert_separator_at(std::size_t idx, const Key &key, std::uint32_t right_child_page_num) {
     if (idx > keys.size()) return false;
+    if (!keycodec::validate_key(key)) return false;
     if (child_page_nums.size() != keys.size() + 1) return false;
 
     keys.insert(keys.begin() + idx, key);
@@ -157,8 +199,9 @@ bool BInternalPage::remove_separator_at(std::size_t idx) {
     return true;
 }
 
-bool BInternalPage::set_separator_key_at(std::size_t idx, std::uint64_t key) {
+bool BInternalPage::set_separator_key_at(std::size_t idx, const Key &key) {
     if (idx >= keys.size()) return false;
+    if (!keycodec::validate_key(key)) return false;
     keys[idx] = key;
     return true;
 }
@@ -192,58 +235,64 @@ std::optional<std::uint32_t> BInternalPage::get_right_child(std::size_t separato
     return child_page_nums[separator_idx + 1];
 }
 
-bool BInternalPage::remove(std::uint64_t key) {
+bool BInternalPage::remove(const Key &key) {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return false;
-    if (keys[idx] != key) return false;
+    if (!keycodec::equal(keys[idx], key)) return false;
     return remove_separator_at(idx);
 }
 
 void BInternalPage::flush() {
     // Clear the page first so any stale bytes from older layouts do not survive after flush.
-    std::memset(page, 0, 4096);
+    std::memset(page, 0, PAGE_SIZE);
 
     // Serialize the fixed-size header first.
     put_u8_be(page, static_cast<std::uint8_t>(page_type));
     put_u16_be(&page[1], static_cast<std::uint16_t>(keys.size()));
-    put_u16_be(&page[3], static_cast<std::uint16_t>(11 + keys.size() * 2));
-    put_u16_be(&page[5], static_cast<std::uint16_t>(4096 - keys.size() * 12 - 1));
+    put_u16_be(&page[3], static_cast<std::uint16_t>(INTERNAL_HEADER_SIZE + keys.size() * CELL_DIR_ENTRY_SIZE));
+
+    std::uint16_t total_cell_bytes = 0;
+    for (const Key &key : keys) {
+        total_cell_bytes = static_cast<std::uint16_t>(total_cell_bytes + internal_cell_size(key));
+    }
+    put_u16_be(&page[5], static_cast<std::uint16_t>(PAGE_SIZE - total_cell_bytes - 1));
     put_u32_be(&page[7], child_page_nums[0]);
 
     // The directory is stored in key order. Each 2-byte entry points at the start of one
     // internal cell body somewhere in the packed cell-content region at the end of the page.
-    std::uint16_t dir_ptr = 11;
-    std::uint16_t cell_ptr = 4096;
+    std::uint16_t dir_ptr = INTERNAL_HEADER_SIZE;
+    std::uint16_t cell_ptr = PAGE_SIZE;
 
-    for (std::uint16_t i = 0; i < keys.size(); i++) {
-        cell_ptr -= 12;
+    for (std::size_t i = 0; i < keys.size(); i++) {
+        std::uint16_t cell_size = internal_cell_size(keys[i]);
+        cell_ptr = static_cast<std::uint16_t>(cell_ptr - cell_size);
 
-        // Internal cell format: 8-byte separator key, then 4-byte right child page number.
-        put_u64_be(&page[cell_ptr], keys[i]);
-        put_u32_be(&page[cell_ptr + 8], child_page_nums[i + 1]);
+        // Internal cell format: type tag, key payload size, encoded key bytes,
+        // then the child page number to the right of that separator.
+        write_key_bytes(&page[cell_ptr], keys[i]);
+        put_u32_be(&page[cell_ptr + 3 + keys[i].size], child_page_nums[i + 1]);
 
         // Store the offset to this cell in the directory entry for the same logical key index.
         put_u16_be(&page[dir_ptr], cell_ptr);
-        dir_ptr += 2;
+        dir_ptr += CELL_DIR_ENTRY_SIZE;
     }
 }
 
-void BInternalPage::parse_internal_cell(const char *in, std::uint64_t *key, std::uint32_t *right_child_page_num) {
-    // Internal cell format: 8-byte separator key, then 4-byte right child page number.
-    *key = get_u64_be(in);
-    *right_child_page_num = get_u32_be(&in[8]);
+void BInternalPage::parse_internal_cell(const char *in, Key *key, std::uint32_t *right_child_page_num) {
+    // Internal cell format: type tag, key payload size, encoded key bytes,
+    // then the child page number to the right of that separator.
+    parse_key_bytes(in, key);
+    *right_child_page_num = get_u32_be(&in[3 + key->size]);
 }
 
 void BInternalPage::fill_initial_layout(char *out) {
-    std::memset(out, 0, 4096);
+    std::memset(out, 0, PAGE_SIZE);
     put_u8_be(out, static_cast<std::uint8_t>(PageType::Internal));
     put_u16_be(&out[1], 0);
-    put_u16_be(&out[3], 11);
-    put_u16_be(&out[5], 4095);
+    put_u16_be(&out[3], INTERNAL_HEADER_SIZE);
+    put_u16_be(&out[5], PAGE_SIZE - 1);
     put_u32_be(&out[7], 0);
 }
-
-
 
 // ====================================== Leaf Page =======================================
 
@@ -301,7 +350,6 @@ void BLeafPage::decode() {
     free_offset_start = get_u16_be(&page[3]);
     free_offset_end = get_u16_be(&page[5]);
 
-
     // We are re-decoding this page into vectors, so drop any older decoded state first.
     keys.clear();
     values.clear();
@@ -310,9 +358,9 @@ void BLeafPage::decode() {
 
     // The cell directory starts immediately after the 7-byte header.
     // Each entry is a 2-byte offset to the start of one leaf cell.
-    std::uint16_t start_ptr = 7;
+    std::uint16_t start_ptr = LEAF_HEADER_SIZE;
     for (std::uint16_t i = 0; i < key_count; i++) {
-        std::uint64_t key = 0;
+        Key key{};
         Value value{};
         std::uint16_t cell_start_offset = get_u16_be(&page[start_ptr]);
 
@@ -322,13 +370,12 @@ void BLeafPage::decode() {
         values.push_back(value);
 
         // Advance to the next 2-byte directory entry.
-        start_ptr += 2;
+        start_ptr += CELL_DIR_ENTRY_SIZE;
     }
 }
 
 void BLeafPage::write_back() {
     flush();
-    return;
 }
 
 std::optional<Value> BLeafPage::get_at(std::size_t idx) const {
@@ -337,15 +384,16 @@ std::optional<Value> BLeafPage::get_at(std::size_t idx) const {
     return values[idx];
 }
 
-std::optional<Value> BLeafPage::get(std::uint64_t key) const {
+std::optional<Value> BLeafPage::get(const Key &key) const {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return std::nullopt;
-    if (keys[idx] != key) return std::nullopt;
+    if (!keycodec::equal(keys[idx], key)) return std::nullopt;
     return values[idx];
 }
 
-bool BLeafPage::insert_at(std::size_t idx, std::uint64_t key, const Value &value) {
+bool BLeafPage::insert_at(std::size_t idx, const Key &key, const Value &value) {
     if (idx > keys.size()) return false;
+    if (!keycodec::validate_key(key)) return false;
 
     keys.insert(keys.begin() + idx, key);
     values.insert(values.begin() + idx, value);
@@ -363,25 +411,25 @@ bool BLeafPage::remove_at(std::size_t idx) {
     return true;
 }
 
-bool BLeafPage::set(std::uint64_t key, const Value &value) {
+bool BLeafPage::set(const Key &key, const Value &value) {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return false;
-    if (keys[idx] != key) return false;
+    if (!keycodec::equal(keys[idx], key)) return false;
 
     values[idx] = value;
     return true;
 }
 
-bool BLeafPage::remove(std::uint64_t key) {
+bool BLeafPage::remove(const Key &key) {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return false;
-    if (keys[idx] != key) return false;
+    if (!keycodec::equal(keys[idx], key)) return false;
     return remove_at(idx);
 }
 
 void BLeafPage::flush() {
     // Clear the page first so any stale bytes from older layouts do not survive after flush.
-    std::memset(page, 0, 4096);
+    std::memset(page, 0, PAGE_SIZE);
 
     // Serialize the fixed-size header first.
     put_u8_be(page, static_cast<std::uint8_t>(page_type));
@@ -389,51 +437,53 @@ void BLeafPage::flush() {
 
     // The leaf header is 7 bytes long. The cell directory starts immediately after it
     // and contributes 2 bytes per key-value cell.
-    put_u16_be(&page[3], static_cast<std::uint16_t>(7 + keys.size() * 2));
+    put_u16_be(&page[3], static_cast<std::uint16_t>(LEAF_HEADER_SIZE + keys.size() * CELL_DIR_ENTRY_SIZE));
 
     std::uint16_t total_cell_bytes = 0;
     for (std::size_t i = 0; i < keys.size(); i++) {
-        total_cell_bytes = static_cast<std::uint16_t>(total_cell_bytes + 11 + values[i].size);
+        total_cell_bytes = static_cast<std::uint16_t>(total_cell_bytes + leaf_cell_size(keys[i], values[i]));
     }
-    put_u16_be(&page[5], static_cast<std::uint16_t>(4096 - total_cell_bytes - 1));
+    put_u16_be(&page[5], static_cast<std::uint16_t>(PAGE_SIZE - total_cell_bytes - 1));
 
     // The directory is stored in key order. Each 2-byte entry points at the start of one
     // packed leaf cell body near the end of the page.
-    std::uint16_t dir_ptr = 7;
-    std::uint16_t cell_ptr = 4096;
+    std::uint16_t dir_ptr = LEAF_HEADER_SIZE;
+    std::uint16_t cell_ptr = PAGE_SIZE;
 
     for (std::size_t i = 0; i < keys.size(); i++) {
-        std::uint16_t cell_size = 11 + values[i].size;
-        cell_ptr = cell_ptr - cell_size;
+        std::uint16_t cell_size = leaf_cell_size(keys[i], values[i]);
+        cell_ptr = static_cast<std::uint16_t>(cell_ptr - cell_size);
 
-        // Leaf cell format: 8-byte key, 1-byte ValueType, 2-byte value size, then payload bytes.
-        put_u64_be(&page[cell_ptr], keys[i]);
-        put_u8_be(&page[cell_ptr + 8], static_cast<std::uint8_t>(values[i].type));
-        put_u16_be(&page[cell_ptr + 9], static_cast<std::uint16_t>(values[i].size));
-        std::memcpy(&page[cell_ptr + 11], values[i].data.data(), values[i].size);
+        // Leaf cell format: type tag, key payload size, encoded key bytes, then
+        // the value type, value size, and value bytes.
+        write_key_bytes(&page[cell_ptr], keys[i]);
+        put_u8_be(&page[cell_ptr + 3 + keys[i].size], static_cast<std::uint8_t>(values[i].type));
+        put_u16_be(&page[cell_ptr + 4 + keys[i].size], static_cast<std::uint16_t>(values[i].size));
+        std::memcpy(&page[cell_ptr + 6 + keys[i].size], values[i].data.data(), values[i].size);
 
         // Store the offset to this cell in the directory entry for the same logical key index.
         put_u16_be(&page[dir_ptr], cell_ptr);
-        dir_ptr += 2;
+        dir_ptr += CELL_DIR_ENTRY_SIZE;
     }
 }
 
-void BLeafPage::parse_leaf_cell(const char *in, std::uint64_t *key, Value *value) {
-    // Leaf cell format: 8-byte key, 1-byte ValueType, 2-byte value size, then payload bytes.
-    *key = get_u64_be(in);
+void BLeafPage::parse_leaf_cell(const char *in, Key *key, Value *value) {
+    // Leaf cell format: type tag, key payload size, encoded key bytes, then
+    // the value type, value size, and value bytes.
+    parse_key_bytes(in, key);
 
-    std::uint8_t value_type_int = get_u8_be(&in[8]);
+    std::uint8_t value_type_int = get_u8_be(&in[3 + key->size]);
     if (value_type_int > static_cast<std::uint8_t>(ValueType::Char)) std::abort(); // TODO: replace with something appropriate
     value->type = static_cast<ValueType>(value_type_int);
 
-    value->size = get_u16_be(&in[9]);
-    value->data.assign(&in[11], &in[11] + value->size);
+    value->size = get_u16_be(&in[4 + key->size]);
+    value->data.assign(&in[6 + key->size], &in[6 + key->size] + value->size);
 }
 
 void BLeafPage::fill_initial_layout(char *out) {
-    std::memset(out, 0, 4096);
+    std::memset(out, 0, PAGE_SIZE);
     put_u8_be(out, static_cast<std::uint8_t>(PageType::Leaf));
     put_u16_be(&out[1], 0);
-    put_u16_be(&out[3], 7);
-    put_u16_be(&out[5], 4095);
+    put_u16_be(&out[3], LEAF_HEADER_SIZE);
+    put_u16_be(&out[5], PAGE_SIZE - 1);
 }

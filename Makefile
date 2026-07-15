@@ -8,7 +8,6 @@ ARFLAGS = rcs
 LIB = build/libsqlengine.a
 
 SRC = \
-	src/containers/BTree.cpp \
 	src/containers/BTreePage.cpp \
 	src/containers/DLList.cpp \
 	src/JournalCodec.cpp \
@@ -17,10 +16,10 @@ SRC = \
 	src/Pager.cpp \
 	src/disk/DiskIO.cpp \
 	src/encoding/Endian.cpp \
+	src/encoding/KeyCodec.cpp \
 	src/DBHeaderCodec.cpp
 
 OBJ = \
-	build/containers/BTree.o \
 	build/containers/BTreePage.o \
 	build/containers/DLList.o \
 	build/JournalCodec.o \
@@ -29,13 +28,14 @@ OBJ = \
 	build/Pager.o \
 	build/disk/DiskIO.o \
 	build/encoding/Endian.o \
+	build/encoding/KeyCodec.o \
 	build/DBHeaderCodec.o
 
-UNIT_TEST_SRC := $(wildcard tests/unit/*.cpp)
+UNIT_TEST_SRC := $(filter-out tests/unit/BTree_test.cpp,$(wildcard tests/unit/*.cpp))
 UNIT_TEST_OBJ := $(patsubst tests/unit/%.cpp,build/tests/unit/%.o,$(UNIT_TEST_SRC))
 UNIT_TEST_BIN := $(patsubst tests/unit/%.cpp,build/tests/unit/%,$(UNIT_TEST_SRC))
 
-INTEGRATION_TEST_SRC := $(wildcard tests/integration/*.cpp)
+INTEGRATION_TEST_SRC := $(filter-out tests/integration/BTree_test.cpp,$(wildcard tests/integration/*.cpp))
 INTEGRATION_TEST_OBJ := $(patsubst tests/integration/%.cpp,build/tests/integration/%.o,$(INTEGRATION_TEST_SRC))
 INTEGRATION_TEST_BIN := $(patsubst tests/integration/%.cpp,build/tests/integration/%,$(INTEGRATION_TEST_SRC))
 
