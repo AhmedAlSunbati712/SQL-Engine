@@ -4,6 +4,7 @@
 #include <vector>
 
 enum class ValueType : std::uint8_t {
+    VarUInt,
     VarInt,
     Bool,
     Char

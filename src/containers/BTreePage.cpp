@@ -3,6 +3,7 @@
 #include <Endian.h>
 #include <KeyCodec.h>
 #include <Value.h>
+#include <ValueCodec.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -394,6 +395,7 @@ std::optional<Value> BLeafPage::get(const Key &key) const {
 bool BLeafPage::insert_at(std::size_t idx, const Key &key, const Value &value) {
     if (idx > keys.size()) return false;
     if (!keycodec::validate_key(key)) return false;
+    if (!valuecodec::validate_value(value)) return false;
 
     keys.insert(keys.begin() + idx, key);
     values.insert(values.begin() + idx, value);
@@ -415,6 +417,7 @@ bool BLeafPage::set(const Key &key, const Value &value) {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return false;
     if (!keycodec::equal(keys[idx], key)) return false;
+    if (!valuecodec::validate_value(value)) return false;
 
     values[idx] = value;
     return true;
@@ -456,6 +459,8 @@ void BLeafPage::flush() {
 
         // Leaf cell format: type tag, key payload size, encoded key bytes, then
         // the value type, value size, and value bytes.
+        // Validate first so we never persist a malformed typed value into the page.
+        if (!valuecodec::validate_value(values[i])) std::abort(); // TODO: replace with something appropriate
         write_key_bytes(&page[cell_ptr], keys[i]);
         put_u8_be(&page[cell_ptr + 3 + keys[i].size], static_cast<std::uint8_t>(values[i].type));
         put_u16_be(&page[cell_ptr + 4 + keys[i].size], static_cast<std::uint16_t>(values[i].size));
@@ -478,6 +483,10 @@ void BLeafPage::parse_leaf_cell(const char *in, Key *key, Value *value) {
 
     value->size = get_u16_be(&in[4 + key->size]);
     value->data.assign(&in[6 + key->size], &in[6 + key->size] + value->size);
+
+    // The raw bytes are now loaded. Make sure they actually match the rules
+    // of the declared value type before we let the caller observe them.
+    if (!valuecodec::validate_value(*value)) std::abort(); // TODO: replace with something appropriate
 }
 
 void BLeafPage::fill_initial_layout(char *out) {

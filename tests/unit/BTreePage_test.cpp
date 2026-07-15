@@ -3,6 +3,7 @@
 #include <BTreePage.h>
 #include <Endian.h>
 #include <KeyCodec.h>
+#include <ValueCodec.h>
 
 #include <array>
 #include <cstddef>
@@ -39,6 +40,11 @@ void write_leaf_cell(char *page, std::uint16_t cell_offset, const Key &key, Valu
 
 void build_leaf_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &expected_keys) {
     page.fill(0);
+    Value false_char = make_value(ValueType::Char, "F");
+    Value true_bool = make_value(ValueType::Bool, "T");
+    Value negative_int = valuecodec::make_varint(-5);
+    Value cat_value = make_value(ValueType::Char, "CAT");
+    Value bytes_value = make_value(ValueType::Char, "BYTES");
 
     expected_keys = {
         keycodec::make_bool(false),
@@ -59,11 +65,11 @@ void build_leaf_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &expect
     put_u16_be(&page[13], 4044);
     put_u16_be(&page[15], 4031);
 
-    write_leaf_cell(page.data(), 4088, expected_keys[0], ValueType::Char, "F", 1);
-    write_leaf_cell(page.data(), 4073, expected_keys[1], ValueType::Bool, "T", 1);
-    write_leaf_cell(page.data(), 4056, expected_keys[2], ValueType::VarInt, "NEG", 3);
-    write_leaf_cell(page.data(), 4044, expected_keys[3], ValueType::Char, "CAT", 3);
-    write_leaf_cell(page.data(), 4031, expected_keys[4], ValueType::Char, "BYTES", 5);
+    write_leaf_cell(page.data(), 4088, expected_keys[0], false_char.type, false_char.data.data(), false_char.size);
+    write_leaf_cell(page.data(), 4073, expected_keys[1], true_bool.type, true_bool.data.data(), true_bool.size);
+    write_leaf_cell(page.data(), 4056, expected_keys[2], negative_int.type, negative_int.data.data(), negative_int.size);
+    write_leaf_cell(page.data(), 4044, expected_keys[3], cat_value.type, cat_value.data.data(), cat_value.size);
+    write_leaf_cell(page.data(), 4031, expected_keys[4], bytes_value.type, bytes_value.data.data(), bytes_value.size);
 }
 
 void write_internal_cell(char *page, std::uint16_t cell_offset, const Key &key, std::uint32_t right_child_page_num) {
@@ -216,7 +222,7 @@ TEST(BTreePageTest, LeafInsertSetAndRemoveMutateLogicalState) {
 
     EXPECT_EQ(leaf_page.insert_at(0, key_string, make_value(ValueType::Char, "C")), true);
     EXPECT_EQ(leaf_page.insert_at(0, key_false, make_value(ValueType::Bool, "F")), true);
-    EXPECT_EQ(leaf_page.insert_at(1, key_uint, make_value(ValueType::VarInt, "20")), true);
+    EXPECT_EQ(leaf_page.insert_at(1, key_uint, valuecodec::make_varuint(20)), true);
     EXPECT_EQ(leaf_page.insert_at(9, keycodec::make_bytes(std::vector<char>{'z'}), make_value(ValueType::Char, "Z")), false);
 
     ASSERT_TRUE(leaf_page.key_at(0).has_value());
@@ -299,7 +305,7 @@ TEST(BTreePageTest, LeafWriteBackRoundTripsIntoFreshObject) {
         BLeafPage leaf_page(page.data());
         ASSERT_EQ(leaf_page.insert_at(0, key_false, make_value(ValueType::Char, "A")), true);
         ASSERT_EQ(leaf_page.insert_at(1, key_uint, make_value(ValueType::Bool, "B")), true);
-        ASSERT_EQ(leaf_page.insert_at(2, key_string, make_value(ValueType::VarInt, "123456")), true);
+        ASSERT_EQ(leaf_page.insert_at(2, key_string, valuecodec::make_varint(123456)), true);
         ASSERT_EQ(leaf_page.set(key_uint, make_value(ValueType::Bool, "T")), true);
         leaf_page.write_back();
     }
@@ -326,7 +332,9 @@ TEST(BTreePageTest, LeafWriteBackRoundTripsIntoFreshObject) {
     std::optional<Value> last_value = decoded.get(key_string);
     ASSERT_TRUE(last_value.has_value());
     EXPECT_EQ(last_value->type, ValueType::VarInt);
-    EXPECT_EQ(std::string(last_value->data.begin(), last_value->data.end()), "123456");
+    std::int64_t decoded_last_value = 0;
+    ASSERT_EQ(valuecodec::decode_varint(*last_value, &decoded_last_value), true);
+    EXPECT_EQ(decoded_last_value, 123456);
 }
 
 TEST(BTreePageTest, InternalWriteBackRoundTripsIntoFreshObject) {

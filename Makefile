@@ -17,6 +17,7 @@ SRC = \
 	src/disk/DiskIO.cpp \
 	src/encoding/Endian.cpp \
 	src/encoding/KeyCodec.cpp \
+	src/encoding/ValueCodec.cpp \
 	src/DBHeaderCodec.cpp
 
 OBJ = \
@@ -29,6 +30,7 @@ OBJ = \
 	build/disk/DiskIO.o \
 	build/encoding/Endian.o \
 	build/encoding/KeyCodec.o \
+	build/encoding/ValueCodec.o \
 	build/DBHeaderCodec.o
 
 UNIT_TEST_SRC := $(filter-out tests/unit/BTree_test.cpp,$(wildcard tests/unit/*.cpp))
