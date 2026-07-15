@@ -81,10 +81,10 @@ class BTree {
             std::optional<std::uint32_t> left_sibling_page_num;
         };
 
-        BTreeStatus propagate_separator_change_upward(const std::vector<TraversalPathEntry> &path, std::uint64_t new_subtree_min);
+        BTreeStatus propagate_separator_change_upward(const std::vector<TraversalPathEntry> &path, const Key &new_subtree_min);
         BTreeStatus propagate_splitting(std::uint32_t split_page_num, std::vector<TraversalPathEntry> &path);
         BTreeStatus propagate_merging(std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path);
-        BTreeStatus handle_splitting_root(std::uint32_t left_child_page_num, std::uint32_t right_child_page_num, std::uint64_t separator_key);
+        BTreeStatus handle_splitting_root(std::uint32_t left_child_page_num, std::uint32_t right_child_page_num, const Key &separator_key);
         BTreeStatus handle_root_underflow(std::uint32_t underflow_page_num, PageType underflow_page_type, char *underflow_page_data);
         MergeParentContext build_merge_parent_context(const TraversalPathEntry &parent_path_entry, BInternalPage &parent_page);
         BTreeStatus finish_parent_after_merge(BInternalPage &parent_page, std::uint32_t parent_page_num, std::vector<TraversalPathEntry> &path);

@@ -1,6 +1,19 @@
 #include <BTree.h>
+#include <KeyCodec.h>
 #include <Pager.h>
 #include <cassert>
+
+namespace {
+
+Key make_tree_key(std::uint64_t key) {
+    // For now the public BTree interface still takes numeric keys.
+    // Convert them once at the edge, then keep the rest of the module
+    // working in terms of fully-typed keys.
+    return keycodec::make_uint64(key);
+}
+
+} // namespace
+
 BTree::~BTree() {
     close();
 }
@@ -102,9 +115,10 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
      * status.value <- leaf.values[idx]
      * pager->unref(descent.leaf_page_num)
      * return status
-     */
+    */
     BTreeGetStatus get_result{};
     get_result.status = BTreeStatus::Success;
+    Key target_key = make_tree_key(key);
 
     // Descend from the root tohe leaf. We pass false to the second arg
     // Since we are not interested in keeping the parent pointers
@@ -125,16 +139,16 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
     // equal to key. If the key doesn't exist or all the values
     // are less than the target key, then return status
     // key not in tree
-    std::size_t idx = target_leaf.lower_bound_key(key);
-    std::optional<std::uint64_t> key_at_idx = target_leaf.key_at(idx);
-    if (key_at_idx == std::nullopt || key_at_idx != key) {
+    std::size_t idx = target_leaf.lower_bound_key(target_key);
+    std::optional<Key> key_at_idx = target_leaf.key_at(idx);
+    if (key_at_idx == std::nullopt || !keycodec::equal(*key_at_idx, target_key)) {
         pager->unref_page(descent_result.leaf_page_num);
         get_result.status = BTreeStatus::KeyNotInTree;
         return get_result;
     }
 
     // Otherwise, we know the key exists. Extract its value
-    std::optional<Value> value_opt = target_leaf.get(key);
+    std::optional<Value> value_opt = target_leaf.get(target_key);
     Value value = *value_opt;
     get_result.value = value;
 
@@ -187,9 +201,10 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
      *
      * pager->unref(descent.leaf_page_num)
      * return success
-     */
+    */
     // Descend from the root to the target leaf.
     // We need the path this time in case the insert changes separators or causes a split.
+    Key target_key = make_tree_key(key);
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         PagerAllocateResult allocation_result = pager->allocate_page();
@@ -199,7 +214,7 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
         BLeafPage::fill_initial_layout(allocation_result.data);
         BLeafPage root_leaf(allocation_result.data);
 
-        bool insert_result = root_leaf.insert_at(0, key, value);
+        bool insert_result = root_leaf.insert_at(0, target_key, value);
         if (!insert_result) {
             pager->unref_page(root_page_num);
             return BTreeStatus::FailedToInsert;
@@ -222,12 +237,12 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
 
     // Build the in-memory object for the leaf page.
     BLeafPage target_leaf(descent_result.leaf_page);
-    std::size_t idx = target_leaf.lower_bound_key(key);
-    std::optional<std::uint64_t> key_at_idx = target_leaf.key_at(idx);
+    std::size_t idx = target_leaf.lower_bound_key(target_key);
+    std::optional<Key> key_at_idx = target_leaf.key_at(idx);
 
     // If the key already exists, this insert is really just an overwrite of the stored value.
-    if (key_at_idx != std::nullopt && *key_at_idx == key) {
-        bool set_result = target_leaf.set(key, value);
+    if (key_at_idx != std::nullopt && keycodec::equal(*key_at_idx, target_key)) {
+        bool set_result = target_leaf.set(target_key, value);
         if (!set_result) {
             pager->unref_page(descent_result.leaf_page_num);
             return BTreeStatus::FailedToInsert;
@@ -238,7 +253,7 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
         return BTreeStatus::Success;
     }
 
-    bool insert_result = target_leaf.insert_at(idx, key, value);
+    bool insert_result = target_leaf.insert_at(idx, target_key, value);
     if (!insert_result) {
         pager->unref_page(descent_result.leaf_page_num);
         return BTreeStatus::FailedToInsert;
@@ -301,6 +316,7 @@ BTreeRemoveStatus BTree::remove(std::uint64_t key) {
      * return success
      */
     BTreeRemoveStatus remove_result{};
+    Key target_key = make_tree_key(key);
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         remove_result.status = BTreeStatus::KeyNotInTree;
@@ -315,8 +331,8 @@ BTreeRemoveStatus BTree::remove(std::uint64_t key) {
     // Parse the leaf page and find the key
     BLeafPage target_leaf_page(descent_result.leaf_page);
     std::uint32_t leaf_page_num = descent_result.leaf_page_num;
-    std::size_t key_idx = target_leaf_page.lower_bound_key(key);
-    if (key_idx == target_leaf_page.get_key_count() || *target_leaf_page.key_at(key_idx) != key) {
+    std::size_t key_idx = target_leaf_page.lower_bound_key(target_key);
+    if (key_idx == target_leaf_page.get_key_count() || !keycodec::equal(*target_leaf_page.key_at(key_idx), target_key)) {
         remove_result.status = BTreeStatus::KeyNotInTree;
         pager->unref_page(leaf_page_num);
         return remove_result;
@@ -375,6 +391,7 @@ BTreeRemoveStatus BTree::remove(std::uint64_t key) {
 
 LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool include_path) {
     LeafDescentResult descent_result{};
+    Key target_key = make_tree_key(key);
     PagerGetRootResult root_get_result = pager->get_btree_root();
 
     if (root_get_result.status == PagerResult::EmptyBTree) {
@@ -400,7 +417,7 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
     while (true) {
         // Decode the current node raw bytes into an in-memory internal page object
         BInternalPage curr(curr_data);
-        std::size_t idx = curr.lower_bound_key(key); // The idx of the first key greater or equal to the key
+        std::size_t idx = curr.lower_bound_key(target_key); // The idx of the first key greater or equal to the key
 
         std::optional<std::uint32_t> target_child_page_num;
         ChildDirection child_dir;
@@ -408,7 +425,7 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
             // The target key is greater than all keys in the current node
             target_child_page_num = curr.get_right_child(idx - 1);
             child_dir = ChildDirection::Right;
-        } else if (*curr.key_at(idx) == key) { 
+        } else if (keycodec::equal(*curr.key_at(idx), target_key)) { 
             // The key at the idx is equal to the target
             target_child_page_num = curr.get_right_child(idx);
             child_dir = ChildDirection::Right;
@@ -525,7 +542,7 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
         // The parent page is surely definitely an internal page
         // Insert the new separator key at the idx after the parent separator_index_used
         BInternalPage parent_page(get_parent_result.data);
-        std::uint64_t key = *new_leaf_page.key_at(0);
+        Key key = *new_leaf_page.key_at(0);
         bool insert_separator_result = false;
         if (parent_path_entry.child_dir == ChildDirection::Right) {
             insert_separator_result = parent_page.insert_separator_at(parent_path_entry.separator_index_used + 1, key, new_leaf_page_num);
@@ -573,7 +590,7 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
         // Capture the median key before mutating the original page.
         // This is the key that gets promoted upward and does not stay in either child page.
         std::size_t median_separator_idx = split_page.get_key_count() / 2;
-        std::optional<std::uint64_t> promoted_key = split_page.key_at(median_separator_idx);
+        std::optional<Key> promoted_key = split_page.key_at(median_separator_idx);
         if (promoted_key == std::nullopt) {
             pager->unref_page(split_page_num);
             pager->unref_page(new_internal_page_num);
@@ -656,7 +673,7 @@ void BTree::migrate_leaf(BLeafPage &src, BLeafPage &dst, std::size_t separator_i
     // Move every key-value pair starting at the split point into the new right leaf.
     // We keep removing from the same logical index because the left leaf shrinks after each move.
     while (src.get_key_count() > separator_idx) {
-        std::optional<std::uint64_t> move_key = src.key_at(separator_idx);
+        std::optional<Key> move_key = src.key_at(separator_idx);
         if (move_key == std::nullopt) std::abort();
 
         std::optional<Value> move_value = src.get(*move_key);
@@ -687,7 +704,7 @@ void BTree::migrate_internal(BInternalPage &src, BInternalPage &dst, std::size_t
     // Move every separator strictly to the right of the median into the new right page.
     // We keep removing from the same logical index because the vector shrinks after each removal.
     while (src.get_key_count() > median_separator_idx + 1) {
-        std::optional<std::uint64_t> move_key = src.key_at(median_separator_idx + 1);
+        std::optional<Key> move_key = src.key_at(median_separator_idx + 1);
         std::optional<std::uint32_t> move_right_child = src.get_right_child(median_separator_idx + 1);
         if (move_key == std::nullopt || move_right_child == std::nullopt) std::abort();
 
@@ -711,7 +728,7 @@ void BTree::migrate_internal(BInternalPage &src, BInternalPage &dst, std::size_t
 BTreeStatus BTree::handle_splitting_root(
     std::uint32_t left_child_page_num,
     std::uint32_t right_child_page_num,
-    std::uint64_t separator_key
+    const Key &separator_key
 ) {
     // A root split means we need to allocate a brand new internal root above the
     // two children that just came out of the split.
@@ -750,7 +767,7 @@ BTreeStatus BTree::handle_splitting_root(
 
 BTreeStatus BTree::propagate_separator_change_upward(
     const std::vector<TraversalPathEntry> &path,
-    std::uint64_t new_subtree_min
+    const Key &new_subtree_min
 ) {
     /**
      * A delete changed the minimum key of some subtree.
@@ -937,7 +954,7 @@ BTreeStatus BTree::borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage
 
     // Borrow the first record from the right sibling and append it to the current leaf.
     // Then update the parent separator so it names the new minimum of the right subtree.
-    std::optional<std::uint64_t> borrowed_key = right_sibling.key_at(0);
+    std::optional<Key> borrowed_key = right_sibling.key_at(0);
     std::optional<Value> borrowed_value = right_sibling.get_at(0);
     if (borrowed_key == std::nullopt || borrowed_value == std::nullopt) {
         pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
@@ -948,7 +965,7 @@ BTreeStatus BTree::borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage
 
     bool insert_result = current_leaf.insert_at(current_leaf.get_key_count(), *borrowed_key, *borrowed_value);
     bool remove_result = right_sibling.remove_at(0);
-    std::optional<std::uint64_t> new_right_first_key = right_sibling.first_key();
+    std::optional<Key> new_right_first_key = right_sibling.first_key();
     bool set_sep_result = (new_right_first_key != std::nullopt) &&
         parent_page.set_separator_key_at(ctx.child_idx, *new_right_first_key);
     if (!insert_result || !remove_result || !set_sep_result) {
@@ -996,7 +1013,7 @@ BTreeStatus BTree::borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage 
     // Borrow the last record from the left sibling and prepend it to the current leaf.
     // The current leaf's minimum changed, so we must update the separator that names it.
     std::size_t left_last_idx = left_sibling.get_key_count() - 1;
-    std::optional<std::uint64_t> borrowed_key = left_sibling.key_at(left_last_idx);
+    std::optional<Key> borrowed_key = left_sibling.key_at(left_last_idx);
     std::optional<Value> borrowed_value = left_sibling.get_at(left_last_idx);
     if (borrowed_key == std::nullopt || borrowed_value == std::nullopt) {
         pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
@@ -1007,7 +1024,7 @@ BTreeStatus BTree::borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage 
 
     bool remove_result = left_sibling.remove_at(left_last_idx);
     bool insert_result = current_leaf.insert_at(0, *borrowed_key, *borrowed_value);
-    std::optional<std::uint64_t> new_current_first_key = current_leaf.first_key();
+    std::optional<Key> new_current_first_key = current_leaf.first_key();
     bool set_sep_result = (new_current_first_key != std::nullopt) &&
         parent_page.set_separator_key_at(ctx.child_idx - 1, *new_current_first_key);
     if (!remove_result || !insert_result || !set_sep_result) {
@@ -1042,7 +1059,7 @@ BTreeStatus BTree::merge_with_right_leaf(BLeafPage &current_leaf, BInternalPage 
 
     BLeafPage right_sibling(get_right_result.data);
     while (right_sibling.get_key_count() > 0) {
-        std::optional<std::uint64_t> move_key = right_sibling.key_at(0);
+        std::optional<Key> move_key = right_sibling.key_at(0);
         std::optional<Value> move_value = right_sibling.get_at(0);
         if (move_key == std::nullopt || move_value == std::nullopt) {
             pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
@@ -1100,7 +1117,7 @@ BTreeStatus BTree::merge_with_left_leaf(BLeafPage &current_leaf, BInternalPage &
 
     BLeafPage left_sibling(get_left_result.data);
     while (current_leaf.get_key_count() > 0) {
-        std::optional<std::uint64_t> move_key = current_leaf.key_at(0);
+        std::optional<Key> move_key = current_leaf.key_at(0);
         std::optional<Value> move_value = current_leaf.get_at(0);
         if (move_key == std::nullopt || move_value == std::nullopt) {
             pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
@@ -1172,9 +1189,9 @@ BTreeStatus BTree::borrow_from_right_internal(BInternalPage &current_page, BInte
     // - parent separator moves down into the current page
     // - the right sibling's old leftmost child comes with it
     // - the right sibling's old first separator moves up to become the new parent separator
-    std::optional<std::uint64_t> parent_sep = parent_page.key_at(ctx.child_idx);
+    std::optional<Key> parent_sep = parent_page.key_at(ctx.child_idx);
     std::optional<std::uint32_t> right_old_leftmost_child = right_sibling.get_leftmost_child();
-    std::optional<std::uint64_t> new_parent_sep = right_sibling.key_at(0);
+    std::optional<Key> new_parent_sep = right_sibling.key_at(0);
     std::optional<std::uint32_t> right_new_leftmost_child = right_sibling.get_right_child(0);
     if (parent_sep == std::nullopt || right_old_leftmost_child == std::nullopt ||
         new_parent_sep == std::nullopt || right_new_leftmost_child == std::nullopt) {
@@ -1239,8 +1256,8 @@ BTreeStatus BTree::borrow_from_left_internal(BInternalPage &current_page, BInter
     // - the left sibling's old rightmost child becomes the new leftmost child of the current page
     // - the left sibling's old rightmost separator moves up to become the new parent separator
     std::size_t left_last_idx = left_sibling.get_key_count() - 1;
-    std::optional<std::uint64_t> parent_sep = parent_page.key_at(ctx.child_idx - 1);
-    std::optional<std::uint64_t> borrowed_sep = left_sibling.key_at(left_last_idx);
+    std::optional<Key> parent_sep = parent_page.key_at(ctx.child_idx - 1);
+    std::optional<Key> borrowed_sep = left_sibling.key_at(left_last_idx);
     std::optional<std::uint32_t> borrowed_child = left_sibling.get_right_child(left_last_idx);
     std::optional<std::uint32_t> old_current_leftmost = current_page.get_leftmost_child();
     if (parent_sep == std::nullopt || borrowed_sep == std::nullopt ||
@@ -1286,7 +1303,7 @@ BTreeStatus BTree::merge_with_right_internal(BInternalPage &current_page, BInter
     }
 
     BInternalPage right_sibling(get_right_result.data);
-    std::optional<std::uint64_t> parent_sep = parent_page.key_at(ctx.child_idx);
+    std::optional<Key> parent_sep = parent_page.key_at(ctx.child_idx);
     std::optional<std::uint32_t> right_leftmost_child = right_sibling.get_leftmost_child();
     if (parent_sep == std::nullopt || right_leftmost_child == std::nullopt) {
         pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
@@ -1309,7 +1326,7 @@ BTreeStatus BTree::merge_with_right_internal(BInternalPage &current_page, BInter
     }
 
     while (right_sibling.get_key_count() > 0) {
-        std::optional<std::uint64_t> move_key = right_sibling.key_at(0);
+        std::optional<Key> move_key = right_sibling.key_at(0);
         std::optional<std::uint32_t> move_right_child = right_sibling.get_right_child(0);
         if (move_key == std::nullopt || move_right_child == std::nullopt) {
             pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
@@ -1381,7 +1398,7 @@ BTreeStatus BTree::merge_with_left_internal(BInternalPage &current_page, BIntern
     }
 
     BInternalPage left_sibling(get_left_result.data);
-    std::optional<std::uint64_t> parent_sep = parent_page.key_at(ctx.child_idx - 1);
+    std::optional<Key> parent_sep = parent_page.key_at(ctx.child_idx - 1);
     std::optional<std::uint32_t> current_leftmost_child = current_page.get_leftmost_child();
     if (parent_sep == std::nullopt || current_leftmost_child == std::nullopt) {
         pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
@@ -1403,7 +1420,7 @@ BTreeStatus BTree::merge_with_left_internal(BInternalPage &current_page, BIntern
     }
 
     while (current_page.get_key_count() > 0) {
-        std::optional<std::uint64_t> move_key = current_page.key_at(0);
+        std::optional<Key> move_key = current_page.key_at(0);
         std::optional<std::uint32_t> move_right_child = current_page.get_right_child(0);
         if (move_key == std::nullopt || move_right_child == std::nullopt) {
             pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
