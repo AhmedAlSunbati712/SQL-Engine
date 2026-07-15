@@ -35,11 +35,11 @@ OBJ = \
 	build/encoding/ValueCodec.o \
 	build/DBHeaderCodec.o
 
-UNIT_TEST_SRC := $(filter-out tests/unit/BTree_test.cpp,$(wildcard tests/unit/*.cpp))
+UNIT_TEST_SRC := $(wildcard tests/unit/*.cpp)
 UNIT_TEST_OBJ := $(patsubst tests/unit/%.cpp,build/tests/unit/%.o,$(UNIT_TEST_SRC))
 UNIT_TEST_BIN := $(patsubst tests/unit/%.cpp,build/tests/unit/%,$(UNIT_TEST_SRC))
 
-INTEGRATION_TEST_SRC := $(filter-out tests/integration/BTree_test.cpp,$(wildcard tests/integration/*.cpp))
+INTEGRATION_TEST_SRC := $(wildcard tests/integration/*.cpp)
 INTEGRATION_TEST_OBJ := $(patsubst tests/integration/%.cpp,build/tests/integration/%.o,$(INTEGRATION_TEST_SRC))
 INTEGRATION_TEST_BIN := $(patsubst tests/integration/%.cpp,build/tests/integration/%,$(INTEGRATION_TEST_SRC))
 
