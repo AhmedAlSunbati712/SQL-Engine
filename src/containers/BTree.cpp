@@ -3,17 +3,6 @@
 #include <Pager.h>
 #include <cassert>
 
-namespace {
-
-Key make_tree_key(std::uint64_t key) {
-    // For now the public BTree interface still takes numeric keys.
-    // Convert them once at the edge, then keep the rest of the module
-    // working in terms of fully-typed keys.
-    return keycodec::make_uint64(key);
-}
-
-} // namespace
-
 BTree::~BTree() {
     close();
 }
@@ -85,7 +74,7 @@ BTreeRollbackStatus BTree::rollback() {
 }
 
 
-BTreeGetStatus BTree::get(std::uint64_t key) {
+BTreeGetStatus BTree::get(const Key &key) {
     /**
      * status <- BTreeGetStatus{}
      * status.status <- success
@@ -118,8 +107,6 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
     */
     BTreeGetStatus get_result{};
     get_result.status = BTreeStatus::Success;
-    Key target_key = make_tree_key(key);
-
     // Descend from the root tohe leaf. We pass false to the second arg
     // Since we are not interested in keeping the parent pointers
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, false);
@@ -139,16 +126,16 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
     // equal to key. If the key doesn't exist or all the values
     // are less than the target key, then return status
     // key not in tree
-    std::size_t idx = target_leaf.lower_bound_key(target_key);
+    std::size_t idx = target_leaf.lower_bound_key(key);
     std::optional<Key> key_at_idx = target_leaf.key_at(idx);
-    if (key_at_idx == std::nullopt || !keycodec::equal(*key_at_idx, target_key)) {
+    if (key_at_idx == std::nullopt || !keycodec::equal(*key_at_idx, key)) {
         pager->unref_page(descent_result.leaf_page_num);
         get_result.status = BTreeStatus::KeyNotInTree;
         return get_result;
     }
 
     // Otherwise, we know the key exists. Extract its value
-    std::optional<Value> value_opt = target_leaf.get(target_key);
+    std::optional<Value> value_opt = target_leaf.get(key);
     Value value = *value_opt;
     get_result.value = value;
 
@@ -157,7 +144,7 @@ BTreeGetStatus BTree::get(std::uint64_t key) {
     return get_result;
 }
 
-BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
+BTreeStatus BTree::insert(const Key &key, Value &value) {
     /**
      * descent <- descend_from_root_to_leaf(key)
      *
@@ -204,7 +191,6 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
     */
     // Descend from the root to the target leaf.
     // We need the path this time in case the insert changes separators or causes a split.
-    Key target_key = make_tree_key(key);
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         PagerAllocateResult allocation_result = pager->allocate_page();
@@ -214,7 +200,7 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
         BLeafPage::fill_initial_layout(allocation_result.data);
         BLeafPage root_leaf(allocation_result.data);
 
-        bool insert_result = root_leaf.insert_at(0, target_key, value);
+        bool insert_result = root_leaf.insert_at(0, key, value);
         if (!insert_result) {
             pager->unref_page(root_page_num);
             return BTreeStatus::FailedToInsert;
@@ -237,12 +223,12 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
 
     // Build the in-memory object for the leaf page.
     BLeafPage target_leaf(descent_result.leaf_page);
-    std::size_t idx = target_leaf.lower_bound_key(target_key);
+    std::size_t idx = target_leaf.lower_bound_key(key);
     std::optional<Key> key_at_idx = target_leaf.key_at(idx);
 
     // If the key already exists, this insert is really just an overwrite of the stored value.
-    if (key_at_idx != std::nullopt && keycodec::equal(*key_at_idx, target_key)) {
-        bool set_result = target_leaf.set(target_key, value);
+    if (key_at_idx != std::nullopt && keycodec::equal(*key_at_idx, key)) {
+        bool set_result = target_leaf.set(key, value);
         if (!set_result) {
             pager->unref_page(descent_result.leaf_page_num);
             return BTreeStatus::FailedToInsert;
@@ -253,7 +239,7 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
         return BTreeStatus::Success;
     }
 
-    bool insert_result = target_leaf.insert_at(idx, target_key, value);
+    bool insert_result = target_leaf.insert_at(idx, key, value);
     if (!insert_result) {
         pager->unref_page(descent_result.leaf_page_num);
         return BTreeStatus::FailedToInsert;
@@ -278,7 +264,7 @@ BTreeStatus BTree::insert(std::uint64_t key, Value &value) {
     return BTreeStatus::Success;
 }
 
-BTreeRemoveStatus BTree::remove(std::uint64_t key) {
+BTreeRemoveStatus BTree::remove(const Key &key) {
     /**
      * descent <- descend_from_root_to_leaf(key)
      * if descent failed, return failure
@@ -316,7 +302,6 @@ BTreeRemoveStatus BTree::remove(std::uint64_t key) {
      * return success
      */
     BTreeRemoveStatus remove_result{};
-    Key target_key = make_tree_key(key);
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         remove_result.status = BTreeStatus::KeyNotInTree;
@@ -331,8 +316,8 @@ BTreeRemoveStatus BTree::remove(std::uint64_t key) {
     // Parse the leaf page and find the key
     BLeafPage target_leaf_page(descent_result.leaf_page);
     std::uint32_t leaf_page_num = descent_result.leaf_page_num;
-    std::size_t key_idx = target_leaf_page.lower_bound_key(target_key);
-    if (key_idx == target_leaf_page.get_key_count() || !keycodec::equal(*target_leaf_page.key_at(key_idx), target_key)) {
+    std::size_t key_idx = target_leaf_page.lower_bound_key(key);
+    if (key_idx == target_leaf_page.get_key_count() || !keycodec::equal(*target_leaf_page.key_at(key_idx), key)) {
         remove_result.status = BTreeStatus::KeyNotInTree;
         pager->unref_page(leaf_page_num);
         return remove_result;
@@ -389,9 +374,8 @@ BTreeRemoveStatus BTree::remove(std::uint64_t key) {
 
 
 
-LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool include_path) {
+LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_path) {
     LeafDescentResult descent_result{};
-    Key target_key = make_tree_key(key);
     PagerGetRootResult root_get_result = pager->get_btree_root();
 
     if (root_get_result.status == PagerResult::EmptyBTree) {
@@ -417,7 +401,7 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
     while (true) {
         // Decode the current node raw bytes into an in-memory internal page object
         BInternalPage curr(curr_data);
-        std::size_t idx = curr.lower_bound_key(target_key); // The idx of the first key greater or equal to the key
+        std::size_t idx = curr.lower_bound_key(key); // The idx of the first key greater or equal to the key
 
         std::optional<std::uint32_t> target_child_page_num;
         ChildDirection child_dir;
@@ -425,7 +409,7 @@ LeafDescentResult BTree::descend_from_root_to_leaf(std::uint64_t key, bool inclu
             // The target key is greater than all keys in the current node
             target_child_page_num = curr.get_right_child(idx - 1);
             child_dir = ChildDirection::Right;
-        } else if (keycodec::equal(*curr.key_at(idx), target_key)) { 
+        } else if (keycodec::equal(*curr.key_at(idx), key)) { 
             // The key at the idx is equal to the target
             target_child_page_num = curr.get_right_child(idx);
             child_dir = ChildDirection::Right;

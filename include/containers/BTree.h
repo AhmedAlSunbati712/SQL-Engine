@@ -69,11 +69,11 @@ class BTree {
         BTreeStatus close();
         BTreeCommitStatus commit();
         BTreeRollbackStatus rollback();
-        BTreeGetStatus get(std::uint64_t key);
-        BTreeStatus insert(std::uint64_t key, Value &value);
-        BTreeRemoveStatus remove(std::uint64_t key);
+        BTreeGetStatus get(const Key &key);
+        BTreeStatus insert(const Key &key, Value &value);
+        BTreeRemoveStatus remove(const Key &key);
     private:
-        LeafDescentResult descend_from_root_to_leaf(std::uint64_t key, bool include_path);
+        LeafDescentResult descend_from_root_to_leaf(const Key &key, bool include_path);
         struct MergeParentContext {
             std::uint32_t parent_page_num;
             std::size_t child_idx;
