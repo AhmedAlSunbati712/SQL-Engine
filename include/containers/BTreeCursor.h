@@ -60,7 +60,10 @@ class BTreeCursor {
             std::vector<TraversalPathEntry> new_path
         );
         BTreeCursorStatus move_to_next_leaf();
-        BTreeCursorStatus descend_to_leftmost_leaf(std::uint32_t subtree_page_num);
+        BTreeCursorStatus descend_to_leftmost_leaf(
+            std::uint32_t subtree_page_num,
+            std::vector<TraversalPathEntry> &new_path
+        );
 
         // The BTree must outlive its cursors. The cursor keeps only its current leaf
         // pinned; internal pages are loaded and released while crossing leaf boundaries.
