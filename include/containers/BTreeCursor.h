@@ -73,5 +73,6 @@ class BTreeCursor {
         std::size_t current_key_idx = 0;
         std::vector<TraversalPathEntry> path;
         bool positioned = false;
+        bool exhausted = false;
         bool closed = false;
 };

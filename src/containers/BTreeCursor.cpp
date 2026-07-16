@@ -1,6 +1,7 @@
 #include <BTreeCursor.h>
 
 #include <cassert>
+#include <cstdlib>
 #include <utility>
 
 BTreeCursor::BTreeCursor(BTree *tree) : tree(tree) {
@@ -11,6 +12,232 @@ BTreeCursor::BTreeCursor(BTree *tree) : tree(tree) {
     // Register immediately even though the cursor starts unpositioned. This prevents
     // a write from starting between cursor construction and the first seek.
     tree->register_cursor();
+}
+
+BTreeCursor::~BTreeCursor() {
+    if (closed) return;
+
+    // A destructor cannot report that it failed to release ownership. If that ever
+    // happens, the pager reference count can no longer be trusted.
+    if (close() != BTreeCursorStatus::Success) std::abort();
+}
+
+BTreeCursor::BTreeCursor(BTreeCursor &&other) noexcept
+    : tree(other.tree),
+      current_leaf_data(other.current_leaf_data),
+      current_leaf_page_num(other.current_leaf_page_num),
+      current_key_idx(other.current_key_idx),
+      path(std::move(other.path)),
+      positioned(other.positioned),
+      exhausted(other.exhausted),
+      closed(other.closed) {
+    // The registration belongs to this object now. Make the moved-from cursor
+    // closed so its destructor does not release the page or unregister again.
+    other.tree = nullptr;
+    other.current_leaf_data = nullptr;
+    other.current_leaf_page_num = 0;
+    other.current_key_idx = 0;
+    other.path.clear();
+    other.positioned = false;
+    other.exhausted = false;
+    other.closed = true;
+}
+
+BTreeCursor &BTreeCursor::operator=(BTreeCursor &&other) noexcept {
+    if (this == &other) return *this;
+
+    // Drop this cursor's existing registration before taking ownership of the other
+    // one. Cleanup failure is fatal because move assignment cannot return a status.
+    if (!closed && close() != BTreeCursorStatus::Success) std::abort();
+
+    tree = other.tree;
+    current_leaf_data = other.current_leaf_data;
+    current_leaf_page_num = other.current_leaf_page_num;
+    current_key_idx = other.current_key_idx;
+    path = std::move(other.path);
+    positioned = other.positioned;
+    exhausted = other.exhausted;
+    closed = other.closed;
+
+    other.tree = nullptr;
+    other.current_leaf_data = nullptr;
+    other.current_leaf_page_num = 0;
+    other.current_key_idx = 0;
+    other.path.clear();
+    other.positioned = false;
+    other.exhausted = false;
+    other.closed = true;
+    return *this;
+}
+
+BTreeCursorStatus BTreeCursor::seek_first() {
+    if (closed) return BTreeCursorStatus::Closed;
+
+    BTreeCursorStatus release_result = release_current_leaf();
+    if (release_result != BTreeCursorStatus::Success) return release_result;
+    exhausted = false;
+
+    PagerGetRootResult root_result = tree->pager->get_btree_root();
+    if (root_result.status == PagerResult::EmptyBTree) {
+        exhausted = true;
+        return BTreeCursorStatus::EndOfTree;
+    }
+    if (root_result.status != PagerResult::Success) {
+        return BTreeCursorStatus::FailedToRead;
+    }
+
+    std::vector<TraversalPathEntry> new_path;
+    if (BTreePage::peek_page_type(root_result.data) == PageType::Leaf) {
+        BTreeCursorStatus position_result = position_on_leaf(
+            root_result.data,
+            root_result.root_page_num,
+            0,
+            std::move(new_path)
+        );
+        if (position_result == BTreeCursorStatus::EndOfTree) exhausted = true;
+        return position_result;
+    }
+
+    // Keep the first root reference pinned while the helper acquires its own traversal
+    // reference. This prevents another process from changing the tree between the two.
+    BTreeCursorStatus descent_result = descend_to_leftmost_leaf(
+        root_result.root_page_num,
+        new_path
+    );
+
+    PagerResult root_release_result = tree->pager->unref_page(root_result.root_page_num);
+    if (root_release_result != PagerResult::Success) {
+        if (release_current_leaf() != BTreeCursorStatus::Success) std::abort();
+        exhausted = false;
+        return BTreeCursorStatus::FailedToReleasePage;
+    }
+
+    if (descent_result == BTreeCursorStatus::EndOfTree) exhausted = true;
+    return descent_result;
+}
+
+BTreeCursorStatus BTreeCursor::seek(const Key &target) {
+    if (closed) return BTreeCursorStatus::Closed;
+
+    // Seeking starts a new position. A failed seek intentionally leaves this cursor
+    // unpositioned instead of restoring its previous leaf and path.
+    BTreeCursorStatus release_result = release_current_leaf();
+    if (release_result != BTreeCursorStatus::Success) return release_result;
+    exhausted = false;
+
+    LeafDescentResult descent_result = tree->descend_from_root_to_leaf(target, true);
+    if (descent_result.status == BTreeStatus::EmptyTree) {
+        exhausted = true;
+        return BTreeCursorStatus::EndOfTree;
+    }
+    if (descent_result.status != BTreeStatus::Success) {
+        return BTreeCursorStatus::FailedToRead;
+    }
+
+    BLeafPage leaf(descent_result.leaf_page);
+    std::size_t key_idx = leaf.lower_bound_key(target);
+    if (key_idx < leaf.get_key_count()) {
+        return position_on_leaf(
+            descent_result.leaf_page,
+            descent_result.leaf_page_num,
+            key_idx,
+            std::move(descent_result.path)
+        );
+    }
+
+    if (leaf.get_key_count() == 0) {
+        PagerResult leaf_release_result = tree->pager->unref_page(descent_result.leaf_page_num);
+        if (leaf_release_result != PagerResult::Success) {
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+        exhausted = true;
+        return BTreeCursorStatus::EndOfTree;
+    }
+
+    // The target belongs after every key in this leaf. Install its final key only as
+    // a traversal anchor, then cross the boundary to the next leaf if one exists.
+    BTreeCursorStatus anchor_result = position_on_leaf(
+        descent_result.leaf_page,
+        descent_result.leaf_page_num,
+        leaf.get_key_count() - 1,
+        std::move(descent_result.path)
+    );
+    if (anchor_result != BTreeCursorStatus::Success) return anchor_result;
+
+    BTreeCursorStatus move_result = move_to_next_leaf();
+    if (move_result == BTreeCursorStatus::EndOfTree) {
+        exhausted = true;
+        return move_result;
+    }
+    if (move_result != BTreeCursorStatus::Success) {
+        if (release_current_leaf() != BTreeCursorStatus::Success) {
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+    }
+    return move_result;
+}
+
+BTreeCursorStatus BTreeCursor::next() {
+    if (closed) return BTreeCursorStatus::Closed;
+    if (exhausted) return BTreeCursorStatus::EndOfTree;
+    if (!positioned) return BTreeCursorStatus::NotPositioned;
+
+    BLeafPage leaf(current_leaf_data);
+    if (current_key_idx + 1 < leaf.get_key_count()) {
+        current_key_idx++;
+        return BTreeCursorStatus::Success;
+    }
+
+    BTreeCursorStatus move_result = move_to_next_leaf();
+    if (move_result == BTreeCursorStatus::EndOfTree) exhausted = true;
+    return move_result;
+}
+
+BTreeCursorResult BTreeCursor::current() const {
+    BTreeCursorResult result{};
+    if (closed) {
+        result.status = BTreeCursorStatus::Closed;
+        return result;
+    }
+    if (exhausted) {
+        result.status = BTreeCursorStatus::EndOfTree;
+        return result;
+    }
+    if (!positioned || current_leaf_data == nullptr) {
+        result.status = BTreeCursorStatus::NotPositioned;
+        return result;
+    }
+
+    BLeafPage leaf(current_leaf_data);
+    std::optional<Key> key = leaf.key_at(current_key_idx);
+    std::optional<Value> value = leaf.get_at(current_key_idx);
+    if (key == std::nullopt || value == std::nullopt) {
+        result.status = BTreeCursorStatus::FailedToRead;
+        return result;
+    }
+
+    result.status = BTreeCursorStatus::Success;
+    result.key = std::move(*key);
+    result.value = std::move(*value);
+    return result;
+}
+
+bool BTreeCursor::valid() const {
+    return !closed && !exhausted && positioned && current_leaf_data != nullptr;
+}
+
+BTreeCursorStatus BTreeCursor::close() {
+    if (closed) return BTreeCursorStatus::Success;
+
+    BTreeCursorStatus release_result = release_current_leaf();
+    if (release_result != BTreeCursorStatus::Success) return release_result;
+
+    assert(tree != nullptr);
+    tree->unregister_cursor();
+    tree = nullptr;
+    exhausted = false;
+    closed = true;
+    return BTreeCursorStatus::Success;
 }
 
 BTreeCursorStatus BTreeCursor::release_current_leaf() {

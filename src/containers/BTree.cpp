@@ -1,4 +1,5 @@
 #include <BTree.h>
+#include <BTreeCursor.h>
 #include <KeyCodec.h>
 #include <Pager.h>
 #include <cassert>
@@ -19,6 +20,12 @@ void BTree::unregister_cursor() {
     // Every cursor registration must be released exactly once.
     assert(active_cursor_count > 0);
     active_cursor_count--;
+}
+
+BTreeCursor BTree::open_cursor() {
+    // Like the rest of the BTree data API, cursor creation requires an open database.
+    assert(pager_open && pager != nullptr);
+    return BTreeCursor(this);
 }
 
 BTreeStatus BTree::open(std::string db_file) {

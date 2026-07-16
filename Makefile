@@ -9,6 +9,7 @@ LIB = build/libsqlengine.a
 
 SRC = \
 	src/containers/BTree.cpp \
+	src/containers/BTreeCursor.cpp \
 	src/containers/BTreePage.cpp \
 	src/containers/DLList.cpp \
 	src/JournalCodec.cpp \
@@ -23,6 +24,7 @@ SRC = \
 
 OBJ = \
 	build/containers/BTree.o \
+	build/containers/BTreeCursor.o \
 	build/containers/BTreePage.o \
 	build/containers/DLList.o \
 	build/JournalCodec.o \
