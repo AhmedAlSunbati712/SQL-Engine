@@ -4,7 +4,21 @@
 #include <cassert>
 
 BTree::~BTree() {
+    // A cursor holds a pointer back to this BTree, so the BTree must always outlive it.
+    assert(active_cursor_count == 0);
     close();
+}
+
+void BTree::register_cursor() {
+    // A cursor can only exist while this BTree has a live pager behind it.
+    assert(pager_open && pager != nullptr);
+    active_cursor_count++;
+}
+
+void BTree::unregister_cursor() {
+    // Every cursor registration must be released exactly once.
+    assert(active_cursor_count > 0);
+    active_cursor_count--;
 }
 
 BTreeStatus BTree::open(std::string db_file) {
@@ -26,6 +40,9 @@ BTreeStatus BTree::open(std::string db_file) {
 BTreeStatus BTree::close() {
     // If we are already closed, there is nothing to do.
     if (!pager_open && pager == nullptr) return BTreeStatus::Success;
+
+    // Closing the pager would invalidate every page and path owned by a cursor.
+    if (active_cursor_count > 0) return BTreeStatus::CursorActive;
 
     // If the client closes while a write txn is still alive, try to roll it back first.
     // Even if rollback fails, we still tear down the pager and report the failure.
@@ -52,6 +69,9 @@ BTreeStatus BTree::close() {
 BTreeCommitStatus BTree::commit() {
     if (!pager_open || !pager) return BTreeCommitStatus::Failed;
 
+    // A commit can release locks and refresh pager state, which would invalidate a cursor.
+    if (active_cursor_count > 0) return BTreeCommitStatus::CursorActive;
+
     // Phase one makes the journal durable and pushes dirty pages to the db file.
     PagerResult phase_one_result = pager->commit_phase_one();
     if (phase_one_result != PagerResult::Success) return BTreeCommitStatus::Failed;
@@ -65,6 +85,9 @@ BTreeCommitStatus BTree::commit() {
 
 BTreeRollbackStatus BTree::rollback() {
     if (!pager_open || !pager) return BTreeRollbackStatus::Failed;
+
+    // Rollback can remove cached pages that an active cursor still references.
+    if (active_cursor_count > 0) return BTreeRollbackStatus::CursorActive;
 
     // Let the pager unwind either the in-memory write set or the durable journal.
     PagerResult rollback_result = pager->rollback_transaction();
@@ -189,6 +212,9 @@ BTreeStatus BTree::insert(const Key &key, Value &value) {
      * pager->unref(descent.leaf_page_num)
      * return success
     */
+    // A split or even an in-place insert can invalidate an active cursor's position.
+    if (active_cursor_count > 0) return BTreeStatus::CursorActive;
+
     // Descend from the root to the target leaf.
     // We need the path this time in case the insert changes separators or causes a split.
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
@@ -302,6 +328,13 @@ BTreeRemoveStatus BTree::remove(const Key &key) {
      * return success
      */
     BTreeRemoveStatus remove_result{};
+
+    // Deletes can change separator keys, merge pages, or free the cursor's current page.
+    if (active_cursor_count > 0) {
+        remove_result.status = BTreeStatus::CursorActive;
+        return remove_result;
+    }
+
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         remove_result.status = BTreeStatus::KeyNotInTree;

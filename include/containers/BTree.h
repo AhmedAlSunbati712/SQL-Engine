@@ -20,16 +20,19 @@ enum class BTreeStatus : std::uint8_t {
     FailedToInsert,
     FailedToRemove,
     FailedToAllocateNewPage,
+    CursorActive,
 };
 
 enum class BTreeCommitStatus : std::uint8_t {
     Success = 0,
-    Failed
+    Failed,
+    CursorActive
 };
 
 enum class BTreeRollbackStatus : std::uint8_t {
     Success = 0,
-    Failed
+    Failed,
+    CursorActive
 };
 
 enum class ChildDirection : std::uint8_t {
@@ -60,6 +63,7 @@ struct LeafDescentResult {
     std::vector<TraversalPathEntry> path;
 };
 
+class BTreeCursor;
 
 class BTree {
     public:
@@ -72,7 +76,13 @@ class BTree {
         BTreeGetStatus get(const Key &key);
         BTreeStatus insert(const Key &key, Value &value);
         BTreeRemoveStatus remove(const Key &key);
+        // The database must already be open. The returned cursor starts unpositioned.
+        BTreeCursor open_cursor();
     private:
+        friend class BTreeCursor;
+
+        void register_cursor();
+        void unregister_cursor();
         LeafDescentResult descend_from_root_to_leaf(const Key &key, bool include_path);
         struct MergeParentContext {
             std::uint32_t parent_page_num;
@@ -103,5 +113,7 @@ class BTree {
         static void migrate_internal(BInternalPage &src, BInternalPage &dst, std::size_t median_separator_idx);
         Pager *pager = nullptr;
         std::string currently_open_db_file;
+        // Writes, transaction boundaries, and close are rejected while this is nonzero.
+        std::size_t active_cursor_count = 0;
         bool pager_open = false;
 };
