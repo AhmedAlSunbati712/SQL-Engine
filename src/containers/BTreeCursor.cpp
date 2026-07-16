@@ -1,42 +1,40 @@
 #include <BTreeCursor.h>
 
-BTreeCursor::BTreeCursor(BTree *tree) {
-    /**
-     * assert tree is not null
-     * assert tree has an open pager
-     *
-     * this->tree <- tree
-     * positioned <- false
-     * closed <- false
-     *
-     * Tell the BTree that it now has one active read cursor. While this count is
-     * greater than zero, the same BTree object must reject insert, remove, commit,
-     * rollback, and close because any of them could invalidate this cursor's path.
-     *
-     * The constructor does not seek anywhere. The client still has to call
-     * seek_first() or seek(key) before current() and next() can be used.
-     */
+#include <cassert>
+#include <utility>
+
+BTreeCursor::BTreeCursor(BTree *tree) : tree(tree) {
+    // A cursor can only be created by a BTree that already has an open pager.
+    assert(tree != nullptr);
+    assert(tree->pager_open && tree->pager != nullptr);
+
+    // Register immediately even though the cursor starts unpositioned. This prevents
+    // a write from starting between cursor construction and the first seek.
+    tree->register_cursor();
 }
 
 BTreeCursorStatus BTreeCursor::release_current_leaf() {
-    /**
-     * If current_leaf_data is null:
-     *      clear the current position and path
-     *      return Success
-     *
-     * release_result <- tree->pager->unref_page(current_leaf_page_num)
-     * if release_result failed:
-     *      Keep all cursor fields unchanged because we still have to assume that
-     *      the cursor owns the page reference.
-     *      return FailedToReleasePage
-     *
-     * current_leaf_data <- null
-     * current_leaf_page_num <- 0
-     * current_key_idx <- 0
-     * path.clear()
-     * positioned <- false
-     * return Success
-     */
+    if (current_leaf_data == nullptr) {
+        current_leaf_page_num = 0;
+        current_key_idx = 0;
+        path.clear();
+        positioned = false;
+        return BTreeCursorStatus::Success;
+    }
+
+    // Keep the cursor state unchanged when unref fails. We still have to assume
+    // that this cursor owns the page reference in that case.
+    PagerResult release_result = tree->pager->unref_page(current_leaf_page_num);
+    if (release_result != PagerResult::Success) {
+        return BTreeCursorStatus::FailedToReleasePage;
+    }
+
+    current_leaf_data = nullptr;
+    current_leaf_page_num = 0;
+    current_key_idx = 0;
+    path.clear();
+    positioned = false;
+    return BTreeCursorStatus::Success;
 }
 
 BTreeCursorStatus BTreeCursor::position_on_leaf(
@@ -45,158 +43,209 @@ BTreeCursorStatus BTreeCursor::position_on_leaf(
     std::size_t key_idx,
     std::vector<TraversalPathEntry> new_path
 ) {
-    /**
-     * This helper consumes the pager reference represented by leaf_data. If it
-     * succeeds, the cursor owns that reference. If it fails, it must release it.
-     *
-     * if leaf_data is null or it does not describe a leaf page:
-     *      unref leaf_page_num if needed
-     *      return FailedToRead
-     *
-     * leaf <- decode leaf_data
-     * if key_idx is outside the leaf:
-     *      unref leaf_page_num
-     *      return EndOfTree
-     *
-     * release_result <- release_current_leaf()
-     * if release_result failed:
-     *      unref leaf_page_num because the cursor cannot take ownership of it
-     *      return release_result
-     *
-     * current_leaf_data <- leaf_data
-     * current_leaf_page_num <- leaf_page_num
-     * current_key_idx <- key_idx
-     * path <- move(new_path)
-     * positioned <- true
-     * return Success
-     */
+    assert(tree != nullptr && tree->pager != nullptr);
+
+    // This helper consumes a valid incoming pager reference. A null pointer means
+    // that the caller never obtained such a reference, so there is nothing to release.
+    if (leaf_data == nullptr) return BTreeCursorStatus::FailedToRead;
+
+    if (closed) {
+        PagerResult release_result = tree->pager->unref_page(leaf_page_num);
+        if (release_result != PagerResult::Success) {
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+        return BTreeCursorStatus::Closed;
+    }
+
+    // If the fetched page is not a leaf, release the incoming reference before
+    // reporting the malformed traversal result.
+    if (BTreePage::peek_page_type(leaf_data) != PageType::Leaf) {
+        PagerResult release_result = tree->pager->unref_page(leaf_page_num);
+        if (release_result != PagerResult::Success) {
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+        return BTreeCursorStatus::FailedToRead;
+    }
+
+    BLeafPage leaf(leaf_data);
+    if (key_idx >= leaf.get_key_count()) {
+        PagerResult release_result = tree->pager->unref_page(leaf_page_num);
+        if (release_result != PagerResult::Success) {
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+        return BTreeCursorStatus::EndOfTree;
+    }
+
+    // Do not abandon the old leaf until the incoming leaf has been validated.
+    BTreeCursorStatus release_result = release_current_leaf();
+    if (release_result != BTreeCursorStatus::Success) {
+        PagerResult incoming_release_result = tree->pager->unref_page(leaf_page_num);
+        if (incoming_release_result != PagerResult::Success) {
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+        return release_result;
+    }
+
+    current_leaf_data = leaf_data;
+    current_leaf_page_num = leaf_page_num;
+    current_key_idx = key_idx;
+    path = std::move(new_path);
+    positioned = true;
+    return BTreeCursorStatus::Success;
 }
 
 BTreeCursorStatus BTreeCursor::move_to_next_leaf() {
-    /**
-     * We only call this after current_key_idx reaches the end of the current leaf.
-     * Keep the current leaf pinned until the next leaf has been found successfully.
-     *
-     * if the cursor is closed:
-     *      return Closed
-     * if the cursor is not positioned:
-     *      return NotPositioned
-     *
-     * candidate_path <- path
-     *
-     * while candidate_path is not empty:
-     *      entry <- candidate_path.back()
-     *      candidate_path.pop_back()
-     *
-     *      parent_result <- tree->pager->get(entry.parent_page_num)
-     *      if parent_result failed:
-     *          return FailedToRead
-     *
-     *      parent <- decode parent_result.data as an internal page
-     *
-     *      Convert the separator information back into the child index that was
-     *      taken during descent:
-     *          if entry.child_dir is Left:
-     *              child_idx <- entry.separator_index_used
-     *          otherwise:
-     *              child_idx <- entry.separator_index_used + 1
-     *
-     *      if child_idx is less than parent.key_count:
-     *          There is another child immediately to the right of the old path.
-     *          next_subtree_page_num <- parent.get_right_child(child_idx)
-     *
-     *          Add the step from this parent into that right child:
-     *              candidate_path.push_back({
-     *                  entry.parent_page_num,
-     *                  child_idx,
-     *                  ChildDirection::Right
-     *              })
-     *
-     *          unref the parent page
-     *          if unref failed:
-     *              return FailedToReleasePage
-     *
-     *          descend_to_leftmost_leaf() appends the rest of the path directly to
-     *          candidate_path. The cursor's installed path is not touched until the
-     *          new leaf has been reached successfully.
-     *          return descend_to_leftmost_leaf(
-     *              next_subtree_page_num,
-     *              candidate_path
-     *          )
-     *
-     *      unref the parent page
-     *      if unref failed:
-     *          return FailedToReleasePage
-     *
-     *      This parent had no unvisited child to the right, so continue upward.
-     *
-     * No ancestor had another child to the right. The current key was the final
-     * key in the tree.
-     * release_result <- release_current_leaf()
-     * if release_result failed:
-     *      return release_result
-     * return EndOfTree
-     */
+    if (closed) return BTreeCursorStatus::Closed;
+    if (!positioned) return BTreeCursorStatus::NotPositioned;
+
+    // Work on a copy. The cursor keeps its current path and pinned leaf until a
+    // complete path to the next leaf has been found.
+    std::vector<TraversalPathEntry> candidate_path = path;
+
+    while (!candidate_path.empty()) {
+        TraversalPathEntry entry = candidate_path.back();
+        candidate_path.pop_back();
+
+        PagerGetResult parent_result = tree->pager->get(entry.parent_page_num);
+        if (parent_result.status != PagerResult::Success) {
+            return BTreeCursorStatus::FailedToRead;
+        }
+
+        // Every page recorded in a traversal path must be an internal page.
+        if (BTreePage::peek_page_type(parent_result.data) != PageType::Internal) {
+            PagerResult release_result = tree->pager->unref_page(entry.parent_page_num);
+            if (release_result != PagerResult::Success) {
+                return BTreeCursorStatus::FailedToReleasePage;
+            }
+            return BTreeCursorStatus::FailedToRead;
+        }
+
+        BInternalPage parent(parent_result.data);
+        std::size_t child_idx = entry.separator_index_used;
+        if (entry.child_dir == ChildDirection::Right) child_idx++;
+
+        // A child index greater than key_count cannot describe a valid path through
+        // an internal page with key_count + 1 children.
+        if (child_idx > parent.get_key_count()) {
+            PagerResult release_result = tree->pager->unref_page(entry.parent_page_num);
+            if (release_result != PagerResult::Success) {
+                return BTreeCursorStatus::FailedToReleasePage;
+            }
+            return BTreeCursorStatus::FailedToRead;
+        }
+
+        if (child_idx < parent.get_key_count()) {
+            // The next subtree is the child immediately to the right of the child
+            // used by the old path.
+            std::optional<std::uint32_t> next_subtree_page_num = parent.get_right_child(child_idx);
+            if (next_subtree_page_num == std::nullopt) {
+                PagerResult release_result = tree->pager->unref_page(entry.parent_page_num);
+                if (release_result != PagerResult::Success) {
+                    return BTreeCursorStatus::FailedToReleasePage;
+                }
+                return BTreeCursorStatus::FailedToRead;
+            }
+
+            candidate_path.push_back({
+                entry.parent_page_num,
+                child_idx,
+                ChildDirection::Right
+            });
+
+            PagerResult release_result = tree->pager->unref_page(entry.parent_page_num);
+            if (release_result != PagerResult::Success) {
+                return BTreeCursorStatus::FailedToReleasePage;
+            }
+
+            return descend_to_leftmost_leaf(*next_subtree_page_num, candidate_path);
+        }
+
+        // This parent has no unvisited child to the right. Release it and continue
+        // upward until we find an ancestor that does.
+        PagerResult release_result = tree->pager->unref_page(entry.parent_page_num);
+        if (release_result != PagerResult::Success) {
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+    }
+
+    // No ancestor had another child to the right, so the old leaf contained the
+    // final key in the tree.
+    BTreeCursorStatus release_result = release_current_leaf();
+    if (release_result != BTreeCursorStatus::Success) return release_result;
+    return BTreeCursorStatus::EndOfTree;
 }
 
 BTreeCursorStatus BTreeCursor::descend_to_leftmost_leaf(
     std::uint32_t subtree_page_num,
     std::vector<TraversalPathEntry> &new_path
 ) {
-    /**
-     * new_path already contains the path prefix leading to subtree_page_num. Append
-     * the rest of the leftmost descent to it. Do not replace the cursor position
-     * until the complete descent succeeds.
-     *
-     * initial_path_size <- new_path.size()
-     * current_page_num <- subtree_page_num
-     * current_result <- tree->pager->get(current_page_num)
-     * if current_result failed:
-     *      new_path.resize(initial_path_size)
-     *      return FailedToRead
-     *
-     * while current_result.data describes an internal page:
-     *      current_page <- decode current_result.data as an internal page
-     *      leftmost_child <- current_page.get_leftmost_child()
-     *      if leftmost_child does not exist:
-     *          unref current_page_num
-     *          new_path.resize(initial_path_size)
-     *          return FailedToRead
-     *
-     *      child_result <- tree->pager->get(leftmost_child)
-     *      if child_result failed:
-     *          unref current_page_num
-     *          new_path.resize(initial_path_size)
-     *          return FailedToRead
-     *
-     *      Since we always take the leftmost child, record the traversal relative
-     *      to separator zero.
-     *      new_path.push_back({
-     *          current_page_num,
-     *          0,
-     *          ChildDirection::Left
-     *      })
-     *
-     *      unref current_page_num
-     *      if unref failed:
-     *          unref leftmost_child so its new reference is not leaked
-     *          new_path.resize(initial_path_size)
-     *          return FailedToReleasePage
-     *
-     *      current_page_num <- leftmost_child
-     *      current_result <- child_result
-     *
-     * leaf <- decode current_result.data as a leaf page
-     * if leaf is empty:
-     *      unref current_page_num
-     *      new_path.resize(initial_path_size)
-     *      return EndOfTree
-     *
-     * return position_on_leaf(
-     *      current_result.data,
-     *      current_page_num,
-     *      0,
-     *      move(new_path)
-     * )
-     */
+    if (closed) return BTreeCursorStatus::Closed;
+
+    // Roll the caller's path back to this point if any part of the descent fails.
+    std::size_t initial_path_size = new_path.size();
+    std::uint32_t current_page_num = subtree_page_num;
+    PagerGetResult current_result = tree->pager->get(current_page_num);
+    if (current_result.status != PagerResult::Success) {
+        return BTreeCursorStatus::FailedToRead;
+    }
+
+    while (BTreePage::peek_page_type(current_result.data) == PageType::Internal) {
+        BInternalPage current_page(current_result.data);
+        std::optional<std::uint32_t> leftmost_child = current_page.get_leftmost_child();
+
+        if (leftmost_child == std::nullopt) {
+            PagerResult release_result = tree->pager->unref_page(current_page_num);
+            new_path.resize(initial_path_size);
+            if (release_result != PagerResult::Success) {
+                return BTreeCursorStatus::FailedToReleasePage;
+            }
+            return BTreeCursorStatus::FailedToRead;
+        }
+
+        PagerGetResult child_result = tree->pager->get(*leftmost_child);
+        if (child_result.status != PagerResult::Success) {
+            PagerResult release_result = tree->pager->unref_page(current_page_num);
+            new_path.resize(initial_path_size);
+            if (release_result != PagerResult::Success) {
+                return BTreeCursorStatus::FailedToReleasePage;
+            }
+            return BTreeCursorStatus::FailedToRead;
+        }
+
+        // Release the parent before continuing. If that fails, also release the
+        // child reference we just acquired so this traversal does not leak it.
+        PagerResult parent_release_result = tree->pager->unref_page(current_page_num);
+        if (parent_release_result != PagerResult::Success) {
+            tree->pager->unref_page(*leftmost_child);
+            new_path.resize(initial_path_size);
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+
+        // Taking the leftmost child is represented relative to separator zero.
+        new_path.push_back({
+            current_page_num,
+            0,
+            ChildDirection::Left
+        });
+
+        current_page_num = *leftmost_child;
+        current_result = child_result;
+    }
+
+    BLeafPage leaf(current_result.data);
+    if (leaf.get_key_count() == 0) {
+        PagerResult release_result = tree->pager->unref_page(current_page_num);
+        new_path.resize(initial_path_size);
+        if (release_result != PagerResult::Success) {
+            return BTreeCursorStatus::FailedToReleasePage;
+        }
+        return BTreeCursorStatus::EndOfTree;
+    }
+
+    return position_on_leaf(
+        current_result.data,
+        current_page_num,
+        0,
+        std::move(new_path)
+    );
 }
