@@ -5,7 +5,7 @@ LDLIBS = -lgtest -lgtest_main
 AR = ar
 ARFLAGS = rcs
 
-LIB = build/libsqlengine.a
+LIB = build/libstoneleafdb.a
 
 SRC = \
 	src/containers/BTree.cpp \

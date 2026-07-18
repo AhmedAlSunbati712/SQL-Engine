@@ -21,7 +21,7 @@ class BTreeCursorIntegrationTest : public ::testing::Test {
             auto unique_suffix = std::to_string(
                 std::chrono::steady_clock::now().time_since_epoch().count()
             );
-            temp_dir = std::filesystem::temp_directory_path() / ("sqlengine_cursor_test_" + unique_suffix);
+            temp_dir = std::filesystem::temp_directory_path() / ("stoneleafdb_cursor_test_" + unique_suffix);
             db_path = temp_dir / "test.db";
             std::filesystem::create_directories(temp_dir);
         }

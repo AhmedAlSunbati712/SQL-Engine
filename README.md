@@ -1,6 +1,6 @@
-# Distributed Transactional Storage Engine
+# StoneleafDB
 
-This repository is a personal systems project centered on building a crash-safe distributed transactional storage engine in C++ from first principles.
+StoneleafDB is a personal systems project centered on building a crash-safe distributed transactional storage engine in C++ from first principles.
 
 The long-term goal is not just to build a local storage engine. The goal is to build the storage and commit path of a distributed database, starting from the lowest-level durability and recovery mechanisms and then layering replication and distributed coordination on top.
 
@@ -42,11 +42,11 @@ Sharding is a later step. It belongs after the replicated commit path is stable,
 
 ## What Is In The Repo
 
-- [Docs/System Constraints](/Volumes/youwhat/projects/SQL-Engine/Docs/System%20Constraints): high-level scope and constraints for each subsystem
-- [Docs/Technical Design Docs](/Volumes/youwhat/projects/SQL-Engine/Docs/Technical%20Design%20Docs): lower-level design notes, invariants, and control flow
-- [src](/Volumes/youwhat/projects/SQL-Engine/src): implementation
-- [include](/Volumes/youwhat/projects/SQL-Engine/include): public headers
-- [tests](/Volumes/youwhat/projects/SQL-Engine/tests): unit tests
+- [Docs/System Constraints](Docs/System%20Constraints): high-level scope and constraints for each subsystem
+- [Docs/Technical Design Docs](Docs/Technical%20Design%20Docs): lower-level design notes, invariants, and control flow
+- [src](src): implementation
+- [include](include): public headers
+- [tests](tests): unit tests
 
 ## Current Status
 

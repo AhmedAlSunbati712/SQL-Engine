@@ -14,7 +14,7 @@ class TempFile {
     public:
         TempFile() {
             auto unique_suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-            path = std::filesystem::temp_directory_path() / ("sqlengine_lockmgr_test_" + unique_suffix + ".db");
+            path = std::filesystem::temp_directory_path() / ("stoneleafdb_lockmgr_test_" + unique_suffix + ".db");
         }
 
         ~TempFile() {
