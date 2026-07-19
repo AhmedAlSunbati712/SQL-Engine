@@ -97,12 +97,60 @@ but it never directly applies a replicated write to the B+ tree. Writes are
 proposed to Raft and reach the storage engine through the ordered apply thread.
 This naturally preserves the first-version one-writer rule.
 
-The server takes an exclusive filesystem ownership lock when it opens the
-database and holds it for its lifetime. That lock prevents another server or an
-offline mutation tool from opening the same database. All transaction
-coordination inside the server uses mutexes, condition variables, and latches.
+The server takes an exclusive filesystem ownership lock on
+`<database>.lock` when it opens the database and holds it for its lifetime.
+That lock prevents another server or an offline mutation tool from opening the
+same database. It is not acquired, promoted, or released by individual
+transactions. All transaction coordination inside the server uses mutexes,
+condition variables, and latches.
 
 ## Thread-Safe Locking
+
+### File-Locking Boundary
+
+The existing POSIX byte-range lock manager is retired from the pager's normal
+read, write, commit, rollback, and recovery paths. Traditional `fcntl` record
+locks coordinate processes; threads within one process share process-level
+lock ownership and therefore cannot use those locks to represent independent
+transactions reliably.
+
+File locking remains only as a server-ownership boundary:
+
+```cpp
+class DatabaseOwnershipLock {
+  public:
+    OwnershipResult acquire(const std::string &database_path);
+    void release();
+
+  private:
+    int lock_file_fd = -1;
+};
+```
+
+The ownership lock follows this lifecycle:
+
+```text
+open <database>.lock
+    -> acquire one non-blocking exclusive OS lock
+    -> open database, control file, and WAL
+    -> complete recovery
+    -> start Raft and connection workers
+    -> serve until orderly shutdown
+    -> stop workers and close storage
+    -> release ownership lock
+```
+
+Failure to acquire the ownership lock fails server startup with
+`DatabaseAlreadyOpen`. An abnormal process exit releases the OS lock
+automatically; the next server still performs WAL recovery before serving.
+The lock file contains no authoritative recovery state and must never be used
+to decide whether recovery is necessary.
+
+Because one server owns one authoritative buffer pool, v2 also removes the
+cross-process cache-purge protocol. The current `file_change_counter` is not
+carried into the v2 database header. A commit epoch remains for observability
+and future snapshot semantics, but cache validity no longer depends on reading
+metadata back from the database file.
 
 ### Ownership
 
@@ -189,6 +237,10 @@ These concepts must remain separate:
 The required lock order is transaction lock, buffer-directory latch, then
 frame-content latch. No disk or WAL wait may occur while holding the
 buffer-directory latch.
+
+The in-memory manager is the sole authority for transaction lock state. The
+server must not combine its decisions with the old per-pager file-lock state;
+running both mechanisms would create two unsynchronized sources of truth.
 
 ## Transaction and Buffer Structures
 
@@ -947,14 +999,22 @@ pass on v2 pages; no WAL or server concurrency is enabled yet.
 
 - Replace process-owned pager state with one server-owned engine and shared
   buffer pool.
+- Add `DatabaseOwnershipLock`, acquire it once during server startup, and hold
+  it until storage shutdown.
+- Remove POSIX byte-range locking from pager operations and replace the current
+  `LockMgr` implementation with the transaction-owned in-memory manager.
+- Remove file-change-counter cache refresh and cache purge; all workers use the
+  same authoritative buffer pool.
 - Add transaction-owned lock state, condition-variable promotion, frame IDs,
   pins, latches, guards, and CLOCK replacement.
+- Complete recovery before starting connection workers or Raft application.
 - Keep the one-writer and reader-drain behavior.
 - Implement `KeyStore.cpp` and tests against the local B+ tree.
 
 Acceptance: thread sanitizer runs clean; concurrent readers return stable
 values; a reserved writer coexists with readers; pending blocks new readers;
-exclusive promotion cannot starve.
+exclusive promotion cannot starve; a second process cannot acquire server
+ownership of the same database.
 
 ### Milestone 3: Full-Image WAL and Recovery
 
@@ -1019,6 +1079,11 @@ replica.
 
 ### Locking and Cache
 
+- A second server process cannot acquire the database ownership lock.
+- Normal reader, writer, commit, and rollback operations issue no file-lock
+  transitions after server startup.
+- An abnormal server exit releases ownership, and the next server recovers
+  before admitting requests.
 - Many readers acquire and release shared ownership concurrently.
 - One reserved writer coexists with readers and excludes a second writer.
 - Pending blocks new readers and eventually reaches exclusive.
