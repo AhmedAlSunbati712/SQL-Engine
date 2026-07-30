@@ -8,6 +8,7 @@ ARFLAGS = rcs
 LIB = build/libstoneleafdb.a
 
 SRC = \
+	src/KeyStore.cpp \
 	src/containers/BTree.cpp \
 	src/containers/BTreeCursor.cpp \
 	src/containers/BTreePage.cpp \
@@ -23,6 +24,7 @@ SRC = \
 	src/DBHeaderCodec.cpp
 
 OBJ = \
+	build/KeyStore.o \
 	build/containers/BTree.o \
 	build/containers/BTreeCursor.o \
 	build/containers/BTreePage.o \

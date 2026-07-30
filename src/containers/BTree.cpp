@@ -28,6 +28,10 @@ BTreeCursor BTree::open_cursor() {
     return BTreeCursor(this);
 }
 
+bool BTree::cursor_active() const {
+    return active_cursor_count > 0;
+}
+
 BTreeStatus BTree::open(std::string db_file) {
     assert(!pager_open && pager == nullptr);
 

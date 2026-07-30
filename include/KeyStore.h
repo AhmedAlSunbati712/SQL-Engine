@@ -52,7 +52,12 @@ enum class KeyStoreStatus : std::uint8_t {
     WriteFailed,
     CommitFailed,
     RollbackFailed,
-    ScanFailed
+    ScanFailed,
+    // Appended to preserve the numeric values of the original public statuses.
+    NotOpen,
+    AlreadyOpen,
+    ReadFailed,
+    DecodeFailed
 };
 
 enum class KeyStoreCursorStatus : std::uint8_t {
@@ -135,7 +140,11 @@ class KeyStore {
         KeyStore(KeyStore &&) = delete;
         KeyStore &operator=(KeyStore &&) = delete;
 
+        // A KeyStore owns one open BTree at a time. Any cursor returned from a
+        // scan must be destroyed before its KeyStore.
         KeyStoreStatus open(const std::string &db_file);
+        // Closing an already-closed store succeeds. Active or failed write
+        // transactions must be committed or rolled back before an explicit close.
         KeyStoreStatus close();
 
         KeyStoreGetResult get(const KeyInput &key);
@@ -147,6 +156,8 @@ class KeyStore {
         KeyStoreStatus rollback();
         bool write_transaction_active() const;
 
+        // Successful scans return an already-positioned cursor. An empty result
+        // is represented by a cursor whose current status is EndOfScan.
         // Full ordered scan, starting at the leftmost leaf.
         KeyStoreScanResult scan();
 

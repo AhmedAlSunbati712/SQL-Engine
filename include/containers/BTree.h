@@ -78,6 +78,7 @@ class BTree {
         BTreeRemoveStatus remove(const Key &key);
         // The database must already be open. The returned cursor starts unpositioned.
         BTreeCursor open_cursor();
+        bool cursor_active() const;
     private:
         friend class BTreeCursor;
 
