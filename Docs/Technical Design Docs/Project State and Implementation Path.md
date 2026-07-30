@@ -93,7 +93,8 @@ safe for the embedded implementation but too coarse for the target server.
 
 ### Key-Value API
 
-`include/KeyStore.h` defines the desired local key-value interface:
+`include/KeyStore.h` and `src/KeyStore.cpp` implement the local key-value
+interface:
 
 ```text
 open
@@ -107,8 +108,15 @@ commit
 rollback
 ```
 
-It also defines automatic and explicit write policies and cursor result types.
-There is no `KeyStore.cpp` or KeyStore test suite yet.
+The boundary supports automatic and explicit write policies, typed point
+operations, full and bounded scans, rollback-required transaction state, and
+move-only cursors. Integration tests cover persistence, rollback, cross-process
+write conflicts, typed ordering, and cursor ownership.
+
+The v1 implementation inherits the B+ tree's count-based split policy. Client
+entries are therefore assumed to fit the current 4 KiB page layout in
+aggregate; KeyStore validates the existing 16-bit payload representation but
+does not add overflow pages or byte-capacity splitting.
 
 ### Concurrency
 
@@ -341,7 +349,7 @@ Completion criteria:
 
 ## Step 1: Finish the Local KeyStore Boundary
 
-Implement `KeyStore.cpp` and tests over the existing B+ tree.
+Status: implemented over the existing B+ tree.
 
 Why this comes first:
 
@@ -640,13 +648,9 @@ the first complete architecture.
 
 ## Immediate Restart Point
 
-The next three tasks are deliberately small and ordered:
-
-1. Update the detailed replicated-KV roadmap to use key/range locks and latch
-   crabbing instead of a global transaction lock.
-2. Implement `KeyStore.cpp` and its tests.
-3. Implement WAL segment and record codecs without integrating them into the
-   pager.
+The roadmap locking reconciliation and local KeyStore boundary are complete.
+The next implementation task is to add WAL segment and record codecs without
+integrating them into the pager.
 
 Do not begin the network server, thread-safe buffer pool, or Raft while these
 tasks are incomplete.
@@ -659,8 +663,7 @@ tasks are incomplete.
 - `Docs/Technical Design Docs/Pager + Cache.md`: current pager and rollback
   journal behavior.
 - `Docs/Technical Design Docs/Tree_Module.md`: B+ tree split and merge rules.
-- `include/KeyStore.h`: unfinished logical key-value boundary.
+- `include/KeyStore.h`: implemented logical key-value boundary.
 - `include/Pager.h`: current embedded pager interface.
 - `include/LockMgr.h`: current process-oriented lock manager that will be
   replaced for internal server coordination.
-

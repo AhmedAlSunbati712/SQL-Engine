@@ -40,14 +40,14 @@ The repository already contains substantially more than a pager prototype.
 - Cross-process cache invalidation using the database file-change counter.
 - A B+ tree with typed keys and values, insertion, overwrite, deletion,
   splitting, borrowing, merging, root replacement, and ordered cursors.
+- A typed local `KeyStore` boundary with automatic and explicit write
+  transactions, point operations, range and prefix scans, and cursor lifecycle
+  enforcement.
 - Unit and integration coverage for the codecs, disk I/O, cache, pager,
-  multiprocess locking, recovery, B+ tree, and cursor lifecycle.
+  multiprocess locking, recovery, B+ tree, KeyStore, and cursor lifecycle.
 
 ### Partially Implemented
 
-- `KeyStore.h` defines the intended key-value API, explicit and automatic write
-  policies, scans, cursors, and typed client inputs. There is no corresponding
-  `KeyStore.cpp` or test suite on `main` yet.
 - The pager already follows the useful high-level progression of allowing a
   reserved writer, blocking new readers during promotion, and requiring
   exclusive access before database-page writes. That behavior is currently
@@ -1009,7 +1009,8 @@ pass on v2 pages; no WAL or server concurrency is enabled yet.
   pins, latches, guards, and CLOCK replacement.
 - Complete recovery before starting connection workers or Raft application.
 - Keep the one-writer and reader-drain behavior.
-- Implement `KeyStore.cpp` and tests against the local B+ tree.
+- Adapt the completed `KeyStore` boundary to the shared, thread-safe local
+  engine.
 
 Acceptance: thread sanitizer runs clean; concurrent readers return stable
 values; a reserved writer coexists with readers; pending blocks new readers;
