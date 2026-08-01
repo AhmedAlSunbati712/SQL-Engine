@@ -390,7 +390,18 @@ already includes permission to read.
 
 ### Fair Wake-Up
 
-When an owner releases a key, the manager examines the front of `waiters`:
+`KeyLockManager` is a shared object, not a background thread. Calling
+`acquire()` or `release()` runs lock-manager code on the calling transaction's
+thread.
+
+When a request cannot be granted, that requesting thread enqueues its
+`KeyLockWaiter` and sleeps on `KeyLockState::changed`. The condition-variable
+wait releases the shard mutex while sleeping. It does not release any
+transaction locks the transaction already owns.
+
+When an owner later commits or aborts, that owner's thread calls `release()`.
+The releasing thread takes the shard mutex and examines the front of
+`waiters`:
 
 - If the first waiter requests `X`, grant only that one request.
 - If the first waiter requests `S`, grant the consecutive group of shared
@@ -402,12 +413,42 @@ For example:
 Current owners: S(T1), S(T2)
 Waiters:        X(T3), S(T4), S(T5)
 
-T1 releases:   T3 still waits because T2 remains
-T2 releases:   grant X(T3)
-T3 releases:   grant S(T4) and S(T5) together
+T3's thread:   sleeping inside acquire(X)
+T4's thread:   sleeping inside acquire(S)
+T5's thread:   sleeping inside acquire(S)
+
+T1's thread releases:
+    remove T1 from shared_owners
+    T3 still waits because T2 remains
+
+T2's thread releases:
+    remove T2 from shared_owners
+    remove X(T3) from the waiter queue
+    set exclusive_owner = T3
+    mark T3's request granted
+    notify changed
+
+T3's thread wakes:
+    reacquire shard mutex
+    observe its request is granted
+    return from acquire(X)
+    perform its work
+
+T3's thread eventually releases:
+    clear exclusive_owner
+    grant S(T4) and S(T5) together
+    notify changed
+
+T4 and T5 wake and return from acquire(S)
 ```
 
 This permits concurrent readers without starving the queued writer.
+
+Under rigorous 2PL, T1 and T2 retain their shared locks until their
+transactions commit or abort. T3 may therefore sleep until both transactions
+finish. It must not wait while holding a page latch, the `PCache` mutex, or the
+WAL append mutex. A timeout or cancellation removes T3's waiter safely; a
+future interactive-transaction API also requires deadlock handling.
 
 ### Transaction-Owned Lock List
 
@@ -515,7 +556,23 @@ model:
 enum class CachedPageState : std::uint8_t {
     Loading,
     Valid,
+    LoadFailed,
     Evicting,
+};
+
+class PageLatch {
+  public:
+    void lock_shared();
+    void unlock_shared();
+    void lock();
+    void unlock();
+
+  private:
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::size_t active_readers = 0;
+    std::size_t waiting_writers = 0;
+    bool writer_active = false;
 };
 
 struct Page {
@@ -525,8 +582,9 @@ struct Page {
     bool is_dirty;
     bool need_flushing;
     Lsn page_lsn;
-    CachedPageState state;
-    std::shared_mutex content_latch;
+    CachedPageState state; // Protected by PCache::mutex.
+    PageLatch content_latch;
+    // Always waited on with a unique_lock owning PCache::mutex.
     std::condition_variable state_changed;
 };
 ```
@@ -536,26 +594,241 @@ unpinned-page list, cache length, and victim selection. A single short-held
 mutex is acceptable for the first correct version. It can be sharded only if
 profiling later identifies it as a bottleneck.
 
-The current `get()` followed later by `ref_page()` is unsafe with multiple
-threads because eviction can occur between those operations. Replace that
-sequence with one cache operation that looks up and pins the `Page` while
-holding the cache mutex. The returned pointer then remains valid until the
-caller unpins it.
+The current pager calls `PCache::get()` and then changes `Page::refs_num`
+separately. That sequence is unsafe with multiple threads because eviction can
+occur between lookup and the reference-count change. Replace it with one cache
+operation that looks up and references the `Page` while holding the cache
+mutex. The returned pointer then remains valid until the caller unreferences
+it.
 
 On a cache miss, the loader publishes one pinned `Page` with state `Loading`,
 releases the cache mutex, and performs disk I/O. Another thread requesting the
 same page finds that object and waits for `Valid` instead of loading a duplicate
 copy. Disk I/O must not occur while holding the cache mutex.
 
-Callers should receive RAII guards:
+`Page::state_changed` exists specifically for that loading state:
 
-- `ReadPageGuard` pins a cached `Page` and owns its shared content latch.
-- `WritePageGuard` pins a cached `Page` and owns its exclusive content latch.
-- Destruction releases the latch and then the pin.
+```cpp
+// Second requester enters PCache with its mutex held.
+std::unique_lock cache_lock(pcache.mutex);
+Page *page = find_page(page_num);
 
-`PCache` and the pager own cached-page lifetime, pins, and the mechanics of
-guards. The B+ tree owns the tree-specific policy: which page to latch, in what
-order, when a child is safe, and when an ancestor can be released.
+// Pin before waiting so failed-load cleanup cannot delete the object.
+page->refs_num++;
+
+page->state_changed.wait(cache_lock, [&] {
+    return page->state != CachedPageState::Loading;
+});
+
+// wait() returns with pcache.mutex held again.
+if (page->state == CachedPageState::LoadFailed) {
+    // Drop this reference and return the stored load failure.
+}
+```
+
+The loader publishes completion under that same mutex:
+
+```cpp
+{
+    std::lock_guard cache_lock(pcache.mutex);
+    page->state = load_succeeded
+        ? CachedPageState::Valid
+        : CachedPageState::LoadFailed;
+}
+
+page->state_changed.notify_all();
+```
+
+`wait()` atomically releases `PCache::mutex` while the requester sleeps, which
+allows the loader to acquire it and change the state. It reacquires the mutex
+before returning. The predicate handles both spurious wake-ups and the case
+where loading finishes just before the requester begins waiting.
+
+Every read and write of `Page::state` must use `PCache::mutex`; using a
+different mutex would permit data races and missed state transitions. A failed
+loader publishes `LoadFailed` before waking waiters so they return the same
+load error instead of reading uninitialized bytes.
+
+No new page-handle class hierarchy is required. `Pager::get()` already loads a
+page, increments `Page::refs_num`, and pins it before returning. The
+multithreaded version can return the cached `Page*` in `PagerGetResult` so the
+B+ tree can use its latch:
+
+```cpp
+struct PagerGetResult {
+    PagerResult status;
+    Page *page; // Already referenced and pinned on success.
+};
+```
+
+The B+ tree uses standard-library lock objects on `page->content_latch`, then
+calls the existing `Pager::unref_page()` after unlocking. `Pager::get()`,
+`Pager::ref_page()`, and `Pager::unref_page()` must make their cache lookup,
+reference-count change, and unpinned-list change atomic under the `PCache`
+mutex.
+
+`PCache` and the pager own cached-page lifetime and pins. The B+ tree owns the
+tree-specific latch policy: which page to latch, in what order, when a child is
+safe, and when an ancestor can be released.
+
+### How `content_latch` Implements Crabbing
+
+`Page::content_latch` is the read/write latch used for one cached page:
+
+```text
+shared lock on content_latch    inspect page bytes
+exclusive lock on content_latch modify page bytes or structure
+```
+
+The current `Page` struct does not contain this field yet; it is part of the
+multithreaded redesign.
+
+The latch and the lock objects are different things:
+
+```cpp
+PageLatch content_latch; // The synchronization object in Page.
+
+std::shared_lock read_lock(content_latch); // Calls lock_shared().
+std::unique_lock write_lock(content_latch); // Calls lock().
+```
+
+`PageLatch` tracks whether an exclusive owner exists and how many shared
+owners are active:
+
+```text
+active_reader_count
+writer_active
+waiting readers and writers
+```
+
+Constructing `std::shared_lock` calls `content_latch.lock_shared()`. Several
+threads may successfully do this at once. Destroying or unlocking that object
+calls `content_latch.unlock_shared()`.
+
+Constructing `std::unique_lock` calls `content_latch.lock()`. It waits until:
+
+```text
+active_reader_count == 0
+and writer_active == false
+```
+
+It then becomes the one exclusive owner. While it is held, no shared or other
+exclusive acquisition succeeds. Destroying or unlocking it calls
+`content_latch.unlock()`.
+
+The writer therefore does not inspect the readers or repeatedly poll them.
+`PageLatch` performs the waiting and wake-up.
+
+The latch does not provide an atomic shared-to-exclusive upgrade. An
+optimistic writer must release its `std::shared_lock`, acquire a
+`std::unique_lock`, and then revalidate the page because another writer could
+have changed it in between.
+
+### Page-Latch Fairness
+
+A raw `std::shared_mutex` provides mutual-exclusion correctness but does not
+standardize reader-versus-writer fairness. A continuous stream of readers may
+therefore starve the Raft apply writer on some implementations.
+
+The page latch does not need the transaction IDs or explicit FIFO request
+objects used by the key lock manager. Page latches are short-lived, and the
+first design has only one storage writer. A writer-preferring policy is enough:
+
+```text
+lock_shared:
+    wait until !writer_active && waiting_writers == 0
+    active_readers++
+
+unlock_shared:
+    active_readers--
+    if active_readers == 0: notify waiters
+
+lock:
+    waiting_writers++
+    wait until !writer_active && active_readers == 0
+    waiting_writers--
+    writer_active = true
+
+unlock:
+    writer_active = false
+    notify waiters
+```
+
+Once a writer starts waiting, later readers stop entering. Existing readers
+drain, and the writer proceeds. This guarantees writer progress without
+maintaining one queue node per latch request.
+
+This policy can favor writers under a continuous write stream. If later
+testing shows reader starvation, replace it with a phase-fair policy that
+alternates a reader phase and a writer phase. That still does not require
+transaction-level lock queues in each page.
+
+For a cached read descent, the B+ tree uses the latch stored in each `Page`:
+
+```cpp
+PagerGetResult parent_result = pager->get(root_page_num);
+Page *parent = parent_result.page; // Already pinned by get().
+std::shared_lock parent_latch(parent->content_latch);
+
+PageId child_id = choose_child(parent->data, key);
+PagerGetResult child_result = pager->get(child_id);
+Page *child = child_result.page; // Also pinned.
+std::shared_lock child_latch(child->content_latch);
+
+// Child is pinned and latched, so release the parent in this order.
+parent_latch.unlock();
+pager->unref_page(parent->page_num);
+```
+
+The loop repeats with `child` as the next parent. The invariant is:
+
+```text
+parent content_latch held
+    -> pin child
+    -> acquire child content_latch
+    -> release parent content_latch
+    -> unpin parent
+```
+
+At the target leaf, an optimistic writer keeps the leaf pinned while changing
+latch mode:
+
+```cpp
+// Pager::get() still owns a reference, so the leaf remains pinned.
+leaf_shared_latch.unlock();
+
+std::unique_lock leaf_write_latch(leaf->content_latch);
+revalidate_leaf(leaf->data);
+```
+
+The pin prevents eviction during the non-atomic shared-to-exclusive
+transition. Revalidation is required because releasing the shared latch gives
+another writer an opportunity to change the leaf before exclusive acquisition.
+The initial one-writer apply design makes that unlikely, but the invariant
+should still be encoded correctly.
+
+For the pessimistic structural pass, the B+ tree retains several pinned
+`Page*` values and their standard `std::unique_lock` objects:
+
+```text
+root Page.content_latch       X-held
+internal Page.content_latch   X-held
+leaf Page.content_latch       X-held
+```
+
+When a child is safe, the B+ tree unlocks each unnecessary ancestor and calls
+`Pager::unref_page()` for it. If the child is unsafe, the corresponding
+`Page*` remains pinned and its `std::unique_lock` remains held so split or
+merge propagation can modify that ancestor.
+
+No B+ tree wrapper such as `BLeafPage` or `BInternalPage` may retain a raw
+`Page::data` pointer after the page latch is released.
+
+On a cache miss, avoid holding an ancestor content latch across disk I/O when
+possible. Publish and pin the child as `Loading`, release the ancestor, finish
+the load, and restart or revalidate traversal. The simpler alternative of
+holding the ancestor during the load is correct with the same top-down order
+but can block the entire subtree for disk latency.
 
 Latch crabbing can temporarily pin an entire unsafe root-to-leaf path plus a
 sibling and a newly allocated page. `PCache` must therefore be able to satisfy
@@ -743,6 +1016,185 @@ acquire X(key)
 ```
 
 ## Local WAL
+
+### LSN Vocabulary
+
+An LSN is one 64-bit coordinate in the node's local WAL byte stream. The names
+below do not represent different number formats. They describe where an LSN is
+stored and what that stored position means.
+
+| Name | Stored in | Meaning |
+| --- | --- | --- |
+| Record LSN | WAL record header | Position and identity of this record |
+| `prevLSN` | WAL record header | Previous record written by the same transaction |
+| `undoNextLSN` | CLR payload | Next transaction record recovery should undo |
+| `pageLSN` | Database page and cached `Page` | Newest WAL action reflected in this page image |
+| `recLSN` | Dirty-page table | Oldest update that may be missing from disk for this dirty interval |
+| `firstLSN` | Transaction table | Transaction's begin record |
+| `lastLSN` | Transaction table | Transaction's newest record and starting point for undo |
+| `nextLSN` | WAL manager | Position to assign to the next appended record |
+| `writtenLSN` | WAL manager | WAL written to the operating system, but not necessarily durable |
+| `durableLSN` | WAL manager | WAL known to survive the required crash model |
+| Checkpoint LSN | Control file | Position of the latest completed recovery checkpoint |
+
+Consider this local WAL:
+
+```text
+LSN 100: T8 BEGIN
+LSN 120: T8 updates page P
+LSN 140: T8 updates page Q
+LSN 160: T8 updates page P again
+LSN 180: T8 COMMIT
+```
+
+The records form a transaction chain:
+
+```text
+record 100.prevLSN = 0
+record 120.prevLSN = 100
+record 140.prevLSN = 120
+record 160.prevLSN = 140
+record 180.prevLSN = 160
+```
+
+The transaction table contains:
+
+```text
+T8.firstLSN = 100
+T8.lastLSN  = 180
+```
+
+After the in-memory updates:
+
+```text
+P.pageLSN = 160
+Q.pageLSN = 140
+P.recLSN  = 120
+Q.recLSN  = 140
+```
+
+`P.recLSN` remains 120 after the second update. Page P has been continuously
+dirty since record 120, so the database file might still contain the page
+version from before 120. Redo must not assume that starting at 160 is enough.
+
+### Why Record LSN Exists
+
+Every record needs a stable order and address. Recovery uses record LSNs to
+compare history, locate records, set page metadata, and refer to other records.
+Without a record LSN, `pageLSN`, `prevLSN`, and checkpoint positions have
+nothing to reference.
+
+### Why `pageLSN` Exists
+
+`pageLSN` makes redo conditional and idempotent:
+
+```text
+page.pageLSN >= update_record.LSN
+    -> this action or a later action is already reflected; skip
+
+page.pageLSN < update_record.LSN
+    -> apply redo and advance pageLSN
+```
+
+This matters when a page reached disk before the crash, when it did not reach
+disk, and when recovery itself crashes and runs again. Redo must not overwrite
+a newer page image with an older log action.
+
+When undo generates a CLR, the restored page receives the CLR's LSN rather
+than moving `pageLSN` backward. The CLR is the newest action reflected in that
+page.
+
+### Why `prevLSN` and `lastLSN` Exist
+
+WAL records from different transactions are interleaved. `lastLSN` identifies
+where one transaction's undo begins, and `prevLSN` walks only that
+transaction's records backward:
+
+```text
+lastLSN -> prevLSN -> prevLSN -> ... -> BEGIN
+```
+
+Recovery could instead scan the entire WAL backward looking for matching
+transaction IDs, but that becomes unnecessarily expensive and awkward with
+several loser transactions.
+
+### Why `undoNextLSN` Exists
+
+Undo itself writes a compensation log record. If recovery crashes after
+undoing LSN 160, the CLR says both:
+
+```text
+redo this already-completed undo if necessary
+continue undo at LSN 140
+```
+
+That continuation is `undoNextLSN`. It prevents a second recovery from
+repeating transaction undo incorrectly or restarting from the beginning.
+
+### Why `recLSN` Exists
+
+`recLSN` belongs to a dirty interval, not permanently to the page. It is set
+when a clean page first becomes dirty and remains unchanged through later
+updates. Once the current page version is successfully written and no newer
+update raced with that write, the page leaves the dirty-page table.
+
+The minimum `recLSN` tells ARIES where redo may need to begin. Without it,
+recovery can remain correct by scanning every WAL record after the checkpoint,
+but recovery does more work. A first version with only sharp checkpoints may
+defer the dirty-page table and `recLSN`; fuzzy checkpoints require them.
+
+### Why `writtenLSN` and `durableLSN` Differ
+
+A successful `write()` usually means bytes reached the operating system's
+cache. It does not necessarily mean they survive power loss. Therefore:
+
+```text
+writtenLSN >= durableLSN
+```
+
+The WAL writer advances `writtenLSN` after sequential writes and advances
+`durableLSN` only after the configured synchronization operation completes.
+
+The distinction permits group commit. Several transactions can append and
+wait for one synchronization that advances `durableLSN` past all of their
+commit records.
+
+Correctness uses `durableLSN`:
+
+```text
+before writing a database page:
+    durableLSN >= page.pageLSN
+
+before acknowledging local commit:
+    durableLSN >= transaction.commitLSN
+```
+
+Without a tracked durability boundary, the engine must synchronize after
+every record or cannot know whether WAL-before-data is satisfied.
+
+### Why Checkpoint LSN Exists
+
+The checkpoint LSN is a durable recovery starting point. Without checkpoints,
+recovery can scan from the beginning of WAL, but restart time and retained WAL
+grow without bound. A sharp first checkpoint can establish an empty
+dirty-page table and no active transaction; a later fuzzy checkpoint records
+those tables without stopping normal work.
+
+### Minimal First-Version Set
+
+Not every named field must be implemented in the first WAL commit. The minimum
+sound set for single-writer STEAL / NO-FORCE recovery is:
+
+- Record LSN.
+- `pageLSN`.
+- `prevLSN` and transaction `lastLSN`.
+- CLR `undoNextLSN`.
+- `nextLSN` and `durableLSN`.
+- A checkpoint LSN once WAL reclamation begins.
+
+`writtenLSN` becomes useful with an asynchronous WAL writer and group commit.
+`recLSN`, the dirty-page table, and fuzzy-checkpoint contents can follow after
+sharp-checkpoint recovery is working.
 
 ### When Logging Happens
 
@@ -1147,7 +1599,7 @@ The implementation should assert these rules:
 
 1. Make `KeyStore` the complete local key-value boundary.
 2. Introduce shared `StorageEngine`, `TransactionContext`, thread-safe
-   `PCache`, cached-page guards, pins, and page latches.
+   `PCache`, atomic page references, and page latches.
 3. Implement the sharded key lock manager and Repeatable Read tests.
 4. Add latch-crabbed point operations and a conservative structure latch for
    scans and structural changes.
