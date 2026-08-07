@@ -137,13 +137,13 @@ namespace V2PageCodec {
     void set_page_lsn(std::span<std::byte, 4096> page, std::uint64_t lsn);
     void set_page_kind(std::span<std::byte, 4096> page, V2PageKind kind);
     void update_checksum(std::span<std::byte, 4096> page);
-    V2PageCodecResult validate(std::span<const std::byte> page,
-                               std::optional<std::uint32_t> expected_page_num);
+    V2PageCodecResult validate(std::span<const std::byte> page);
 }
 ```
 
-The codec validates exact size, magic, page kind, optional expected page
-number, and CRC32C before the pager exposes a disk-loaded page.
+The codec validates exact size, magic, page kind, and CRC32C before the pager
+exposes a disk-loaded page. The pager separately compares the decoded page
+number with the page number it requested from disk.
 
 ## Pager-to-B+ Tree Boundary
 
