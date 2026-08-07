@@ -277,7 +277,7 @@ enum class FrameState : std::uint8_t {
 };
 
 struct BufferFrame {
-    alignas(64) std::array<std::byte, 4096> bytes;
+    alignas(64) std::array<char, 4096> bytes;
     PageId page_id;
     std::uint32_t page_generation;
     std::atomic<std::uint32_t> pin_count;

@@ -21,7 +21,8 @@ SRC = \
 	src/encoding/Endian.cpp \
 	src/encoding/KeyCodec.cpp \
 	src/encoding/ValueCodec.cpp \
-	src/DBHeaderCodec.cpp
+	src/DBHeaderCodec.cpp \
+	src/V2PageCodec.cpp
 
 OBJ = \
 	build/KeyStore.o \
@@ -37,7 +38,8 @@ OBJ = \
 	build/encoding/Endian.o \
 	build/encoding/KeyCodec.o \
 	build/encoding/ValueCodec.o \
-	build/DBHeaderCodec.o
+	build/DBHeaderCodec.o \
+	build/V2PageCodec.o
 
 UNIT_TEST_SRC := $(wildcard tests/unit/*.cpp)
 UNIT_TEST_OBJ := $(patsubst tests/unit/%.cpp,build/tests/unit/%.o,$(UNIT_TEST_SRC))

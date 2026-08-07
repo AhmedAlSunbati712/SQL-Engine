@@ -36,7 +36,7 @@ enum class V2PageKind : std::uint32_t {
 /// serialized. A default-constructed instance contains all-zero bytes, which
 /// is not a valid persistent page until V2PageCodec::initialize is called.
 struct PageV2 {
-    std::array<std::byte, V2_PAGE_SIZE> data{};
+    std::array<char, V2_PAGE_SIZE> data{};
 
     std::uint32_t refs_num = 0;
     bool is_dirty = false;

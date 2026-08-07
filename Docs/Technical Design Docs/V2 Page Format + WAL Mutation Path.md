@@ -7,9 +7,10 @@ journal to a physical write-ahead log. It is authoritative for the V2 page
 header, the pager-to-B+ tree boundary, page mutation capture, the first logger,
 the rollback-journal transition, and startup recovery sequencing.
 
-The implementation remains on the current rollback journal today. These
-decisions describe the work to perform next; they do not claim that V2 pages or
-WAL recovery are already implemented.
+The implementation remains on the current rollback journal today. The
+standalone V2 page representation and common codec are implemented and tested,
+but they are not integrated into the pager or B+ tree. The logger, mutation
+boundary, WAL cutover, and WAL recovery remain future work.
 
 `V2` is the name of this migration path and its new source files. It is not a
 version number stored in the page bytes.
@@ -67,7 +68,8 @@ older database files unsupported.
 
 Persistent integers are big-endian. Page number zero is valid and identifies
 the database metadata page. LSN zero means that no WAL update has yet been
-assigned. The CRC32C covers all 4096 bytes with the CRC field treated as zero.
+assigned. The CRC32C covers only the 4072-byte page-kind payload at bytes 24
+through 4095; the 24-byte common header is not included.
 
 V2 page kinds are:
 
@@ -117,7 +119,7 @@ independently mutable C++ fields. Those values are read from and written to the
 
 ```cpp
 struct PageV2 {
-    std::array<std::byte, 4096> data{};
+    std::array<char, 4096> data{};
 
     // Runtime-only cache state. Never serialized.
     std::uint32_t refs_num = 0;
@@ -130,28 +132,29 @@ struct PageV2 {
 
 ```cpp
 namespace V2PageCodec {
-    std::uint32_t page_num(std::span<const std::byte, 4096> page);
-    std::uint64_t page_lsn(std::span<const std::byte, 4096> page);
-    V2PageKind page_kind(std::span<const std::byte, 4096> page);
+    std::uint32_t page_num(std::span<const char, 4096> page);
+    std::uint64_t page_lsn(std::span<const char, 4096> page);
+    V2PageKind page_kind(std::span<const char, 4096> page);
 
-    void set_page_lsn(std::span<std::byte, 4096> page, std::uint64_t lsn);
-    void set_page_kind(std::span<std::byte, 4096> page, V2PageKind kind);
-    void update_checksum(std::span<std::byte, 4096> page);
-    V2PageCodecResult validate(std::span<const std::byte> page);
+    void set_page_lsn(std::span<char, 4096> page, std::uint64_t lsn);
+    void set_page_kind(std::span<char, 4096> page, V2PageKind kind);
+    void update_checksum(std::span<char, 4096> page);
+    V2PageCodecResult validate(std::span<const char> page);
 }
 ```
 
-The codec validates exact size, magic, page kind, and CRC32C before the pager
-exposes a disk-loaded page. The pager separately compares the decoded page
-number with the page number it requested from disk.
+The codec validates exact size, magic, page kind, and payload CRC32C before the
+pager exposes a disk-loaded page. The pager separately compares the decoded
+page number with the page number it requested from disk. The common-header
+`pageLSN` does not receive checksum protection in this format.
 
 ## Pager-to-B+ Tree Boundary
 
 `PageV2` remains internal to the pager and cache. The B+ tree never owns or
 receives that cache object, and the pager does not separately return decoded
 header fields. A pinned read exposes one read-only
-`std::span<const std::byte, 4096>` over the complete cached page. A mutation
-exposes one mutable `std::span<std::byte, 4096>` over the same complete page.
+`std::span<const char, 4096>` over the complete cached page. A mutation exposes
+one mutable `std::span<char, 4096>` over the same complete page.
 
 `BTreePage` receives all 4096 raw bytes. It uses `V2PageCodec` to read and
 validate the common page kind from those bytes, then interprets bytes 24
@@ -195,13 +198,13 @@ class PageMutationV2 {
     PageMutationV2 &operator=(PageMutationV2 &&) noexcept;
     ~PageMutationV2();
 
-    std::span<std::byte, 4096> bytes();
+    std::span<char, 4096> bytes();
 
   private:
     friend class Pager;
 
-    std::span<std::byte, 4096> cached_bytes;
-    std::array<std::byte, 4096> before_image{};
+    std::span<char, 4096> cached_bytes;
+    std::array<char, 4096> before_image{};
     bool finished = false;
 };
 ```
@@ -348,12 +351,12 @@ the current rollback journal.
 
 ## Incremental Rollback-Journal-to-WAL Transition
 
-### Stage 1: V2 Page Format
+### Stage 1: V2 Page Format — Complete
 
 Implement V2-named page types, the common page codec, CRC32C, corruption tests,
 and raw full-page views without changing the legacy pager or B+ tree.
 
-### Stage 2: Standalone Logger
+### Stage 2: Standalone Logger — Next
 
 Implement store/index segments, LSN allocation, append, rollover, scan,
 lookup, durability tracking, and torn-tail tests without pager integration.
@@ -426,13 +429,10 @@ checkpoint metadata, and safe segment reclamation are a later milestone.
 
 ## Immediate Implementation Order
 
-The next bounded task is only Stage 1's common V2 page representation and
-codec. It does not modify the legacy pager, B+ tree, rollback journal, or
-transaction flow. Logger and mutation integration follow as separately tested
-tasks.
+Stage 1's common V2 page representation, codec, CRC32C implementation, and
+corruption tests are complete. They remain standalone and do not modify the
+legacy pager, B+ tree, rollback journal, or transaction flow.
 
-Stage 1 adds V2-named files, such as `PageV2.h`, `V2PageCodec.h`, and their
-matching implementation and tests. It does not create a replacement
-`BTreePageV2` yet, and it does not edit the original page or B+ tree page
-implementations. Later integration may add V2-specific B+ tree files or adapt
-call sites only when the pager-to-B+ tree migration is the bounded task.
+The next bounded task is Stage 2's standalone logger. Mutation integration
+remains a later, separately tested task. No replacement `BTreePageV2` or legacy
+pager/B+ tree adaptation is part of the logger milestone.
