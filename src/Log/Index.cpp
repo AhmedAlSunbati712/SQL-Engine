@@ -51,9 +51,6 @@ void Index::append(std::uint32_t relative_lsn, std::uint64_t store_offset) {
     if (scan_result_.status != IndexScanStatus::Complete) {
         throw std::runtime_error("Index must be repaired or rebuilt before appending");
     }
-    if (relative_lsn != scan_result_.entry_count) {
-        throw std::invalid_argument("Index relative LSN must equal the current entry count");
-    }
 
     const std::uint64_t entry_offset = size_;
     std::array<char, ENTRY_SIZE> entry{};
@@ -98,16 +95,11 @@ std::uint64_t Index::read(std::uint32_t relative_lsn) const {
         throw std::out_of_range("Index relative LSN is outside the valid entry range");
     }
 
-    const std::uint64_t entry_offset =
-        static_cast<std::uint64_t>(relative_lsn) * ENTRY_SIZE;
+    const std::uint64_t entry_offset = static_cast<std::uint64_t>(relative_lsn) * ENTRY_SIZE;
     std::array<char, ENTRY_SIZE> entry{};
-    disk::read_exact_at(
-        fd_,
-        entry,
-        static_cast<std::streamoff>(entry_offset));
+    disk::read_exact_at(fd_, entry, static_cast<std::streamoff>(entry_offset));
 
-    const std::uint32_t stored_relative_lsn =
-        get_u32_be(entry.data() + RELATIVE_LSN_OFFSET);
+    const std::uint32_t stored_relative_lsn = get_u32_be(entry.data() + RELATIVE_LSN_OFFSET);
     if (stored_relative_lsn != relative_lsn) {
         throw std::runtime_error("Index entry contains an unexpected relative LSN");
     }
