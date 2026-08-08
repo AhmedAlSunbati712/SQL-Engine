@@ -19,7 +19,8 @@ version number stored in the page bytes.
 
 - Keep every persistent database page exactly 4096 bytes.
 - Add `pageLSN` and a page checksum before integrating WAL.
-- Treat the cached 4096 bytes as the only authoritative page representation.
+- Treat the cached 4096 bytes as the authoritative persistent representation;
+  the runtime `page_num` mirror is only a cache lookup key.
 - Give the B+ tree all 4096 raw cached bytes, not a pager-owned `PageV2`
   object or separately decoded header fields.
 - Replace `begin_write` with a mutation boundary that captures exact physical
@@ -111,17 +112,23 @@ owned by the page-kind-specific subsystem:
 The exact V2 B+ tree and freelist payload layouts are separate decisions. The
 common codec can be implemented and tested before those layouts are finalized.
 
-## Raw Bytes Are the Source of Truth
+## Raw Bytes Are the Persistent Source of Truth
 
-The cached page does not duplicate page number, kind, `pageLSN`, or checksum as
-independently mutable C++ fields. Those values are read from and written to the
-4096-byte image through `V2PageCodec`.
+The cached page duplicates only the page number as runtime cache identity. Its
+serialized page number, kind, `pageLSN`, checksum, and payload remain encoded
+in the 4096-byte image and are read and written through `V2PageCodec`.
+
+The pager sets the runtime `page_num` after initializing a new page or
+validating a disk-loaded page. It must equal the page number encoded in `data`.
+The encoded value remains the persistent authority; the runtime mirror exists
+to preserve the current cache's direct page-number lookup behavior.
 
 ```cpp
 struct PageV2 {
     std::array<char, 4096> data{};
 
     // Runtime-only cache state. Never serialized.
+    std::uint32_t page_num = 0;
     std::uint32_t refs_num = 0;
     bool is_dirty = false;
     bool need_flushing = false;
@@ -218,7 +225,8 @@ is exactly what the pager returns to the B+ tree.
 The B+ tree uses the common codec on `bytes()` when it needs to inspect or
 change the page kind. `finish_mutation` owns assignment of `pageLSN` and the
 checksum. It also validates that immutable identity bytes such as magic and
-page number were not accidentally changed.
+page number were not accidentally changed and that the encoded page number
+still equals the owning cache page's runtime `page_num`.
 
 The mutation keeps the page pinned until it finishes or cancels. Concurrency
 protection will be added when the separate concurrency design is implemented.

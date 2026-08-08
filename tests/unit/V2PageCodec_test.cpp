@@ -21,6 +21,7 @@ unsigned int byte_value(char value) {
 TEST(V2PageCodecTest, InitializeBuildsValidPageAndClearsPayload) {
     PageV2 page;
     page.data.fill(static_cast<char>(0xFF));
+    page.page_num = 0;
     page.refs_num = 3;
     page.is_dirty = true;
     page.need_flushing = true;
@@ -35,6 +36,7 @@ TEST(V2PageCodecTest, InitializeBuildsValidPageAndClearsPayload) {
     EXPECT_EQ(byte_value(page.data[2]), 0x50u);
     EXPECT_EQ(byte_value(page.data[3]), 0x47u);
     EXPECT_EQ(V2PageCodec::page_num(page.data), 0u);
+    EXPECT_EQ(page.page_num, V2PageCodec::page_num(page.data));
     EXPECT_EQ(V2PageCodec::page_lsn(page.data), 0u);
     EXPECT_EQ(
         V2PageCodec::page_kind(page.data),
@@ -54,10 +56,11 @@ TEST(V2PageCodecTest, InitializeBuildsValidPageAndClearsPayload) {
 
 TEST(V2PageCodecTest, InitializeUsesBigEndianAndStandardCrc32c) {
     PageV2 page;
+    page.page_num = 0x01020304u;
 
     V2PageCodec::initialize(
         page.data,
-        0x01020304u,
+        page.page_num,
         V2PageKind::BTreeLeaf);
 
     EXPECT_EQ(byte_value(page.data[PAGE_NUM_OFFSET]), 0x01u);
@@ -65,6 +68,7 @@ TEST(V2PageCodecTest, InitializeUsesBigEndianAndStandardCrc32c) {
     EXPECT_EQ(byte_value(page.data[PAGE_NUM_OFFSET + 2]), 0x03u);
     EXPECT_EQ(byte_value(page.data[PAGE_NUM_OFFSET + 3]), 0x04u);
     EXPECT_EQ(V2PageCodec::page_num(page.data), 0x01020304u);
+    EXPECT_EQ(page.page_num, V2PageCodec::page_num(page.data));
 
     EXPECT_EQ(byte_value(page.data[PAGE_KIND_OFFSET]), 0x00u);
     EXPECT_EQ(byte_value(page.data[PAGE_KIND_OFFSET + 1]), 0x00u);

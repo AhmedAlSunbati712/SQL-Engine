@@ -28,16 +28,20 @@ enum class V2PageKind : std::uint32_t {
 
 /// Pager-owned in-memory container for one V2 database page.
 ///
-/// `data` is the sole authoritative persistent page image. Page number, page
-/// kind, pageLSN, checksum, and payload are encoded directly in these bytes;
-/// they must not be duplicated as independently mutable C++ fields.
+/// `data` is the sole authoritative persistent page image. Page kind, pageLSN,
+/// checksum, and payload are encoded directly in these bytes and are not
+/// duplicated as independently mutable C++ fields.
 ///
-/// The remaining members are runtime-only cache state and are never
-/// serialized. A default-constructed instance contains all-zero bytes, which
-/// is not a valid persistent page until V2PageCodec::initialize is called.
+/// `page_num` mirrors the encoded page number for legacy-compatible cache
+/// lookup. The pager must populate it after initialization or validation and
+/// ensure it equals V2PageCodec::page_num(data). It and the remaining cache
+/// members are runtime-only state and are never serialized. A
+/// default-constructed instance contains all-zero bytes, which is not a valid
+/// persistent page until V2PageCodec::initialize is called.
 struct PageV2 {
     std::array<char, V2_PAGE_SIZE> data{};
 
+    std::uint32_t page_num = 0;
     std::uint32_t refs_num = 0;
     bool is_dirty = false;
     bool need_flushing = false;
