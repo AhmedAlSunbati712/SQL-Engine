@@ -14,6 +14,7 @@ SRC = \
 	src/containers/BTreePage.cpp \
 	src/containers/DLList.cpp \
 	src/JournalCodec.cpp \
+	src/Log/Store.cpp \
 	src/LockMgr.cpp \
 	src/PCache.cpp \
 	src/Pager.cpp \
@@ -31,6 +32,7 @@ OBJ = \
 	build/containers/BTreePage.o \
 	build/containers/DLList.o \
 	build/JournalCodec.o \
+	build/Log/Store.o \
 	build/LockMgr.o \
 	build/PCache.o \
 	build/Pager.o \

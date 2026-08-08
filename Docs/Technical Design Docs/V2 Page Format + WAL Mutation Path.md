@@ -311,6 +311,20 @@ WAL lives in a log directory. Each segment has:
 - A base LSN persisted in segment metadata and reflected in its file identity.
 - Configured store and index size limits.
 
+The store is an append-only sequence of independently framed records. Each
+frame begins with a four-byte unsigned big-endian payload length followed by
+exactly that many opaque payload bytes. The store owns its file descriptor,
+uses positional I/O, and returns the length-prefix offset from append for the
+index to persist.
+
+On open, the store scans framing through the final complete record. A partial
+length prefix or partial payload at the physical end of the file is reported
+as an incomplete tail. The caller must explicitly repair that tail by
+truncating to the reported last-valid boundary before another append. This
+framing scan cannot distinguish a corrupted length value from a genuinely
+truncated payload; the WAL record codec supplies the magic, checksum, type,
+and LSN validation needed to classify interior corruption.
+
 Absolute LSN is:
 
 ```text
@@ -330,10 +344,15 @@ next LSN = segment base LSN + last valid relative LSN + 1
 On rollover, the new segment's base LSN is the logger's current `next_lsn` and
 its first record again has relative LSN zero.
 
-The logger rolls over to a new segment when either the active store or index
-would exceed its limit. The store is the correctness authority. The index is
-validated against the store and must be rebuildable after a torn or incomplete
-index write.
+The logger completes both the store-record append and its corresponding index
+entry before testing the active segment's limits. If either resulting file
+size exceeds its configured limit, that complete record remains in the active
+segment and the next record begins a new segment. Records are never divided
+between segments. `max_index_bytes` must be an integer multiple of the fixed
+index-entry width; configuration validation is added when that entry format is
+finalized. The store is the correctness authority. The index is validated
+against the store and must be rebuildable after a torn or incomplete index
+write.
 
 The log manager is the owner of LSN allocation. At runtime it holds
 `next_lsn`, `written_lsn`, and `durable_lsn`. It reconstructs `next_lsn` at
