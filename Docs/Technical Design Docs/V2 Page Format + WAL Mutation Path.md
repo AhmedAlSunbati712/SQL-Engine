@@ -325,6 +325,19 @@ framing scan cannot distinguish a corrupted length value from a genuinely
 truncated payload; the WAL record codec supplies the magic, checksum, type,
 and LSN validation needed to classify interior corruption.
 
+The index is a dense array of fixed-width entries beginning at relative LSN
+zero. Each 12-byte entry contains a four-byte unsigned big-endian relative LSN
+followed by an eight-byte unsigned big-endian Store offset. Lookup reads entry
+`relative_lsn * 12` and verifies that the encoded relative LSN matches the
+requested position.
+
+On open, an index file whose size is not a multiple of 12 reports an incomplete
+tail and requires explicit truncation to its final complete entry before append
+resumes. A complete entry whose relative LSN does not match its ordinal is
+corrupt and cannot be repaired by truncating the tail; the later Segment layer
+rebuilds it from the authoritative Store. Segment also validates that each
+indexed offset identifies the expected Store record.
+
 Absolute LSN is:
 
 ```text
@@ -349,10 +362,9 @@ entry before testing the active segment's limits. If either resulting file
 size exceeds its configured limit, that complete record remains in the active
 segment and the next record begins a new segment. Records are never divided
 between segments. `max_index_bytes` must be an integer multiple of the fixed
-index-entry width; configuration validation is added when that entry format is
-finalized. The store is the correctness authority. The index is validated
-against the store and must be rebuildable after a torn or incomplete index
-write.
+12-byte index-entry width, and logger configuration rejects zero or misaligned
+values. The store is the correctness authority. The index is validated against
+the store and must be rebuildable after a torn or incomplete index write.
 
 The log manager is the owner of LSN allocation. At runtime it holds
 `next_lsn`, `written_lsn`, and `durable_lsn`. It reconstructs `next_lsn` at
