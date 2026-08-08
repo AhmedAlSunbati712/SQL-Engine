@@ -20,5 +20,8 @@ struct Config {
             throw std::invalid_argument(
                 "max_index_bytes must be a nonzero multiple of Index::ENTRY_SIZE");
         }
+        if (max_store_bytes == 0) {
+            throw std::invalid_argument("max_store_bytes must be nonzero");
+        }
     }
 };

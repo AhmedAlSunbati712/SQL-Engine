@@ -15,6 +15,7 @@ SRC = \
 	src/containers/DLList.cpp \
 	src/JournalCodec.cpp \
 	src/Log/Index.cpp \
+	src/Log/Segment.cpp \
 	src/Log/Store.cpp \
 	src/Log/WalRecordCodec.cpp \
 	src/LockMgr.cpp \
@@ -35,6 +36,7 @@ OBJ = \
 	build/containers/DLList.o \
 	build/JournalCodec.o \
 	build/Log/Index.o \
+	build/Log/Segment.o \
 	build/Log/Store.o \
 	build/Log/WalRecordCodec.o \
 	build/LockMgr.o \
