@@ -322,8 +322,21 @@ length prefix or partial payload at the physical end of the file is reported
 as an incomplete tail. The caller must explicitly repair that tail by
 truncating to the reported last-valid boundary before another append. This
 framing scan cannot distinguish a corrupted length value from a genuinely
-truncated payload; the WAL record codec supplies the magic, checksum, type,
-and LSN validation needed to classify interior corruption.
+truncated payload.
+
+The first record codec deliberately has a minimal payload:
+
+```text
++---------------------------+---------------------------+
+| absolute LSN (8 bytes)    | opaque data (0..N bytes)  |
+| unsigned, big-endian      | binary-safe `char` bytes  |
++---------------------------+---------------------------+
+```
+
+Absolute LSN zero is rejected because zero means "none" in page metadata. The
+opaque data has no transaction or page-mutation interpretation yet. Record
+magic, type, version, length duplication, and checksum are deferred until the
+physical WAL record families are finalized.
 
 The index is a dense array of fixed-width entries beginning at relative LSN
 zero. Each 12-byte entry contains a four-byte unsigned big-endian relative LSN
@@ -332,11 +345,10 @@ followed by an eight-byte unsigned big-endian Store offset. Lookup reads entry
 requested position.
 
 On open, an index file whose size is not a multiple of 12 reports an incomplete
-tail and requires explicit truncation to its final complete entry before append
-resumes. A complete entry whose relative LSN does not match its ordinal is
-corrupt and cannot be repaired by truncating the tail; the later Segment layer
-rebuilds it from the authoritative Store. Segment also validates that each
-indexed offset identifies the expected Store record.
+tail. A complete entry whose relative LSN does not match its ordinal marks the
+remainder as corrupt. `Index` is the mechanical fixed-width file layer and
+encodes the relative LSN supplied by its caller; `Segment` owns the requirement
+that new entries are dense.
 
 Absolute LSN is:
 
@@ -344,11 +356,13 @@ Absolute LSN is:
 absolute LSN = segment base LSN + relative LSN
 ```
 
-Each authoritative store record encodes its relative LSN so the index can be
-rebuilt. Absolute LSN zero remains the "none" value used by an untouched
-page's `pageLSN`, so the first segment base and initial `next_lsn` are one.
-Relative LSN zero is the first record in any segment. When a segment is empty,
-its next absolute LSN is its base LSN. Otherwise:
+Each authoritative Store record encodes its absolute LSN. Segment derives the
+four-byte relative Index key by subtracting its base LSN and rejects an append
+unless the result is the next dense ordinal. Absolute LSN zero remains the
+"none" value used by an untouched page's `pageLSN`, so the first segment base
+and initial `next_lsn` are one. Relative LSN zero is the first record in any
+segment. When a segment is empty, its next absolute LSN is its base LSN.
+Otherwise:
 
 ```text
 next LSN = segment base LSN + last valid relative LSN + 1
@@ -357,14 +371,40 @@ next LSN = segment base LSN + last valid relative LSN + 1
 On rollover, the new segment's base LSN is the logger's current `next_lsn` and
 its first record again has relative LSN zero.
 
-The logger completes both the store-record append and its corresponding index
-entry before testing the active segment's limits. If either resulting file
-size exceeds its configured limit, that complete record remains in the active
-segment and the next record begins a new segment. Records are never divided
-between segments. `max_index_bytes` must be an integer multiple of the fixed
-12-byte index-entry width, and logger configuration rejects zero or misaligned
-values. The store is the correctness authority. The index is validated against
-the store and must be rebuildable after a torn or incomplete index write.
+The logger completes both the Store-record append and its corresponding Index
+entry before testing the active segment's limits. `Segment::is_maxed()` uses a
+strict greater-than comparison. If either resulting file size exceeds its
+configured limit, that complete record remains in the active segment and the
+next record begins a new segment. Records are never divided between segments.
+`max_index_bytes` must be an integer multiple of the fixed 12-byte Index-entry
+width, and both configured limits must be nonzero.
+
+The Store is the correctness authority and the Index is derived. The crash
+model assumes bytes in a structurally complete frame or entry retain the values
+written to them. Recovery handles missing writes, incomplete append tails, and
+Store/Index persistence gaps; arbitrary damage inside complete bytes is outside
+scope and fails open rather than being repaired.
+
+Segment open repairs only crash-explained suffix differences:
+
+1. Truncate an incomplete Store frame to the last complete boundary.
+2. Reject a structurally complete Index entry whose relative LSN is corrupt.
+3. Retain the smaller of the complete Store and Index counts.
+4. Use the last retained Index entry to locate the Store suffix, or Store offset
+   zero when no Index entries survived.
+5. Truncate a partial or extra Index suffix and append mappings only for Store
+   records missing from the Index.
+
+Recovery synchronizes a changed authoritative Store before the repaired Index.
+Normal `sync()` uses the same Store-before-Index order. This tail-oriented rule
+avoids rescanning and rewriting the whole Index after an incomplete Index
+append. It does not walk backward through complete entries looking for a
+repairable boundary.
+
+The minimal record codec catches short records, reserved LSN zero, and a
+non-dense absolute-LSN sequence. It does not yet protect opaque data with a
+checksum. In particular, same-length interior payload corruption can remain
+undetected until the checksummed physical record header is introduced.
 
 The log manager is the owner of LSN allocation. At runtime it holds
 `next_lsn`, `written_lsn`, and `durable_lsn`. It reconstructs `next_lsn` at
