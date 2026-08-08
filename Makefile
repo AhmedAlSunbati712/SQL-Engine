@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -I/opt/homebrew/include
+CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -I/opt/homebrew/include -Iinclude/API
 LDFLAGS = -L/opt/homebrew/lib
 LDLIBS = -lgtest -lgtest_main
 AR = ar
@@ -53,7 +53,13 @@ INTEGRATION_TEST_SRC := $(wildcard tests/integration/*.cpp)
 INTEGRATION_TEST_OBJ := $(patsubst tests/integration/%.cpp,build/tests/integration/%.o,$(INTEGRATION_TEST_SRC))
 INTEGRATION_TEST_BIN := $(patsubst tests/integration/%.cpp,build/tests/integration/%,$(INTEGRATION_TEST_SRC))
 
-.PHONY: all test test-unit test-integration clean
+SERVER_SRC = \
+        src/server/server.cpp \
+        src/API/Message.cpp
+SERVER_OBJ = $(patsubst src/%.cpp,build/%.o,$(SERVER_SRC))
+SERVER_BIN = build/stoneleaf-server
+
+.PHONY: all server test test-unit test-integration clean
 .SECONDARY: $(UNIT_TEST_OBJ) $(INTEGRATION_TEST_OBJ)
 
 all: $(LIB) $(UNIT_TEST_BIN) $(INTEGRATION_TEST_BIN)
@@ -61,6 +67,13 @@ all: $(LIB) $(UNIT_TEST_BIN) $(INTEGRATION_TEST_BIN)
 $(LIB): $(OBJ)
 	mkdir -p $(dir $@)
 	$(AR) $(ARFLAGS) $@ $^
+
+server: $(SERVER_BIN)
+
+$(SERVER_BIN): CXXFLAGS += -pthread
+$(SERVER_BIN): $(SERVER_OBJ)
+	mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 build/%.o: src/%.cpp
 	mkdir -p $(dir $@)
