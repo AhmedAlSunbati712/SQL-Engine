@@ -18,8 +18,9 @@ enum class StoreScanStatus : std::uint8_t {
 /// `valid_size` stops immediately after the final complete record. The two
 /// sizes differ only when `status` is `IncompleteTail`.
 ///
-/// This scan validates record framing only. The future WAL record codec is
-/// responsible for validating record magic, checksums, types, and LSNs.
+/// This scan validates record framing only. Segment and WalRecordCodec validate
+/// the absolute LSN stored in each payload. The current minimal record format
+/// does not yet include a record type, magic value, or checksum.
 struct StoreScanResult {
     StoreScanStatus status = StoreScanStatus::Complete;
     std::uint64_t physical_size = 0;
