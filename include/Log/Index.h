@@ -42,8 +42,10 @@ struct IndexScanResult {
 /// rebuild from the authoritative Store and cannot be repaired here.
 ///
 /// Reads may run concurrently. Append, repair, and synchronization are
-/// serialized. Append does not make an entry crash-durable; the caller uses
-/// `sync()` at the appropriate WAL durability boundary.
+/// serialized. Segment owns the dense-sequence invariant; this lower-level
+/// file layer encodes the relative LSN supplied by its caller. Append does not
+/// make an entry crash-durable; the caller uses `sync()` at the appropriate
+/// WAL durability boundary.
 class Index {
     public:
         static constexpr std::size_t RELATIVE_LSN_SIZE = sizeof(std::uint32_t);
@@ -59,11 +61,11 @@ class Index {
         Index(Index &&) = delete;
         Index &operator=(Index &&) = delete;
 
-        /// Appends the next dense relative-LSN-to-Store-offset mapping.
+        /// Appends a relative-LSN-to-Store-offset mapping.
         ///
-        /// `relative_lsn` must equal the current entry count. Throws when the
-        /// sequence is not dense, the Index has an incomplete or corrupt tail,
-        /// or an I/O operation fails.
+        /// Segment must supply the current entry ordinal as `relative_lsn`.
+        /// Throws when the Index has an incomplete or corrupt tail or an I/O
+        /// operation fails.
         void append(std::uint32_t relative_lsn, std::uint64_t store_offset);
 
         /// Returns the Store offset mapped by `relative_lsn`.
@@ -80,6 +82,13 @@ class Index {
         /// Corrupt complete entries are not repairable by Index. Truncation is
         /// not synchronized automatically; call `sync()` when required.
         void repair_tail();
+
+        /// Truncates the Index to exactly `entry_count` complete entries.
+        ///
+        /// The requested count must not exceed the current valid prefix. This
+        /// is used by Segment to discard only an invalid derived suffix before
+        /// rebuilding it from the authoritative Store.
+        void truncate_to(std::uint64_t entry_count);
 
         /// Synchronizes all current index bytes to the required storage layer.
         void sync();
