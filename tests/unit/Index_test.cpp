@@ -114,14 +114,12 @@ TEST(IndexTest, EmptyIndexHasCompleteZeroLengthScan) {
     EXPECT_EQ(result.entry_count, 0u);
 }
 
-TEST(IndexTest, AppendRequiresDenseRelativeLsns) {
+TEST(IndexTest, AppendEncodesTheCallerProvidedRelativeLsn) {
     TempIndexFile file;
     Index index(file.open());
 
-    EXPECT_THROW(index.append(1, 0), std::invalid_argument);
-    EXPECT_NO_THROW(index.append(0, 0));
-    EXPECT_THROW(index.append(0, 12), std::invalid_argument);
-    EXPECT_THROW(index.append(2, 12), std::invalid_argument);
+    EXPECT_NO_THROW(index.append(7, 19));
+    EXPECT_EQ(file.read_bytes(), entry_bytes(7, 19));
 }
 
 TEST(IndexTest, ScanReportsIncompleteFinalEntryAndBlocksAppend) {
@@ -207,6 +205,24 @@ TEST(IndexTest, DestructorClosesOwnedDescriptor) {
 
 TEST(IndexTest, ConstructorRejectsInvalidDescriptor) {
     EXPECT_THROW(Index(-1), std::invalid_argument);
+}
+
+TEST(IndexTest, TruncateToRetainsOnlyTheRequestedValidPrefix) {
+    TempIndexFile file;
+    Index index(file.open());
+    index.append(0, 0);
+    index.append(1, 20);
+    index.append(2, 40);
+
+    index.truncate_to(1);
+
+    EXPECT_EQ(index.size(), Index::ENTRY_SIZE);
+    EXPECT_EQ(index.scan().status, IndexScanStatus::Complete);
+    EXPECT_EQ(index.scan().entry_count, 1u);
+    EXPECT_EQ(index.read(0), 0u);
+    EXPECT_THROW(index.read(1), std::out_of_range);
+    EXPECT_NO_THROW(index.append(1, 20));
+    EXPECT_THROW(index.truncate_to(3), std::out_of_range);
 }
 
 TEST(IndexTest, ConfigRequiresIndexLimitAlignedToEntryWidth) {

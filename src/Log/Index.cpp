@@ -128,6 +128,22 @@ void Index::repair_tail() {
     scan_result_.physical_size = size_;
 }
 
+void Index::truncate_to(std::uint64_t entry_count) {
+    std::unique_lock lock(mutex_);
+
+    if (entry_count > scan_result_.entry_count) {
+        throw std::out_of_range("Cannot retain more Index entries than the valid prefix");
+    }
+
+    const std::uint64_t new_size = entry_count * ENTRY_SIZE;
+    disk::truncate_file(fd_, static_cast<std::streamoff>(new_size));
+    size_ = new_size;
+    scan_result_.status = IndexScanStatus::Complete;
+    scan_result_.physical_size = new_size;
+    scan_result_.valid_size = new_size;
+    scan_result_.entry_count = entry_count;
+}
+
 void Index::sync() {
     std::unique_lock lock(mutex_);
     disk::sync_file_to_disk_fd(fd_);
