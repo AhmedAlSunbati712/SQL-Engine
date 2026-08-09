@@ -23,6 +23,7 @@ class Session {
         void close() noexcept;
     private:
         void send_command(const Command &command);
+        void read_operation_response();
         std::optional<ValueInput> read_get_response();
 
         int fd;

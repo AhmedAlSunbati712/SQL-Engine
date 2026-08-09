@@ -119,23 +119,28 @@ std::optional<ValueInput> Session::get(const KeyInput &key) {
 void Session::put(const KeyInput &key, const ValueInput &value) {
     const Command command{.operator_type = OperatorType::BINARY, .op = Operator::PUT, .key = encode_key(key), .value = encode_value(value)};
     send_command(command);
+    read_operation_response();
 }
 
 void Session::remove(const KeyInput &key) {
     const Command command{.operator_type = OperatorType::UNARY, .op = Operator::DELETE, .key = encode_key(key)};
     send_command(command);
+    read_operation_response();
 }
 
 void Session::begin_transaction() {
     send_command(Command{.operator_type = OperatorType::NULLARY, .op = Operator::BEGIN_TXN});
+    read_operation_response();
 }
 
 void Session::commit() {
     send_command(Command{.operator_type = OperatorType::NULLARY, .op = Operator::COMMIT});
+    read_operation_response();
 }
 
 void Session::rollback() {
     send_command(Command{.operator_type = OperatorType::NULLARY, .op = Operator::ROLLBACK});
+    read_operation_response();
 }
 
 void Session::close() noexcept {
@@ -158,6 +163,31 @@ void Session::send_command(const Command &command) {
         close();
         throw;
     }
+}
+
+void Session::read_operation_response() {
+    if (fd < 0) {
+        throw std::runtime_error("[ERROR] Session is closed");
+    }
+
+    std::uint8_t status = 0;
+    try {
+        receive_all(fd, &status, sizeof(status));
+    } catch (...) {
+        close();
+        throw;
+    }
+
+    if (status == 1) {
+        return;
+    }
+
+    if (status == 0) {
+        throw std::runtime_error("[ERROR] Server rejected operation");
+    }
+
+    close();
+    throw std::runtime_error("[ERROR] Invalid operation response");
 }
 
 std::optional<ValueInput> Session::read_get_response() {

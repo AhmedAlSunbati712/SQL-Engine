@@ -69,6 +69,10 @@ void send_get_response(int fd, const std::vector<std::uint8_t> &network_value) {
     send_all_for_test(fd, network_value.data(), network_value.size());
 }
 
+void send_operation_response(int fd, std::uint8_t status) {
+    send_all_for_test(fd, &status, sizeof(status));
+}
+
 TEST(SessionTest, SendsPutRemoveAndTransactionCommands) {
     int sockets[2];
     ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
@@ -76,6 +80,7 @@ TEST(SessionTest, SendsPutRemoveAndTransactionCommands) {
     Session session(sockets[0], 17);
     EXPECT_EQ(session.get_id(), 17);
 
+    send_operation_response(sockets[1], 1);
     session.put(KeyInput{std::uint64_t{42}}, ValueInput{std::string{"value"}});
     const Command put = receive_command(sockets[1]);
     EXPECT_EQ(put.operator_type, OperatorType::BINARY);
@@ -85,6 +90,7 @@ TEST(SessionTest, SendsPutRemoveAndTransactionCommands) {
     EXPECT_TRUE(KeyCodec::equal(*put.key, KeyCodec::make_uint64(42)));
     EXPECT_TRUE(ValueCodec::equal(*put.value, ValueCodec::make_char("value")));
 
+    send_operation_response(sockets[1], 1);
     session.remove(KeyInput{std::string{"key"}});
     const Command remove = receive_command(sockets[1]);
     EXPECT_EQ(remove.operator_type, OperatorType::UNARY);
@@ -92,10 +98,13 @@ TEST(SessionTest, SendsPutRemoveAndTransactionCommands) {
     ASSERT_TRUE(remove.key.has_value());
     EXPECT_TRUE(KeyCodec::equal(*remove.key, KeyCodec::make_string("key")));
 
+    send_operation_response(sockets[1], 1);
     session.begin_transaction();
     EXPECT_EQ(receive_command(sockets[1]).op, Operator::BEGIN_TXN);
+    send_operation_response(sockets[1], 1);
     session.commit();
     EXPECT_EQ(receive_command(sockets[1]).op, Operator::COMMIT);
+    send_operation_response(sockets[1], 1);
     session.rollback();
     EXPECT_EQ(receive_command(sockets[1]).op, Operator::ROLLBACK);
 
@@ -171,6 +180,28 @@ TEST(SessionTest, OperationsOnClosedSessionThrow) {
 
     EXPECT_THROW(session.commit(), std::runtime_error);
     EXPECT_THROW(session.get(KeyInput{std::uint64_t{1}}), std::runtime_error);
+    ::close(sockets[1]);
+}
+
+TEST(SessionTest, OperationResponsesReportFailureAndRejectInvalidStatus) {
+    int sockets[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+
+    Session session(sockets[0], 6);
+
+    send_operation_response(sockets[1], 0);
+    EXPECT_THROW(session.commit(), std::runtime_error);
+    EXPECT_EQ(receive_command(sockets[1]).op, Operator::COMMIT);
+
+    send_operation_response(sockets[1], 1);
+    EXPECT_NO_THROW(session.rollback());
+    EXPECT_EQ(receive_command(sockets[1]).op, Operator::ROLLBACK);
+
+    send_operation_response(sockets[1], 2);
+    EXPECT_THROW(session.begin_transaction(), std::runtime_error);
+    EXPECT_EQ(receive_command(sockets[1]).op, Operator::BEGIN_TXN);
+    EXPECT_THROW(session.commit(), std::runtime_error);
+
     ::close(sockets[1]);
 }
 
