@@ -17,6 +17,9 @@ constexpr std::size_t TYPE_OFFSET = 0;
 constexpr std::size_t PAYLOAD_SIZE_OFFSET = 1;
 constexpr std::size_t HEADER_SIZE = 5;
 
+static_assert(sizeof(KeyType) == sizeof(std::uint8_t));
+static_assert(sizeof(ValueType) == sizeof(std::uint8_t));
+
 KeyType deserialize_key_type(std::uint8_t type) {
     switch (static_cast<KeyType>(type)) {
         case KeyType::Bool:

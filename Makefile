@@ -13,7 +13,8 @@ SRC = \
 	src/containers/BTreeCursor.cpp \
 	src/containers/BTreePage.cpp \
 	src/containers/DLList.cpp \
-	src/containers/client/NetCodec.cpp \
+	src/client/Command.cpp \
+	src/client/NetCodec.cpp \
 	src/JournalCodec.cpp \
 	src/Log/Index.cpp \
 	src/Log/Segment.cpp \
@@ -35,7 +36,8 @@ OBJ = \
 	build/containers/BTreeCursor.o \
 	build/containers/BTreePage.o \
 	build/containers/DLList.o \
-	build/containers/client/NetCodec.o \
+	build/client/Command.o \
+	build/client/NetCodec.o \
 	build/JournalCodec.o \
 	build/Log/Index.o \
 	build/Log/Segment.o \
