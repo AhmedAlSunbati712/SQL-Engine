@@ -1,24 +1,20 @@
 #include <KeyStore.h>
 
-#include <Endian.h>
 #include <KeyCodec.h>
 #include <ValueCodec.h>
 
 #include <algorithm>
-#include <bit>
 #include <cstdint>
-#include <limits>
-#include <type_traits>
 #include <utility>
 
 /**
- * KeyStore is the client-facing layer above BTree.
+ * KeyStore is the validated key-value layer above BTree.
  *
  * The BTree deliberately works with encoded Key and Value objects and exposes
  * storage-oriented status values. KeyStore is responsible for the opposite
  * side of that boundary:
  *
- * - convert client variants into the ordered on-disk encodings;
+ * - validate encoded keys and values before they reach the BTree;
  * - translate BTree and BTreeCursor failures into public KeyStore statuses;
  * - decide whether a successful write is committed immediately or belongs to
  *   an explicit transaction;
@@ -29,81 +25,6 @@
  * rollback journaling, page ownership, and cross-process locks remain owned by
  * the BTree/Pager layers below it.
  */
-
-namespace {
-
-// Keys and values use 2-byte payload lengths in the current leaf-page format.
-// This guard only protects that representation. It does not solve aggregate
-// page-capacity or overflow-page handling.
-constexpr std::size_t MAX_ENCODED_PAYLOAD_SIZE =
-    std::numeric_limits<std::uint16_t>::max();
-
-std::optional<KeyInput> decode_key_input(const Key &key) {
-    /**
-     * Convert an encoded storage key back into the matching public variant.
-     *
-     * Numeric key encodings preserve sort order, so decoding is not always a
-     * direct byte copy. UInt64 reverses the big-endian encoding. Int64 also
-     * removes the sign-bit bias that makes lexicographic byte order match
-     * signed numeric order.
-     */
-    if (!keycodec::validate_key(key)) return std::nullopt;
-
-    switch (key.type) {
-        case KeyType::Bool:
-            return KeyInput{key.data[0] == '\1'};
-        case KeyType::UInt64:
-            return KeyInput{get_u64_be(key.data.data())};
-        case KeyType::Int64: {
-            // KeyCodec flips the sign bit before storing signed integers. Flip
-            // it back, then preserve the resulting bit pattern as int64_t.
-            const std::uint64_t encoded = get_u64_be(key.data.data());
-            const std::uint64_t raw = encoded ^ (1ULL << 63);
-            return KeyInput{std::bit_cast<std::int64_t>(raw)};
-        }
-        case KeyType::String:
-            return KeyInput{std::string(key.data.begin(), key.data.end())};
-        case KeyType::Bytes:
-            return KeyInput{key.data};
-    }
-
-    return std::nullopt;
-}
-
-std::optional<ValueInput> decode_value_input(const Value &value) {
-    /**
-     * Convert a persisted Value into the public ValueInput variant.
-     *
-     * The codec validates the outer type/size shape first. Integer helpers then
-     * reject malformed or overflowing varints. Bool gets one extra canonical
-     * byte check here because the public API only admits false (0) and true (1).
-     */
-    if (!valuecodec::validate_value(value)) return std::nullopt;
-
-    switch (value.type) {
-        case ValueType::VarUInt: {
-            std::uint64_t decoded = 0;
-            if (!valuecodec::decode_varuint(value, &decoded)) return std::nullopt;
-            return ValueInput{decoded};
-        }
-        case ValueType::VarInt: {
-            std::int64_t decoded = 0;
-            if (!valuecodec::decode_varint(value, &decoded)) return std::nullopt;
-            return ValueInput{decoded};
-        }
-        case ValueType::Bool:
-            if (value.data[0] != '\0' && value.data[0] != '\1') {
-                return std::nullopt;
-            }
-            return ValueInput{value.data[0] == '\1'};
-        case ValueType::Char:
-            return ValueInput{std::string(value.data.begin(), value.data.end())};
-    }
-
-    return std::nullopt;
-}
-
-} // namespace
 
 // ================================= KeyStoreCursor =================================
 
@@ -157,15 +78,19 @@ KeyStoreCursorResult KeyStoreCursor::current() const {
         return result;
     }
 
-    std::optional<KeyInput> key = decode_key(storage_result.key);
-    std::optional<ValueInput> value = decode_value(storage_result.value);
-    if (!key.has_value() || !value.has_value()) {
+    if (
+        !keycodec::validate_key(storage_result.key) ||
+        !valuecodec::validate_value(storage_result.value)
+    ) {
         result.status = KeyStoreCursorStatus::DecodeFailed;
         return result;
     }
 
     result.status = KeyStoreCursorStatus::Success;
-    result.entry = KeyStoreEntry{std::move(*key), std::move(*value)};
+    result.entry = KeyStoreEntry{
+        std::move(storage_result.key),
+        std::move(storage_result.value)
+    };
     return result;
 }
 
@@ -245,7 +170,7 @@ bool KeyStoreCursor::current_key_is_in_bounds(const Key &key) const {
 KeyStoreCursorStatus KeyStoreCursor::translate_cursor_status(
     BTreeCursorStatus status
 ) {
-    // Hide storage-specific failure details from the client cursor API while
+    // Hide storage-specific failure details from the caller-facing cursor API while
     // preserving the distinctions a caller can act on.
     switch (status) {
         case BTreeCursorStatus::Success:
@@ -262,17 +187,6 @@ KeyStoreCursorStatus KeyStoreCursor::translate_cursor_status(
     }
 
     return KeyStoreCursorStatus::StorageError;
-}
-
-std::optional<KeyInput> KeyStoreCursor::decode_key(const Key &key) {
-    // Keep cursor decoding as a class helper while sharing the actual codec
-    // policy with point operations through the file-local implementation.
-    return decode_key_input(key);
-}
-
-std::optional<ValueInput> KeyStoreCursor::decode_value(const Value &value) {
-    // A scan must surface exactly the same ValueInput type that get() would.
-    return decode_value_input(value);
 }
 
 // ==================================== KeyStore ====================================
@@ -345,14 +259,14 @@ KeyStoreStatus KeyStore::close() {
     return KeyStoreStatus::Success;
 }
 
-KeyStoreGetResult KeyStore::get(const KeyInput &key) {
+KeyStoreGetResult KeyStore::get(const Key &key) {
     /**
      * Point lookup flow:
      *
-     * 1. Validate and encode the client key.
+     * 1. Validate the encoded key.
      * 2. Ask the BTree for the encoded value.
      * 3. Translate absence separately from storage failure.
-     * 4. Decode the stored value into the public variant.
+     * 4. Validate the stored value before exposing it.
      *
      * Reads are allowed during explicit write transactions so a transaction can
      * observe its own uncommitted page-cache changes.
@@ -363,13 +277,12 @@ KeyStoreGetResult KeyStore::get(const KeyInput &key) {
         return result;
     }
 
-    std::optional<Key> encoded_key = encode_key(key);
-    if (!encoded_key.has_value()) {
+    if (!keycodec::validate_key(key)) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
 
-    BTreeGetStatus get_result = tree.get(*encoded_key);
+    BTreeGetStatus get_result = tree.get(key);
     if (get_result.status == BTreeStatus::KeyNotInTree) {
         result.status = KeyStoreStatus::KeyNotFound;
         return result;
@@ -379,35 +292,32 @@ KeyStoreGetResult KeyStore::get(const KeyInput &key) {
         return result;
     }
 
-    result.value = decode_value(get_result.value);
-    if (!result.value.has_value()) {
+    if (!valuecodec::validate_value(get_result.value)) {
         result.status = KeyStoreStatus::DecodeFailed;
         return result;
     }
 
     result.status = KeyStoreStatus::Success;
+    result.value = std::move(get_result.value);
     return result;
 }
 
 KeyStoreStatus KeyStore::put(
-    const KeyInput &key,
-    const ValueInput &value
+    const Key &key,
+    const Value &value
 ) {
     /**
      * Insert or overwrite a typed key/value pair.
      *
-     * Encoding happens before transaction checks because InvalidKey and
+     * Validation happens before transaction checks because InvalidKey and
      * InvalidValue are caller errors and must never poison a transaction. Once
      * BTree::insert runs, completion is delegated to either the explicit
      * transaction state machine or the autocommit commit/rollback path.
      */
     if (!is_open) return KeyStoreStatus::NotOpen;
 
-    std::optional<Key> encoded_key = encode_key(key);
-    if (!encoded_key.has_value()) return KeyStoreStatus::InvalidKey;
-
-    std::optional<Value> encoded_value = encode_value(value);
-    if (!encoded_value.has_value()) return KeyStoreStatus::InvalidValue;
+    if (!keycodec::validate_key(key)) return KeyStoreStatus::InvalidKey;
+    if (!valuecodec::validate_value(value)) return KeyStoreStatus::InvalidValue;
 
     if (transaction_state == TransactionState::Failed) {
         // A previous storage/commit failure may have left dirty state. No later
@@ -421,7 +331,8 @@ KeyStoreStatus KeyStore::put(
         return KeyStoreStatus::NoActiveTransaction;
     }
 
-    BTreeStatus write_status = tree.insert(*encoded_key, *encoded_value);
+    Value stored_value = value;
+    BTreeStatus write_status = tree.insert(key, stored_value);
     // An explicit transaction retains successful dirty pages for a later
     // commit. With no explicit transaction, this one call owns the full write.
     if (transaction_state == TransactionState::Active) {
@@ -431,12 +342,12 @@ KeyStoreStatus KeyStore::put(
     return finish_autocommit_write(write_status);
 }
 
-KeyStoreRemoveResult KeyStore::remove(const KeyInput &key) {
+KeyStoreRemoveResult KeyStore::remove(const Key &key) {
     /**
      * Delete a key and return the value that was stored under it.
      *
-     * The raw value must be decoded before an autocommit delete is finalized.
-     * Otherwise a decode failure could commit the deletion while preventing the
+     * The raw value must be validated before an autocommit delete is finalized.
+     * Otherwise invalid stored data could commit the deletion while preventing the
      * API from returning the promised previous value. In that case explicit
      * transactions enter Failed and autocommit rolls the deletion back.
      */
@@ -446,8 +357,7 @@ KeyStoreRemoveResult KeyStore::remove(const KeyInput &key) {
         return result;
     }
 
-    std::optional<Key> encoded_key = encode_key(key);
-    if (!encoded_key.has_value()) {
+    if (!keycodec::validate_key(key)) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
@@ -464,7 +374,7 @@ KeyStoreRemoveResult KeyStore::remove(const KeyInput &key) {
         return result;
     }
 
-    BTreeRemoveStatus remove_result = tree.remove(*encoded_key);
+    BTreeRemoveStatus remove_result = tree.remove(key);
     if (remove_result.status == BTreeStatus::KeyNotInTree) {
         // Not-found is a clean logical result: no page was changed, so there is
         // nothing to commit, roll back, or mark as a failed transaction.
@@ -479,8 +389,7 @@ KeyStoreRemoveResult KeyStore::remove(const KeyInput &key) {
         return result;
     }
 
-    std::optional<ValueInput> removed_value = decode_value(remove_result.value);
-    if (!removed_value.has_value()) {
+    if (!valuecodec::validate_value(remove_result.value)) {
         if (transaction_state == TransactionState::Active) {
             // The BTree mutation already happened in this transaction. Keep the
             // transaction alive but force the caller through rollback.
@@ -489,8 +398,8 @@ KeyStoreRemoveResult KeyStore::remove(const KeyInput &key) {
             return result;
         }
 
-        // Autocommit cannot publish a delete whose return value could not be
-        // decoded. Restore the page state before reporting DecodeFailed.
+        // Autocommit cannot publish a delete whose return value is invalid.
+        // Restore the page state before reporting DecodeFailed.
         BTreeRollbackStatus rollback_status = tree.rollback();
         result.status = (rollback_status == BTreeRollbackStatus::Success)
             ? KeyStoreStatus::DecodeFailed
@@ -502,7 +411,7 @@ KeyStoreRemoveResult KeyStore::remove(const KeyInput &key) {
         ? handle_transactional_write(BTreeStatus::Success)
         : finish_autocommit_write(BTreeStatus::Success);
     if (result.status == KeyStoreStatus::Success) {
-        result.value = std::move(*removed_value);
+        result.value = std::move(remove_result.value);
     }
     return result;
 }
@@ -638,7 +547,7 @@ KeyStoreScanResult KeyStore::scan() {
     return result;
 }
 
-KeyStoreScanResult KeyStore::scan_from(const KeyInput &start) {
+KeyStoreScanResult KeyStore::scan_from(const Key &start) {
     /**
      * Open a lower-bound scan over [start, end of tree).
      *
@@ -651,14 +560,13 @@ KeyStoreScanResult KeyStore::scan_from(const KeyInput &start) {
         return result;
     }
 
-    std::optional<Key> encoded_start = encode_key(start);
-    if (!encoded_start.has_value()) {
+    if (!keycodec::validate_key(start)) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
 
     BTreeCursor cursor = tree.open_cursor();
-    BTreeCursorStatus seek_status = cursor.seek(*encoded_start);
+    BTreeCursorStatus seek_status = cursor.seek(start);
     if (
         seek_status != BTreeCursorStatus::Success &&
         seek_status != BTreeCursorStatus::EndOfTree
@@ -673,8 +581,8 @@ KeyStoreScanResult KeyStore::scan_from(const KeyInput &start) {
 }
 
 KeyStoreScanResult KeyStore::scan_range(
-    const KeyInput &start,
-    const KeyInput &end
+    const Key &start,
+    const Key &end
 ) {
     /**
      * Open a half-open ordered range [start, end).
@@ -689,19 +597,17 @@ KeyStoreScanResult KeyStore::scan_range(
         return result;
     }
 
-    std::optional<Key> encoded_start = encode_key(start);
-    std::optional<Key> encoded_end = encode_key(end);
-    if (!encoded_start.has_value() || !encoded_end.has_value()) {
+    if (!keycodec::validate_key(start) || !keycodec::validate_key(end)) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
-    if (keycodec::compare(*encoded_start, *encoded_end) > 0) {
+    if (keycodec::compare(start, end) > 0) {
         result.status = KeyStoreStatus::InvalidRange;
         return result;
     }
 
     BTreeCursor cursor = tree.open_cursor();
-    BTreeCursorStatus seek_status = cursor.seek(*encoded_start);
+    BTreeCursorStatus seek_status = cursor.seek(start);
     if (
         seek_status != BTreeCursorStatus::Success &&
         seek_status != BTreeCursorStatus::EndOfTree
@@ -714,13 +620,13 @@ KeyStoreScanResult KeyStore::scan_range(
     // owns the exclusive upper-bound check on current() and next().
     result.cursor.emplace(KeyStoreCursor(
         std::move(cursor),
-        std::move(encoded_end)
+        end
     ));
     result.status = KeyStoreStatus::Success;
     return result;
 }
 
-KeyStoreScanResult KeyStore::scan_prefix(const KeyPrefix &prefix) {
+KeyStoreScanResult KeyStore::scan_prefix(const Key &prefix) {
     /**
      * Open a prefix scan for string or byte-vector keys.
      *
@@ -735,20 +641,16 @@ KeyStoreScanResult KeyStore::scan_prefix(const KeyPrefix &prefix) {
         return result;
     }
 
-    // Reuse the normal key encoder so prefix scans follow the same type tags,
-    // payload-size validation, and byte representation as point operations.
-    KeyInput prefix_input = std::visit(
-        [](const auto &value) -> KeyInput { return value; },
-        prefix
-    );
-    std::optional<Key> encoded_prefix = encode_key(prefix_input);
-    if (!encoded_prefix.has_value()) {
+    if (
+        !keycodec::validate_key(prefix) ||
+        (prefix.type != KeyType::String && prefix.type != KeyType::Bytes)
+    ) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
 
     BTreeCursor cursor = tree.open_cursor();
-    BTreeCursorStatus seek_status = cursor.seek(*encoded_prefix);
+    BTreeCursorStatus seek_status = cursor.seek(prefix);
     if (
         seek_status != BTreeCursorStatus::Success &&
         seek_status != BTreeCursorStatus::EndOfTree
@@ -760,81 +662,13 @@ KeyStoreScanResult KeyStore::scan_prefix(const KeyPrefix &prefix) {
     result.cursor.emplace(KeyStoreCursor(
         std::move(cursor),
         std::nullopt,
-        std::move(encoded_prefix)
+        prefix
     ));
     result.status = KeyStoreStatus::Success;
     return result;
 }
 
-// =============================== Encoding + Writes ================================
-
-std::optional<Key> KeyStore::encode_key(const KeyInput &key) {
-    /**
-     * Map one public key alternative to its order-preserving storage encoding.
-     *
-     * std::visit keeps this dispatch exhaustive: adding a KeyInput alternative
-     * requires adding its codec branch here. Variable payloads are checked
-     * before the codec narrows their size into the on-disk representation.
-     */
-    return std::visit(
-        [](const auto &value) -> std::optional<Key> {
-            using T = std::decay_t<decltype(value)>;
-
-            if constexpr (std::is_same_v<T, bool>) {
-                return keycodec::make_bool(value);
-            } else if constexpr (std::is_same_v<T, std::uint64_t>) {
-                return keycodec::make_uint64(value);
-            } else if constexpr (std::is_same_v<T, std::int64_t>) {
-                return keycodec::make_int64(value);
-            } else if constexpr (std::is_same_v<T, std::string>) {
-                if (value.size() > MAX_ENCODED_PAYLOAD_SIZE) {
-                    return std::nullopt;
-                }
-                return keycodec::make_string(value);
-            } else {
-                if (value.size() > MAX_ENCODED_PAYLOAD_SIZE) {
-                    return std::nullopt;
-                }
-                return keycodec::make_bytes(value);
-            }
-        },
-        key
-    );
-}
-
-std::optional<Value> KeyStore::encode_value(const ValueInput &value) {
-    /**
-     * Map one public value alternative to its persisted Value representation.
-     *
-     * Unsigned integers use VarUInt, signed integers use ZigZag + VarInt, bool
-     * is one canonical byte, and public strings map to the current Char type.
-     */
-    return std::visit(
-        [](const auto &input) -> std::optional<Value> {
-            using T = std::decay_t<decltype(input)>;
-
-            if constexpr (std::is_same_v<T, bool>) {
-                return valuecodec::make_bool(input);
-            } else if constexpr (std::is_same_v<T, std::uint64_t>) {
-                return valuecodec::make_varuint(input);
-            } else if constexpr (std::is_same_v<T, std::int64_t>) {
-                return valuecodec::make_varint(input);
-            } else {
-                if (input.size() > MAX_ENCODED_PAYLOAD_SIZE) {
-                    return std::nullopt;
-                }
-                return valuecodec::make_char(input);
-            }
-        },
-        value
-    );
-}
-
-std::optional<ValueInput> KeyStore::decode_value(const Value &value) {
-    // Point operations and cursors intentionally share one decoding policy so
-    // the same persisted bytes cannot be interpreted differently by get/scan.
-    return decode_value_input(value);
-}
+// ==================================== Writes ======================================
 
 KeyStoreStatus KeyStore::finish_autocommit_write(BTreeStatus write_status) {
     /**
