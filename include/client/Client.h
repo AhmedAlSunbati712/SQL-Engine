@@ -7,9 +7,9 @@
 class Client {
     public:
         Client(std::string ip_addr, int port);
-        Session &get_session();
+        ~Client();
+        Session &new_session();
         void close_session(int session_id);
-        void close();
     private:
         struct sockaddr_in server_addr;
         std::unordered_map<int, std::unique_ptr<Session>> sessions;
