@@ -15,7 +15,11 @@ Client::Client(std::string ip_addr, int port): seq_number(0) {
     }
 }
 
-Client::~Client() = default;
+Client::~Client() {
+    for (auto& entry : sessions) {
+        entry.second.close();
+    }
+}
 
 Session &Client::new_session() {
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -40,5 +44,11 @@ Session &Client::new_session() {
 }
 
 void Client::close_session(int session_id) {
-    sessions.erase(session_id);
+    auto it = sessions.find(session_id);
+    if (it == sessions.end()) {
+        return;
+    }
+
+    it->second.close();
+    sessions.erase(it);
 }
