@@ -95,6 +95,10 @@ build/tests/integration/%.o: tests/integration/%.cpp
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+build/tests/integration/CommandServer_test: build/tests/integration/CommandServer_test.o build/server/CommandServer.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) -pthread
+
 build/tests/integration/%: build/tests/integration/%.o $(LIB)
 	mkdir -p $(dir $@)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS)
