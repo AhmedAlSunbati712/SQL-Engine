@@ -2,6 +2,10 @@
 
 #include <ValueCodec.h>
 
+#include <limits>
+#include <optional>
+#include <string>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -82,6 +86,38 @@ TEST(ValueCodecTest, VarIntRoundTripsSignedIntegers) {
     ASSERT_EQ(value.type, ValueType::VarInt);
     ASSERT_EQ(valuecodec::decode_varint(value, &decoded), true);
     EXPECT_EQ(decoded, -300);
+}
+
+TEST(ValueCodecTest, PrimitiveInputsRoundTripThroughCanonicalEncoding) {
+    const std::vector<ValueInput> inputs = {
+        ValueInput{false},
+        ValueInput{std::numeric_limits<std::uint64_t>::max()},
+        ValueInput{std::numeric_limits<std::int64_t>::min()},
+        ValueInput{std::string{"value\0text", 10}}
+    };
+
+    for (const ValueInput &input : inputs) {
+        std::optional<Value> encoded = valuecodec::encode(input);
+        ASSERT_TRUE(encoded.has_value());
+        EXPECT_TRUE(valuecodec::validate_value(*encoded));
+
+        std::optional<ValueInput> decoded = valuecodec::decode(*encoded);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(*decoded, input);
+    }
+}
+
+TEST(ValueCodecTest, RejectsOversizedPayloadAndNonCanonicalBool) {
+    const std::string oversized(valuecodec::MAX_PAYLOAD_SIZE + 1, 'x');
+    EXPECT_FALSE(valuecodec::encode(ValueInput{oversized}).has_value());
+    EXPECT_FALSE(valuecodec::validate_value(valuecodec::make_char(oversized)));
+
+    Value malformed_bool{};
+    malformed_bool.type = ValueType::Bool;
+    malformed_bool.size = 1;
+    malformed_bool.data = {'x'};
+    EXPECT_FALSE(valuecodec::validate_value(malformed_bool));
+    EXPECT_FALSE(valuecodec::decode(malformed_bool).has_value());
 }
 
 } // namespace

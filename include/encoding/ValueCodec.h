@@ -1,10 +1,29 @@
 #pragma once
 
 #include <Value.h>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
+using ValueInput = std::variant<
+    bool,
+    std::uint64_t,
+    std::int64_t,
+    std::string
+>;
+
 namespace valuecodec {
+
+inline constexpr std::size_t MAX_PAYLOAD_SIZE =
+    std::numeric_limits<std::uint16_t>::max();
+
+std::optional<Value> encode(const ValueInput &input);
+std::optional<ValueInput> decode(const Value &value);
 
 bool equal(const Value &lhs, const Value &rhs);
 bool validate_value(const Value &value);

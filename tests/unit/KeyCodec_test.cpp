@@ -3,6 +3,9 @@
 #include <KeyCodec.h>
 
 #include <cstdint>
+#include <limits>
+#include <string>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -83,6 +86,35 @@ TEST(KeyCodecTest, ValidateKeyAcceptsFactoryOutput) {
     EXPECT_EQ(keycodec::validate_key(keycodec::make_int64(-123)), true);
     EXPECT_EQ(keycodec::validate_key(keycodec::make_string("hello")), true);
     EXPECT_EQ(keycodec::validate_key(keycodec::make_bytes(std::vector<char>{'x', 'y'})), true);
+}
+
+TEST(KeyCodecTest, PrimitiveInputsRoundTripThroughCanonicalEncoding) {
+    const std::vector<KeyInput> inputs = {
+        KeyInput{true},
+        KeyInput{std::numeric_limits<std::uint64_t>::max()},
+        KeyInput{std::numeric_limits<std::int64_t>::min()},
+        KeyInput{std::string{"key\0text", 8}},
+        KeyInput{std::vector<char>{'b', '\0', 'y'}}
+    };
+
+    for (const KeyInput &input : inputs) {
+        std::optional<Key> encoded = keycodec::encode(input);
+        ASSERT_TRUE(encoded.has_value());
+        EXPECT_TRUE(keycodec::validate_key(*encoded));
+
+        std::optional<KeyInput> decoded = keycodec::decode(*encoded);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(*decoded, input);
+    }
+}
+
+TEST(KeyCodecTest, EncodeRejectsPayloadThatLeafCellsCannotRepresent) {
+    const std::string oversized(keycodec::MAX_PAYLOAD_SIZE + 1, 'x');
+    EXPECT_FALSE(keycodec::encode(KeyInput{oversized}).has_value());
+
+    Key raw = keycodec::make_string(oversized);
+    EXPECT_FALSE(keycodec::validate_key(raw));
+    EXPECT_FALSE(keycodec::decode(raw).has_value());
 }
 
 } // namespace

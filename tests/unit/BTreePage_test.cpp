@@ -42,7 +42,7 @@ void write_leaf_cell(char *page, std::uint16_t cell_offset, const Key &key, Valu
 void build_leaf_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &expected_keys) {
     page.fill(0);
     Value false_char = make_value(ValueType::Char, "F");
-    Value true_bool = make_value(ValueType::Bool, "T");
+    Value true_bool = valuecodec::make_bool(true);
     Value negative_int = valuecodec::make_varint(-5);
     Value cat_value = make_value(ValueType::Char, "CAT");
     Value bytes_value = make_value(ValueType::Char, "BYTES");
@@ -222,7 +222,7 @@ TEST(BTreePageTest, LeafInsertSetAndRemoveMutateLogicalState) {
     Key key_string = keycodec::make_string("cat");
 
     EXPECT_EQ(leaf_page.insert_at(0, key_string, make_value(ValueType::Char, "C")), true);
-    EXPECT_EQ(leaf_page.insert_at(0, key_false, make_value(ValueType::Bool, "F")), true);
+    EXPECT_EQ(leaf_page.insert_at(0, key_false, valuecodec::make_bool(false)), true);
     EXPECT_EQ(leaf_page.insert_at(1, key_uint, valuecodec::make_varuint(20)), true);
     EXPECT_EQ(leaf_page.insert_at(9, keycodec::make_bytes(std::vector<char>{'z'}), make_value(ValueType::Char, "Z")), false);
 
@@ -233,10 +233,10 @@ TEST(BTreePageTest, LeafInsertSetAndRemoveMutateLogicalState) {
     ASSERT_TRUE(leaf_page.key_at(2).has_value());
     expect_key_equals(*leaf_page.key_at(2), key_string);
 
-    EXPECT_EQ(leaf_page.set(key_uint, make_value(ValueType::Bool, "T")), true);
+    EXPECT_EQ(leaf_page.set(key_uint, valuecodec::make_bool(true)), true);
     std::optional<Value> updated_value = leaf_page.get(key_uint);
     ASSERT_TRUE(updated_value.has_value());
-    EXPECT_EQ(std::string(updated_value->data.begin(), updated_value->data.end()), "T");
+    EXPECT_EQ(updated_value->data[0], '\1');
     EXPECT_EQ(leaf_page.set(keycodec::make_uint64(99), make_value(ValueType::Char, "X")), false);
 
     EXPECT_EQ(leaf_page.remove_at(1), true);
@@ -305,9 +305,9 @@ TEST(BTreePageTest, LeafWriteBackRoundTripsIntoFreshObject) {
     {
         BLeafPage leaf_page(page.data());
         ASSERT_EQ(leaf_page.insert_at(0, key_false, make_value(ValueType::Char, "A")), true);
-        ASSERT_EQ(leaf_page.insert_at(1, key_uint, make_value(ValueType::Bool, "B")), true);
+        ASSERT_EQ(leaf_page.insert_at(1, key_uint, valuecodec::make_bool(false)), true);
         ASSERT_EQ(leaf_page.insert_at(2, key_string, valuecodec::make_varint(123456)), true);
-        ASSERT_EQ(leaf_page.set(key_uint, make_value(ValueType::Bool, "T")), true);
+        ASSERT_EQ(leaf_page.set(key_uint, valuecodec::make_bool(true)), true);
         leaf_page.write_back();
     }
 
@@ -328,7 +328,7 @@ TEST(BTreePageTest, LeafWriteBackRoundTripsIntoFreshObject) {
     std::optional<Value> middle_value = decoded.get(key_uint);
     ASSERT_TRUE(middle_value.has_value());
     EXPECT_EQ(middle_value->type, ValueType::Bool);
-    EXPECT_EQ(std::string(middle_value->data.begin(), middle_value->data.end()), "T");
+    EXPECT_EQ(middle_value->data[0], '\1');
 
     std::optional<Value> last_value = decoded.get(key_string);
     ASSERT_TRUE(last_value.has_value());
