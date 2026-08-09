@@ -17,7 +17,7 @@ using ValueInput = std::variant<
     std::string
 >;
 
-namespace valuecodec {
+namespace ValueCodec {
 
 inline constexpr std::size_t MAX_PAYLOAD_SIZE =
     std::numeric_limits<std::uint16_t>::max();
@@ -43,4 +43,4 @@ Value make_char(std::string_view value);
 bool decode_varuint(const Value &value, std::uint64_t *out);
 bool decode_varint(const Value &value, std::int64_t *out);
 
-} // namespace valuecodec
+} // namespace ValueCodec

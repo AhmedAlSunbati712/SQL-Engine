@@ -3,7 +3,7 @@
 #include <limits>
 #include <type_traits>
 
-namespace valuecodec {
+namespace ValueCodec {
 
 namespace {
 
@@ -188,4 +188,4 @@ bool decode_varint(const Value &value, std::int64_t *out) {
     return true;
 }
 
-} // namespace valuecodec
+} // namespace ValueCodec

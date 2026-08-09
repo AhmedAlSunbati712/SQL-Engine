@@ -19,7 +19,7 @@ std::string value_to_string(const Value &value) {
 }
 
 Key make_key(std::uint64_t key) {
-    return keycodec::make_uint64(key);
+    return KeyCodec::make_uint64(key);
 }
 
 class BTreeIntegrationTest : public ::testing::Test {
@@ -40,7 +40,7 @@ class BTreeIntegrationTest : public ::testing::Test {
 
         Value make_small_key_value(std::uint64_t key) {
             char payload = static_cast<char>('A' + (key % 26));
-            return valuecodec::make_char(std::string(1, payload));
+            return ValueCodec::make_char(std::string(1, payload));
         }
 
         void expect_get_value(BTree &tree, std::uint64_t key, const std::string &expected_payload) {
@@ -71,7 +71,7 @@ TEST_F(BTreeIntegrationTest, InsertCommitAndReopenPreservesSingleKey) {
         BTree tree;
         ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
 
-        Value value = valuecodec::make_char("A");
+        Value value = ValueCodec::make_char("A");
         ASSERT_EQ(tree.insert(make_key(7), value), BTreeStatus::Success);
         ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
     }
@@ -86,7 +86,7 @@ TEST_F(BTreeIntegrationTest, OverwriteExistingKeyCommitAndReopenPreservesUpdated
         BTree tree;
         ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
 
-        Value initial_value = valuecodec::make_char("F");
+        Value initial_value = ValueCodec::make_char("F");
         ASSERT_EQ(tree.insert(make_key(11), initial_value), BTreeStatus::Success);
         ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
     }
@@ -95,7 +95,7 @@ TEST_F(BTreeIntegrationTest, OverwriteExistingKeyCommitAndReopenPreservesUpdated
         BTree tree;
         ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
 
-        Value updated_value = valuecodec::make_char("T");
+        Value updated_value = ValueCodec::make_char("T");
         ASSERT_EQ(tree.insert(make_key(11), updated_value), BTreeStatus::Success);
         ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
     }
@@ -109,7 +109,7 @@ TEST_F(BTreeIntegrationTest, RollbackDiscardsUncommittedInsert) {
     BTree tree;
     ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
 
-    Value value = valuecodec::make_char("R");
+    Value value = ValueCodec::make_char("R");
     ASSERT_EQ(tree.insert(make_key(25), value), BTreeStatus::Success);
     ASSERT_EQ(tree.rollback(), BTreeRollbackStatus::Success);
 
@@ -141,8 +141,8 @@ TEST_F(BTreeIntegrationTest, RemoveCommitAndReopenDeletesKey) {
         BTree tree;
         ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
 
-        Value left_value = valuecodec::make_char("L");
-        Value right_value = valuecodec::make_char("R");
+        Value left_value = ValueCodec::make_char("L");
+        Value right_value = ValueCodec::make_char("R");
         ASSERT_EQ(tree.insert(make_key(10), left_value), BTreeStatus::Success);
         ASSERT_EQ(tree.insert(make_key(20), right_value), BTreeStatus::Success);
         ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
@@ -169,7 +169,7 @@ TEST_F(BTreeIntegrationTest, RollbackDiscardsRemove) {
         BTree tree;
         ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
 
-        Value value = valuecodec::make_char("T");
+        Value value = ValueCodec::make_char("T");
         ASSERT_EQ(tree.insert(make_key(55), value), BTreeStatus::Success);
         ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
     }
@@ -224,11 +224,11 @@ TEST_F(BTreeIntegrationTest, ManyDeletesTriggerStructuralRepairAndKeepRemainingK
 
 TEST_F(BTreeIntegrationTest, HeterogeneousKeysRemainDistinctAcrossCommit) {
     std::vector<Key> keys = {
-        keycodec::make_bool(true),
-        keycodec::make_uint64(1),
-        keycodec::make_int64(1),
-        keycodec::make_string("1"),
-        keycodec::make_bytes({'1'})
+        KeyCodec::make_bool(true),
+        KeyCodec::make_uint64(1),
+        KeyCodec::make_int64(1),
+        KeyCodec::make_string("1"),
+        KeyCodec::make_bytes({'1'})
     };
 
     {
@@ -236,7 +236,7 @@ TEST_F(BTreeIntegrationTest, HeterogeneousKeysRemainDistinctAcrossCommit) {
         ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
 
         for (std::size_t i = 0; i < keys.size(); i++) {
-            Value value = valuecodec::make_varuint(i);
+            Value value = ValueCodec::make_varuint(i);
             ASSERT_EQ(tree.insert(keys[i], value), BTreeStatus::Success);
         }
 
@@ -251,7 +251,7 @@ TEST_F(BTreeIntegrationTest, HeterogeneousKeysRemainDistinctAcrossCommit) {
         ASSERT_EQ(get_result.status, BTreeStatus::Success);
 
         std::uint64_t decoded_value = 0;
-        ASSERT_TRUE(valuecodec::decode_varuint(get_result.value, &decoded_value));
+        ASSERT_TRUE(ValueCodec::decode_varuint(get_result.value, &decoded_value));
         EXPECT_EQ(decoded_value, i);
     }
 }

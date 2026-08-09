@@ -79,8 +79,8 @@ KeyStoreCursorResult KeyStoreCursor::current() const {
     }
 
     if (
-        !keycodec::validate_key(storage_result.key) ||
-        !valuecodec::validate_value(storage_result.value)
+        !KeyCodec::validate_key(storage_result.key) ||
+        !ValueCodec::validate_value(storage_result.value)
     ) {
         result.status = KeyStoreCursorStatus::DecodeFailed;
         return result;
@@ -145,7 +145,7 @@ bool KeyStoreCursor::current_key_is_in_bounds(const Key &key) const {
     // Range scans are half-open: the encoded end key is never part of the result.
     if (
         exclusive_end.has_value() &&
-        keycodec::compare(key, *exclusive_end) >= 0
+        KeyCodec::compare(key, *exclusive_end) >= 0
     ) {
         return false;
     }
@@ -277,7 +277,7 @@ KeyStoreGetResult KeyStore::get(const Key &key) {
         return result;
     }
 
-    if (!keycodec::validate_key(key)) {
+    if (!KeyCodec::validate_key(key)) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
@@ -292,7 +292,7 @@ KeyStoreGetResult KeyStore::get(const Key &key) {
         return result;
     }
 
-    if (!valuecodec::validate_value(get_result.value)) {
+    if (!ValueCodec::validate_value(get_result.value)) {
         result.status = KeyStoreStatus::DecodeFailed;
         return result;
     }
@@ -316,8 +316,8 @@ KeyStoreStatus KeyStore::put(
      */
     if (!is_open) return KeyStoreStatus::NotOpen;
 
-    if (!keycodec::validate_key(key)) return KeyStoreStatus::InvalidKey;
-    if (!valuecodec::validate_value(value)) return KeyStoreStatus::InvalidValue;
+    if (!KeyCodec::validate_key(key)) return KeyStoreStatus::InvalidKey;
+    if (!ValueCodec::validate_value(value)) return KeyStoreStatus::InvalidValue;
 
     if (transaction_state == TransactionState::Failed) {
         // A previous storage/commit failure may have left dirty state. No later
@@ -357,7 +357,7 @@ KeyStoreRemoveResult KeyStore::remove(const Key &key) {
         return result;
     }
 
-    if (!keycodec::validate_key(key)) {
+    if (!KeyCodec::validate_key(key)) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
@@ -389,7 +389,7 @@ KeyStoreRemoveResult KeyStore::remove(const Key &key) {
         return result;
     }
 
-    if (!valuecodec::validate_value(remove_result.value)) {
+    if (!ValueCodec::validate_value(remove_result.value)) {
         if (transaction_state == TransactionState::Active) {
             // The BTree mutation already happened in this transaction. Keep the
             // transaction alive but force the caller through rollback.
@@ -560,7 +560,7 @@ KeyStoreScanResult KeyStore::scan_from(const Key &start) {
         return result;
     }
 
-    if (!keycodec::validate_key(start)) {
+    if (!KeyCodec::validate_key(start)) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
@@ -597,11 +597,11 @@ KeyStoreScanResult KeyStore::scan_range(
         return result;
     }
 
-    if (!keycodec::validate_key(start) || !keycodec::validate_key(end)) {
+    if (!KeyCodec::validate_key(start) || !KeyCodec::validate_key(end)) {
         result.status = KeyStoreStatus::InvalidKey;
         return result;
     }
-    if (keycodec::compare(start, end) > 0) {
+    if (KeyCodec::compare(start, end) > 0) {
         result.status = KeyStoreStatus::InvalidRange;
         return result;
     }
@@ -642,7 +642,7 @@ KeyStoreScanResult KeyStore::scan_prefix(const Key &prefix) {
     }
 
     if (
-        !keycodec::validate_key(prefix) ||
+        !KeyCodec::validate_key(prefix) ||
         (prefix.type != KeyType::String && prefix.type != KeyType::Bytes)
     ) {
         result.status = KeyStoreStatus::InvalidKey;

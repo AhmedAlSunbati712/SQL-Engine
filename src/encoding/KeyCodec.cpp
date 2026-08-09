@@ -7,7 +7,7 @@
 #include <cstring>
 #include <type_traits>
 
-namespace keycodec {
+namespace KeyCodec {
 
 namespace {
 
@@ -148,4 +148,4 @@ Key make_bytes(const std::vector<char> &value) {
     return key;
 }
 
-} // namespace keycodec
+} // namespace KeyCodec

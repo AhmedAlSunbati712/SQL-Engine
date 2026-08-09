@@ -162,7 +162,7 @@ BTreeGetStatus BTree::get(const Key &key) {
     // key not in tree
     std::size_t idx = target_leaf.lower_bound_key(key);
     std::optional<Key> key_at_idx = target_leaf.key_at(idx);
-    if (key_at_idx == std::nullopt || !keycodec::equal(*key_at_idx, key)) {
+    if (key_at_idx == std::nullopt || !KeyCodec::equal(*key_at_idx, key)) {
         pager->unref_page(descent_result.leaf_page_num);
         get_result.status = BTreeStatus::KeyNotInTree;
         return get_result;
@@ -264,7 +264,7 @@ BTreeStatus BTree::insert(const Key &key, Value &value) {
     std::optional<Key> key_at_idx = target_leaf.key_at(idx);
 
     // If the key already exists, this insert is really just an overwrite of the stored value.
-    if (key_at_idx != std::nullopt && keycodec::equal(*key_at_idx, key)) {
+    if (key_at_idx != std::nullopt && KeyCodec::equal(*key_at_idx, key)) {
         bool set_result = target_leaf.set(key, value);
         if (!set_result) {
             pager->unref_page(descent_result.leaf_page_num);
@@ -361,7 +361,7 @@ BTreeRemoveStatus BTree::remove(const Key &key) {
     BLeafPage target_leaf_page(descent_result.leaf_page);
     std::uint32_t leaf_page_num = descent_result.leaf_page_num;
     std::size_t key_idx = target_leaf_page.lower_bound_key(key);
-    if (key_idx == target_leaf_page.get_key_count() || !keycodec::equal(*target_leaf_page.key_at(key_idx), key)) {
+    if (key_idx == target_leaf_page.get_key_count() || !KeyCodec::equal(*target_leaf_page.key_at(key_idx), key)) {
         remove_result.status = BTreeStatus::KeyNotInTree;
         pager->unref_page(leaf_page_num);
         return remove_result;
@@ -453,7 +453,7 @@ LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_
             // The target key is greater than all keys in the current node
             target_child_page_num = curr.get_right_child(idx - 1);
             child_dir = ChildDirection::Right;
-        } else if (keycodec::equal(*curr.key_at(idx), key)) { 
+        } else if (KeyCodec::equal(*curr.key_at(idx), key)) {
             // The key at the idx is equal to the target
             target_child_page_num = curr.get_right_child(idx);
             child_dir = ChildDirection::Right;

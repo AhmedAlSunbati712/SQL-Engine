@@ -20,21 +20,21 @@
 namespace {
 
 Key encode_key(const KeyInput &input) {
-    return keycodec::encode(input).value();
+    return KeyCodec::encode(input).value();
 }
 
 Value encode_value(const ValueInput &input) {
-    return valuecodec::encode(input).value();
+    return ValueCodec::encode(input).value();
 }
 
 void expect_key_input(const Key &key, const KeyInput &expected) {
-    std::optional<KeyInput> decoded = keycodec::decode(key);
+    std::optional<KeyInput> decoded = KeyCodec::decode(key);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(*decoded, expected);
 }
 
 void expect_value_input(const Value &value, const ValueInput &expected) {
-    std::optional<ValueInput> decoded = valuecodec::decode(value);
+    std::optional<ValueInput> decoded = ValueCodec::decode(value);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(*decoded, expected);
 }
@@ -131,19 +131,19 @@ TEST_F(KeyStoreIntegrationTest, LifecycleAndRepresentationValidation) {
         'x'
     );
     EXPECT_EQ(
-        store.put(keycodec::make_string(oversized), value),
+        store.put(KeyCodec::make_string(oversized), value),
         KeyStoreStatus::InvalidKey
     );
     EXPECT_EQ(
-        store.put(key, valuecodec::make_char(oversized)),
+        store.put(key, ValueCodec::make_char(oversized)),
         KeyStoreStatus::InvalidValue
     );
     EXPECT_EQ(
-        store.scan_prefix(keycodec::make_string(oversized)).status,
+        store.scan_prefix(KeyCodec::make_string(oversized)).status,
         KeyStoreStatus::InvalidKey
     );
     EXPECT_EQ(
-        store.scan_prefix(keycodec::make_uint64(1)).status,
+        store.scan_prefix(KeyCodec::make_uint64(1)).status,
         KeyStoreStatus::InvalidKey
     );
 

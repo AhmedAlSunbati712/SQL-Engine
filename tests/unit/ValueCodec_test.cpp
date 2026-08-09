@@ -11,14 +11,14 @@
 namespace {
 
 TEST(ValueCodecTest, EqualRequiresSameTypeSizeAndPayload) {
-    Value lhs = valuecodec::make_char("cat");
-    Value rhs = valuecodec::make_char("cat");
-    Value different_type = valuecodec::make_varuint(7);
-    Value different_payload = valuecodec::make_char("dog");
+    Value lhs = ValueCodec::make_char("cat");
+    Value rhs = ValueCodec::make_char("cat");
+    Value different_type = ValueCodec::make_varuint(7);
+    Value different_payload = ValueCodec::make_char("dog");
 
-    EXPECT_EQ(valuecodec::equal(lhs, rhs), true);
-    EXPECT_EQ(valuecodec::equal(lhs, different_type), false);
-    EXPECT_EQ(valuecodec::equal(lhs, different_payload), false);
+    EXPECT_EQ(ValueCodec::equal(lhs, rhs), true);
+    EXPECT_EQ(ValueCodec::equal(lhs, different_type), false);
+    EXPECT_EQ(ValueCodec::equal(lhs, different_payload), false);
 }
 
 TEST(ValueCodecTest, ValidateValueRejectsMalformedShapes) {
@@ -42,22 +42,22 @@ TEST(ValueCodecTest, ValidateValueRejectsMalformedShapes) {
     bad_size.size = 4;
     bad_size.data = {'c', 'a', 't'};
 
-    EXPECT_EQ(valuecodec::validate_value(bad_varuint), false);
-    EXPECT_EQ(valuecodec::validate_value(bad_bool), false);
-    EXPECT_EQ(valuecodec::validate_value(bad_varint), false);
-    EXPECT_EQ(valuecodec::validate_value(bad_size), false);
+    EXPECT_EQ(ValueCodec::validate_value(bad_varuint), false);
+    EXPECT_EQ(ValueCodec::validate_value(bad_bool), false);
+    EXPECT_EQ(ValueCodec::validate_value(bad_varint), false);
+    EXPECT_EQ(ValueCodec::validate_value(bad_size), false);
 }
 
 TEST(ValueCodecTest, ValidateValueAcceptsFactoryOutput) {
-    EXPECT_EQ(valuecodec::validate_value(valuecodec::make_varuint(123)), true);
-    EXPECT_EQ(valuecodec::validate_value(valuecodec::make_varint(-123)), true);
-    EXPECT_EQ(valuecodec::validate_value(valuecodec::make_bool(true)), true);
-    EXPECT_EQ(valuecodec::validate_value(valuecodec::make_char("hello")), true);
+    EXPECT_EQ(ValueCodec::validate_value(ValueCodec::make_varuint(123)), true);
+    EXPECT_EQ(ValueCodec::validate_value(ValueCodec::make_varint(-123)), true);
+    EXPECT_EQ(ValueCodec::validate_value(ValueCodec::make_bool(true)), true);
+    EXPECT_EQ(ValueCodec::validate_value(ValueCodec::make_char("hello")), true);
 }
 
 TEST(ValueCodecTest, BoolFactoryEncodesSingleBytePayload) {
-    Value false_value = valuecodec::make_bool(false);
-    Value true_value = valuecodec::make_bool(true);
+    Value false_value = ValueCodec::make_bool(false);
+    Value true_value = ValueCodec::make_bool(true);
 
     ASSERT_EQ(false_value.type, ValueType::Bool);
     ASSERT_EQ(false_value.size, 1u);
@@ -71,20 +71,20 @@ TEST(ValueCodecTest, BoolFactoryEncodesSingleBytePayload) {
 }
 
 TEST(ValueCodecTest, VarUIntRoundTripsUnsignedIntegers) {
-    Value value = valuecodec::make_varuint(300);
+    Value value = ValueCodec::make_varuint(300);
     std::uint64_t decoded = 0;
 
     ASSERT_EQ(value.type, ValueType::VarUInt);
-    ASSERT_EQ(valuecodec::decode_varuint(value, &decoded), true);
+    ASSERT_EQ(ValueCodec::decode_varuint(value, &decoded), true);
     EXPECT_EQ(decoded, 300u);
 }
 
 TEST(ValueCodecTest, VarIntRoundTripsSignedIntegers) {
-    Value value = valuecodec::make_varint(-300);
+    Value value = ValueCodec::make_varint(-300);
     std::int64_t decoded = 0;
 
     ASSERT_EQ(value.type, ValueType::VarInt);
-    ASSERT_EQ(valuecodec::decode_varint(value, &decoded), true);
+    ASSERT_EQ(ValueCodec::decode_varint(value, &decoded), true);
     EXPECT_EQ(decoded, -300);
 }
 
@@ -97,27 +97,27 @@ TEST(ValueCodecTest, PrimitiveInputsRoundTripThroughCanonicalEncoding) {
     };
 
     for (const ValueInput &input : inputs) {
-        std::optional<Value> encoded = valuecodec::encode(input);
+        std::optional<Value> encoded = ValueCodec::encode(input);
         ASSERT_TRUE(encoded.has_value());
-        EXPECT_TRUE(valuecodec::validate_value(*encoded));
+        EXPECT_TRUE(ValueCodec::validate_value(*encoded));
 
-        std::optional<ValueInput> decoded = valuecodec::decode(*encoded);
+        std::optional<ValueInput> decoded = ValueCodec::decode(*encoded);
         ASSERT_TRUE(decoded.has_value());
         EXPECT_EQ(*decoded, input);
     }
 }
 
 TEST(ValueCodecTest, RejectsOversizedPayloadAndNonCanonicalBool) {
-    const std::string oversized(valuecodec::MAX_PAYLOAD_SIZE + 1, 'x');
-    EXPECT_FALSE(valuecodec::encode(ValueInput{oversized}).has_value());
-    EXPECT_FALSE(valuecodec::validate_value(valuecodec::make_char(oversized)));
+    const std::string oversized(ValueCodec::MAX_PAYLOAD_SIZE + 1, 'x');
+    EXPECT_FALSE(ValueCodec::encode(ValueInput{oversized}).has_value());
+    EXPECT_FALSE(ValueCodec::validate_value(ValueCodec::make_char(oversized)));
 
     Value malformed_bool{};
     malformed_bool.type = ValueType::Bool;
     malformed_bool.size = 1;
     malformed_bool.data = {'x'};
-    EXPECT_FALSE(valuecodec::validate_value(malformed_bool));
-    EXPECT_FALSE(valuecodec::decode(malformed_bool).has_value());
+    EXPECT_FALSE(ValueCodec::validate_value(malformed_bool));
+    EXPECT_FALSE(ValueCodec::decode(malformed_bool).has_value());
 }
 
 } // namespace

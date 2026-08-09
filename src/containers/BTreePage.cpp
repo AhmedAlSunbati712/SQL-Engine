@@ -24,7 +24,7 @@ std::uint16_t leaf_cell_size(const Key &key, const Value &value) {
 }
 
 void write_key_bytes(char *out, const Key &key) {
-    if (!keycodec::validate_key(key)) std::abort(); // TODO: replace with something appropriate
+    if (!KeyCodec::validate_key(key)) std::abort(); // TODO: replace with something appropriate
     if (key.size > UINT16_MAX) std::abort(); // TODO: replace with something appropriate
 
     put_u8_be(out, static_cast<std::uint8_t>(key.type));
@@ -40,7 +40,7 @@ void parse_key_bytes(const char *in, Key *key) {
     key->size = get_u16_be(&in[1]);
     key->data.assign(&in[3], &in[3] + key->size);
 
-    if (!keycodec::validate_key(*key)) std::abort(); // TODO: replace with something appropriate
+    if (!KeyCodec::validate_key(*key)) std::abort(); // TODO: replace with something appropriate
 }
 
 } // namespace
@@ -67,7 +67,7 @@ std::size_t BTreePage::lower_bound_key(const Key &key) const {
 
     while (left < right) {
         std::size_t mid = left + (right - left) / 2;
-        if (keycodec::compare(keys[mid], key) < 0) {
+        if (KeyCodec::compare(keys[mid], key) < 0) {
             left = mid + 1;
         } else {
             right = mid;
@@ -181,7 +181,7 @@ void BInternalPage::write_back() {
 
 bool BInternalPage::insert_separator_at(std::size_t idx, const Key &key, std::uint32_t right_child_page_num) {
     if (idx > keys.size()) return false;
-    if (!keycodec::validate_key(key)) return false;
+    if (!KeyCodec::validate_key(key)) return false;
     if (child_page_nums.size() != keys.size() + 1) return false;
 
     keys.insert(keys.begin() + idx, key);
@@ -202,7 +202,7 @@ bool BInternalPage::remove_separator_at(std::size_t idx) {
 
 bool BInternalPage::set_separator_key_at(std::size_t idx, const Key &key) {
     if (idx >= keys.size()) return false;
-    if (!keycodec::validate_key(key)) return false;
+    if (!KeyCodec::validate_key(key)) return false;
     keys[idx] = key;
     return true;
 }
@@ -239,7 +239,7 @@ std::optional<std::uint32_t> BInternalPage::get_right_child(std::size_t separato
 bool BInternalPage::remove(const Key &key) {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return false;
-    if (!keycodec::equal(keys[idx], key)) return false;
+    if (!KeyCodec::equal(keys[idx], key)) return false;
     return remove_separator_at(idx);
 }
 
@@ -388,14 +388,14 @@ std::optional<Value> BLeafPage::get_at(std::size_t idx) const {
 std::optional<Value> BLeafPage::get(const Key &key) const {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return std::nullopt;
-    if (!keycodec::equal(keys[idx], key)) return std::nullopt;
+    if (!KeyCodec::equal(keys[idx], key)) return std::nullopt;
     return values[idx];
 }
 
 bool BLeafPage::insert_at(std::size_t idx, const Key &key, const Value &value) {
     if (idx > keys.size()) return false;
-    if (!keycodec::validate_key(key)) return false;
-    if (!valuecodec::validate_value(value)) return false;
+    if (!KeyCodec::validate_key(key)) return false;
+    if (!ValueCodec::validate_value(value)) return false;
 
     keys.insert(keys.begin() + idx, key);
     values.insert(values.begin() + idx, value);
@@ -416,8 +416,8 @@ bool BLeafPage::remove_at(std::size_t idx) {
 bool BLeafPage::set(const Key &key, const Value &value) {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return false;
-    if (!keycodec::equal(keys[idx], key)) return false;
-    if (!valuecodec::validate_value(value)) return false;
+    if (!KeyCodec::equal(keys[idx], key)) return false;
+    if (!ValueCodec::validate_value(value)) return false;
 
     values[idx] = value;
     return true;
@@ -426,7 +426,7 @@ bool BLeafPage::set(const Key &key, const Value &value) {
 bool BLeafPage::remove(const Key &key) {
     std::size_t idx = lower_bound_key(key);
     if (idx >= keys.size()) return false;
-    if (!keycodec::equal(keys[idx], key)) return false;
+    if (!KeyCodec::equal(keys[idx], key)) return false;
     return remove_at(idx);
 }
 
@@ -460,7 +460,7 @@ void BLeafPage::flush() {
         // Leaf cell format: type tag, key payload size, encoded key bytes, then
         // the value type, value size, and value bytes.
         // Validate first so we never persist a malformed typed value into the page.
-        if (!valuecodec::validate_value(values[i])) std::abort(); // TODO: replace with something appropriate
+        if (!ValueCodec::validate_value(values[i])) std::abort(); // TODO: replace with something appropriate
         write_key_bytes(&page[cell_ptr], keys[i]);
         put_u8_be(&page[cell_ptr + 3 + keys[i].size], static_cast<std::uint8_t>(values[i].type));
         put_u16_be(&page[cell_ptr + 4 + keys[i].size], static_cast<std::uint16_t>(values[i].size));
@@ -486,7 +486,7 @@ void BLeafPage::parse_leaf_cell(const char *in, Key *key, Value *value) {
 
     // The raw bytes are now loaded. Make sure they actually match the rules
     // of the declared value type before we let the caller observe them.
-    if (!valuecodec::validate_value(*value)) std::abort(); // TODO: replace with something appropriate
+    if (!ValueCodec::validate_value(*value)) std::abort(); // TODO: replace with something appropriate
 }
 
 void BLeafPage::fill_initial_layout(char *out) {

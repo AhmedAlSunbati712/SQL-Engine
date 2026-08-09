@@ -42,17 +42,17 @@ void write_leaf_cell(char *page, std::uint16_t cell_offset, const Key &key, Valu
 void build_leaf_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &expected_keys) {
     page.fill(0);
     Value false_char = make_value(ValueType::Char, "F");
-    Value true_bool = valuecodec::make_bool(true);
-    Value negative_int = valuecodec::make_varint(-5);
+    Value true_bool = ValueCodec::make_bool(true);
+    Value negative_int = ValueCodec::make_varint(-5);
     Value cat_value = make_value(ValueType::Char, "CAT");
     Value bytes_value = make_value(ValueType::Char, "BYTES");
 
     expected_keys = {
-        keycodec::make_bool(false),
-        keycodec::make_uint64(10),
-        keycodec::make_int64(-5),
-        keycodec::make_string("cat"),
-        keycodec::make_bytes(std::vector<char>{'z', '1'})
+        KeyCodec::make_bool(false),
+        KeyCodec::make_uint64(10),
+        KeyCodec::make_int64(-5),
+        KeyCodec::make_string("cat"),
+        KeyCodec::make_bytes(std::vector<char>{'z', '1'})
     };
 
     put_u8_be(page.data(), static_cast<std::uint8_t>(PageType::Leaf));
@@ -82,9 +82,9 @@ void build_internal_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &ex
     page.fill(0);
 
     expected_keys = {
-        keycodec::make_bool(false),
-        keycodec::make_uint64(10),
-        keycodec::make_string("cat")
+        KeyCodec::make_bool(false),
+        KeyCodec::make_uint64(10),
+        KeyCodec::make_string("cat")
     };
 
     put_u8_be(page.data(), static_cast<std::uint8_t>(PageType::Internal));
@@ -105,7 +105,7 @@ void build_internal_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &ex
 void expect_key_equals(const Key &actual, const Key &expected) {
     EXPECT_EQ(actual.type, expected.type);
     EXPECT_EQ(actual.size, expected.size);
-    EXPECT_EQ(keycodec::equal(actual, expected), true);
+    EXPECT_EQ(KeyCodec::equal(actual, expected), true);
 }
 
 TEST(BTreePageTest, FillInitialLayoutCreatesEmptyLeafPage) {
@@ -179,14 +179,14 @@ TEST(BTreePageTest, LowerBoundKeyReturnsExpectedInsertionPointsAcrossTypes) {
 
     BLeafPage leaf_page(page.data());
 
-    EXPECT_EQ(leaf_page.lower_bound_key(keycodec::make_bool(false)), 0u);
-    EXPECT_EQ(leaf_page.lower_bound_key(keycodec::make_bool(true)), 1u);
-    EXPECT_EQ(leaf_page.lower_bound_key(keycodec::make_uint64(5)), 1u);
-    EXPECT_EQ(leaf_page.lower_bound_key(keycodec::make_uint64(10)), 1u);
-    EXPECT_EQ(leaf_page.lower_bound_key(keycodec::make_int64(-6)), 2u);
-    EXPECT_EQ(leaf_page.lower_bound_key(keycodec::make_string("dog")), 4u);
-    EXPECT_EQ(leaf_page.lower_bound_key(keycodec::make_bytes(std::vector<char>{'a'})), 4u);
-    EXPECT_EQ(leaf_page.lower_bound_key(keycodec::make_bytes(std::vector<char>{'z', '9'})), 5u);
+    EXPECT_EQ(leaf_page.lower_bound_key(KeyCodec::make_bool(false)), 0u);
+    EXPECT_EQ(leaf_page.lower_bound_key(KeyCodec::make_bool(true)), 1u);
+    EXPECT_EQ(leaf_page.lower_bound_key(KeyCodec::make_uint64(5)), 1u);
+    EXPECT_EQ(leaf_page.lower_bound_key(KeyCodec::make_uint64(10)), 1u);
+    EXPECT_EQ(leaf_page.lower_bound_key(KeyCodec::make_int64(-6)), 2u);
+    EXPECT_EQ(leaf_page.lower_bound_key(KeyCodec::make_string("dog")), 4u);
+    EXPECT_EQ(leaf_page.lower_bound_key(KeyCodec::make_bytes(std::vector<char>{'a'})), 4u);
+    EXPECT_EQ(leaf_page.lower_bound_key(KeyCodec::make_bytes(std::vector<char>{'z', '9'})), 5u);
 }
 
 TEST(BTreePageTest, InternalChildrenAreReturnedRelativeToSeparators) {
@@ -217,14 +217,14 @@ TEST(BTreePageTest, LeafInsertSetAndRemoveMutateLogicalState) {
     BLeafPage::fill_initial_layout(page.data());
     BLeafPage leaf_page(page.data());
 
-    Key key_false = keycodec::make_bool(false);
-    Key key_uint = keycodec::make_uint64(20);
-    Key key_string = keycodec::make_string("cat");
+    Key key_false = KeyCodec::make_bool(false);
+    Key key_uint = KeyCodec::make_uint64(20);
+    Key key_string = KeyCodec::make_string("cat");
 
     EXPECT_EQ(leaf_page.insert_at(0, key_string, make_value(ValueType::Char, "C")), true);
-    EXPECT_EQ(leaf_page.insert_at(0, key_false, valuecodec::make_bool(false)), true);
-    EXPECT_EQ(leaf_page.insert_at(1, key_uint, valuecodec::make_varuint(20)), true);
-    EXPECT_EQ(leaf_page.insert_at(9, keycodec::make_bytes(std::vector<char>{'z'}), make_value(ValueType::Char, "Z")), false);
+    EXPECT_EQ(leaf_page.insert_at(0, key_false, ValueCodec::make_bool(false)), true);
+    EXPECT_EQ(leaf_page.insert_at(1, key_uint, ValueCodec::make_varuint(20)), true);
+    EXPECT_EQ(leaf_page.insert_at(9, KeyCodec::make_bytes(std::vector<char>{'z'}), make_value(ValueType::Char, "Z")), false);
 
     ASSERT_TRUE(leaf_page.key_at(0).has_value());
     expect_key_equals(*leaf_page.key_at(0), key_false);
@@ -233,11 +233,11 @@ TEST(BTreePageTest, LeafInsertSetAndRemoveMutateLogicalState) {
     ASSERT_TRUE(leaf_page.key_at(2).has_value());
     expect_key_equals(*leaf_page.key_at(2), key_string);
 
-    EXPECT_EQ(leaf_page.set(key_uint, valuecodec::make_bool(true)), true);
+    EXPECT_EQ(leaf_page.set(key_uint, ValueCodec::make_bool(true)), true);
     std::optional<Value> updated_value = leaf_page.get(key_uint);
     ASSERT_TRUE(updated_value.has_value());
     EXPECT_EQ(updated_value->data[0], '\1');
-    EXPECT_EQ(leaf_page.set(keycodec::make_uint64(99), make_value(ValueType::Char, "X")), false);
+    EXPECT_EQ(leaf_page.set(KeyCodec::make_uint64(99), make_value(ValueType::Char, "X")), false);
 
     EXPECT_EQ(leaf_page.remove_at(1), true);
     EXPECT_EQ(leaf_page.remove(key_string), true);
@@ -254,9 +254,9 @@ TEST(BTreePageTest, InternalMutatorsUpdateKeysAndChildren) {
     BInternalPage::fill_initial_layout(page.data());
     BInternalPage internal_page(page.data());
 
-    Key key_false = keycodec::make_bool(false);
-    Key key_uint = keycodec::make_uint64(20);
-    Key key_string = keycodec::make_string("cat");
+    Key key_false = KeyCodec::make_bool(false);
+    Key key_uint = KeyCodec::make_uint64(20);
+    Key key_string = KeyCodec::make_string("cat");
 
     EXPECT_EQ(internal_page.set_leftmost_child(11), false);
     EXPECT_EQ(internal_page.replace_leftmost_child(77), true);
@@ -266,7 +266,7 @@ TEST(BTreePageTest, InternalMutatorsUpdateKeysAndChildren) {
     EXPECT_EQ(internal_page.insert_separator_at(0, key_false, 22), true);
     EXPECT_EQ(internal_page.insert_separator_at(1, key_string, 44), true);
     EXPECT_EQ(internal_page.insert_separator_at(1, key_uint, 33), true);
-    EXPECT_EQ(internal_page.insert_separator_at(9, keycodec::make_bytes(std::vector<char>{'z'}), 55), false);
+    EXPECT_EQ(internal_page.insert_separator_at(9, KeyCodec::make_bytes(std::vector<char>{'z'}), 55), false);
 
     EXPECT_EQ(internal_page.get_key_count(), 3u);
     ASSERT_TRUE(internal_page.key_at(0).has_value());
@@ -276,7 +276,7 @@ TEST(BTreePageTest, InternalMutatorsUpdateKeysAndChildren) {
     ASSERT_TRUE(internal_page.key_at(2).has_value());
     expect_key_equals(*internal_page.key_at(2), key_string);
 
-    Key replacement_key = keycodec::make_string("cow");
+    Key replacement_key = KeyCodec::make_string("cow");
     EXPECT_EQ(internal_page.set_separator_key_at(2, replacement_key), true);
     ASSERT_TRUE(internal_page.key_at(2).has_value());
     expect_key_equals(*internal_page.key_at(2), replacement_key);
@@ -298,16 +298,16 @@ TEST(BTreePageTest, LeafWriteBackRoundTripsIntoFreshObject) {
     std::array<char, PAGE_SIZE> page{};
     BLeafPage::fill_initial_layout(page.data());
 
-    Key key_false = keycodec::make_bool(false);
-    Key key_uint = keycodec::make_uint64(20);
-    Key key_string = keycodec::make_string("cat");
+    Key key_false = KeyCodec::make_bool(false);
+    Key key_uint = KeyCodec::make_uint64(20);
+    Key key_string = KeyCodec::make_string("cat");
 
     {
         BLeafPage leaf_page(page.data());
         ASSERT_EQ(leaf_page.insert_at(0, key_false, make_value(ValueType::Char, "A")), true);
-        ASSERT_EQ(leaf_page.insert_at(1, key_uint, valuecodec::make_bool(false)), true);
-        ASSERT_EQ(leaf_page.insert_at(2, key_string, valuecodec::make_varint(123456)), true);
-        ASSERT_EQ(leaf_page.set(key_uint, valuecodec::make_bool(true)), true);
+        ASSERT_EQ(leaf_page.insert_at(1, key_uint, ValueCodec::make_bool(false)), true);
+        ASSERT_EQ(leaf_page.insert_at(2, key_string, ValueCodec::make_varint(123456)), true);
+        ASSERT_EQ(leaf_page.set(key_uint, ValueCodec::make_bool(true)), true);
         leaf_page.write_back();
     }
 
@@ -334,7 +334,7 @@ TEST(BTreePageTest, LeafWriteBackRoundTripsIntoFreshObject) {
     ASSERT_TRUE(last_value.has_value());
     EXPECT_EQ(last_value->type, ValueType::VarInt);
     std::int64_t decoded_last_value = 0;
-    ASSERT_EQ(valuecodec::decode_varint(*last_value, &decoded_last_value), true);
+    ASSERT_EQ(ValueCodec::decode_varint(*last_value, &decoded_last_value), true);
     EXPECT_EQ(decoded_last_value, 123456);
 }
 
@@ -342,9 +342,9 @@ TEST(BTreePageTest, InternalWriteBackRoundTripsIntoFreshObject) {
     std::array<char, PAGE_SIZE> page{};
     BInternalPage::fill_initial_layout(page.data());
 
-    Key key_false = keycodec::make_bool(false);
-    Key key_uint = keycodec::make_uint64(20);
-    Key key_string = keycodec::make_string("cat");
+    Key key_false = KeyCodec::make_bool(false);
+    Key key_uint = KeyCodec::make_uint64(20);
+    Key key_string = KeyCodec::make_string("cat");
 
     {
         BInternalPage internal_page(page.data());
@@ -352,7 +352,7 @@ TEST(BTreePageTest, InternalWriteBackRoundTripsIntoFreshObject) {
         ASSERT_EQ(internal_page.insert_separator_at(0, key_false, 22), true);
         ASSERT_EQ(internal_page.insert_separator_at(1, key_uint, 33), true);
         ASSERT_EQ(internal_page.insert_separator_at(2, key_string, 44), true);
-        ASSERT_EQ(internal_page.set_separator_key_at(1, keycodec::make_uint64(25)), true);
+        ASSERT_EQ(internal_page.set_separator_key_at(1, KeyCodec::make_uint64(25)), true);
         internal_page.write_back();
     }
 
@@ -363,7 +363,7 @@ TEST(BTreePageTest, InternalWriteBackRoundTripsIntoFreshObject) {
     ASSERT_TRUE(decoded.key_at(0).has_value());
     expect_key_equals(*decoded.key_at(0), key_false);
     ASSERT_TRUE(decoded.key_at(1).has_value());
-    expect_key_equals(*decoded.key_at(1), keycodec::make_uint64(25));
+    expect_key_equals(*decoded.key_at(1), KeyCodec::make_uint64(25));
     ASSERT_TRUE(decoded.key_at(2).has_value());
     expect_key_equals(*decoded.key_at(2), key_string);
     ASSERT_TRUE(decoded.get_right_child(0).has_value());
