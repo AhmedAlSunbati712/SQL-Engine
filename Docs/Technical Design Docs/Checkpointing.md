@@ -1,0 +1,21 @@
+# Checkpointing
+Checkpointing is needed to be able to truncate log files and also so as not to have the database recover from a long history of logs on restarts. There are two types of checkpointing:
+- Regular Checkpointing: Which, as you can tell by its name, happens regularly. It wakes up at fixed intervals, checks the LSN of the last checkpoint, and starts redoing committed records to disk. One thing to consider is how to prevent it from redoing records of transactions that are still in-flight? If we are appending records instead of batching at a commit, then there's a risk of persisting the after-image of a record before its transaction is committed. If we do batching, and only flush at commit, we risk that a dirty flush might happen due to cache overflow and in that case we must ensure its log record exists on disk, otherwise we are screwed. But this reintroduces the same problem again. With batched writes we can temporarily expand the cache until the transaction is over. However, what should we do about the other case where we append each record at once? Eitherway, after this the checkpointer will append a record in a .checkpoint file that records the last LSN it checkpointed so the next checkpointer run picks up from after it.
+- Recovery Checkpointing: If the database crashes, this one will run. The server will start a recovery process and refuse to accept any connections as long as the recovery is happening. it will do the same thing as before exactly.
+These two don't have to be two different interfaces. it could be the same checkpointer and for normal regular checkpointing it's just a background thread that wakes up every n seconds, calls Checkpointer.checkpoint() and sleeps. For the recovery, the database also calls the same one Checkpointer.checkpoint...etc
+Now, the checkpoint file itself could get too big. If LSNs are 8 bytes, we would need 12,500,000 LSNs before we reach 100MB of a checkpoint file. I'm only assuming that each entry will be 8 bytes but there could be some other metadata which could make this number smaller. Nevertheless, for now, we will just let the checkpointer file grow unbounded
+# Crash-tolerance
+The checkpointer will persist the new checkpoint LSN only once the recovery/checkpoint has persisted on disk. That's it. That's our crash-tolerance mechanism
+# Concurrency
+Now, the checkpoitner and transaction fight for concurrency on the database. My belief however is that we only need page latches as we are redoing/undoing pages. But let's actually walk through the different cases for an log record for a committed transaction:
+- Case 1, the page was flushed to disk at some point due to cache overflow. In that case, the redo is redundant. Do we need a write latch on the page? I'm not entirely sure. we possibly could?
+- Case 2, the page is still sitting in the buffer pool dirty. In that case the redo is not redudnat but we also need to mark the page as not dirty in the buffer pool
+# When to redo?
+Only redo when the DB page's persisted LSN is smaller than the record LSN
+# Handling double modifications in the same transaction for undoing
+Let's say we write to a page X. Then we have a record that has its before-image X and its after-image X_m. What if we do another write? what should the record be? X_m and X_mm? If we are walking serially from the first record to the second, then we risk redoing with X_m but that's inconsistent. I guess we can keep a hashset to track the page numbers we have undone in the current transaction so as not to do double undoing.
+# Log structure
+Each log consists of a segment. Each segment consists of an index and a store. Each entry in the store consists of the size of the entry + the entry itself.
+Each entry in the index consists of the relative LSN (from the start of the segment) and the offset in the corresponding segment. This is relative LSN. the absolute LSN is the base_offset (identified by the file) + the relative LSN.
+Each of the index and hte store have a size limit and we rollover to a new segment once eithr of them is reached
+The log will be an abstraction over these. It will hold the dir where the log lives and will hold an array of segment that currently exist and the currently active segment.
