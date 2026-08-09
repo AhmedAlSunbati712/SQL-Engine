@@ -67,7 +67,7 @@ INTEGRATION_TEST_BIN := $(patsubst tests/integration/%.cpp,build/tests/integrati
 
 SERVER_SRC = \
         src/server/server.cpp \
-        src/API/Message.cpp
+        src/server/CommandServer.cpp
 SERVER_OBJ = $(patsubst src/%.cpp,build/%.o,$(SERVER_SRC))
 SERVER_BIN = build/stoneleaf-server
 
@@ -83,7 +83,7 @@ $(LIB): $(OBJ)
 server: $(SERVER_BIN)
 
 $(SERVER_BIN): CXXFLAGS += -pthread
-$(SERVER_BIN): $(SERVER_OBJ)
+$(SERVER_BIN): $(SERVER_OBJ) $(LIB)
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
@@ -94,6 +94,10 @@ build/%.o: src/%.cpp
 build/tests/integration/%.o: tests/integration/%.cpp
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+build/tests/integration/CommandServer_test: build/tests/integration/CommandServer_test.o build/server/CommandServer.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) -pthread
 
 build/tests/integration/%: build/tests/integration/%.o $(LIB)
 	mkdir -p $(dir $@)
