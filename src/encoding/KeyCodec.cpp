@@ -3,9 +3,11 @@
 #include <Endian.h>
 
 #include <array>
+#include <bit>
 #include <cstring>
+#include <type_traits>
 
-namespace keycodec {
+namespace KeyCodec {
 
 namespace {
 
@@ -25,6 +27,51 @@ std::int32_t compare_bytes(const std::vector<char> &lhs, const std::vector<char>
 
 } // namespace
 
+std::optional<Key> encode(const KeyInput &input) {
+    return std::visit(
+        [](const auto &value) -> std::optional<Key> {
+            using T = std::decay_t<decltype(value)>;
+
+            if constexpr (std::is_same_v<T, bool>) {
+                return make_bool(value);
+            } else if constexpr (std::is_same_v<T, std::uint64_t>) {
+                return make_uint64(value);
+            } else if constexpr (std::is_same_v<T, std::int64_t>) {
+                return make_int64(value);
+            } else if constexpr (std::is_same_v<T, std::string>) {
+                if (value.size() > MAX_PAYLOAD_SIZE) return std::nullopt;
+                return make_string(value);
+            } else {
+                if (value.size() > MAX_PAYLOAD_SIZE) return std::nullopt;
+                return make_bytes(value);
+            }
+        },
+        input
+    );
+}
+
+std::optional<KeyInput> decode(const Key &key) {
+    if (!validate_key(key)) return std::nullopt;
+
+    switch (key.type) {
+        case KeyType::Bool:
+            return KeyInput{key.data[0] == '\1'};
+        case KeyType::UInt64:
+            return KeyInput{get_u64_be(key.data.data())};
+        case KeyType::Int64: {
+            const std::uint64_t encoded = get_u64_be(key.data.data());
+            const std::uint64_t raw = encoded ^ (1ULL << 63);
+            return KeyInput{std::bit_cast<std::int64_t>(raw)};
+        }
+        case KeyType::String:
+            return KeyInput{std::string(key.data.begin(), key.data.end())};
+        case KeyType::Bytes:
+            return KeyInput{key.data};
+    }
+
+    return std::nullopt;
+}
+
 std::int32_t compare(const Key &lhs, const Key &rhs) {
     if (lhs.type != rhs.type) {
         return (static_cast<std::uint8_t>(lhs.type) < static_cast<std::uint8_t>(rhs.type)) ? -1 : 1;
@@ -39,6 +86,7 @@ bool equal(const Key &lhs, const Key &rhs) {
 
 bool validate_key(const Key &key) {
     if (key.size != key.data.size()) return false;
+    if (key.size > MAX_PAYLOAD_SIZE) return false;
 
     switch (key.type) {
         case KeyType::Bool:
@@ -100,4 +148,4 @@ Key make_bytes(const std::vector<char> &value) {
     return key;
 }
 
-} // namespace keycodec
+} // namespace KeyCodec

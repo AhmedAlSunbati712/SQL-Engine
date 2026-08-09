@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <KeyCodec.h>
 #include <KeyStore.h>
+#include <ValueCodec.h>
 
 #include <chrono>
 #include <cstdint>
@@ -16,6 +18,26 @@
 #include <unistd.h>
 
 namespace {
+
+Key encode_key(const KeyInput &input) {
+    return KeyCodec::encode(input).value();
+}
+
+Value encode_value(const ValueInput &input) {
+    return ValueCodec::encode(input).value();
+}
+
+void expect_key_input(const Key &key, const KeyInput &expected) {
+    std::optional<KeyInput> decoded = KeyCodec::decode(key);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(*decoded, expected);
+}
+
+void expect_value_input(const Value &value, const ValueInput &expected) {
+    std::optional<ValueInput> decoded = ValueCodec::decode(value);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(*decoded, expected);
+}
 
 std::vector<KeyStoreEntry> drain_cursor(KeyStoreCursor &cursor) {
     std::vector<KeyStoreEntry> entries;
@@ -67,14 +89,14 @@ class KeyStoreIntegrationTest : public ::testing::Test {
             const KeyInput &key,
             const ValueInput &expected
         ) {
-            KeyStoreGetResult result = store.get(key);
+            KeyStoreGetResult result = store.get(encode_key(key));
             ASSERT_EQ(result.status, KeyStoreStatus::Success);
             ASSERT_TRUE(result.value.has_value());
-            EXPECT_EQ(*result.value, expected);
+            expect_value_input(*result.value, expected);
         }
 
         void expect_missing(KeyStore &store, const KeyInput &key) {
-            KeyStoreGetResult result = store.get(key);
+            KeyStoreGetResult result = store.get(encode_key(key));
             EXPECT_EQ(result.status, KeyStoreStatus::KeyNotFound);
             EXPECT_FALSE(result.value.has_value());
         }
@@ -85,8 +107,8 @@ class KeyStoreIntegrationTest : public ::testing::Test {
 
 TEST_F(KeyStoreIntegrationTest, LifecycleAndRepresentationValidation) {
     KeyStore store;
-    const KeyInput key = std::uint64_t{1};
-    const ValueInput value = std::string{"value"};
+    const Key key = encode_key(KeyInput{std::uint64_t{1}});
+    const Value value = encode_value(ValueInput{std::string{"value"}});
 
     EXPECT_EQ(store.get(key).status, KeyStoreStatus::NotOpen);
     EXPECT_EQ(store.put(key, value), KeyStoreStatus::NotOpen);
@@ -109,17 +131,27 @@ TEST_F(KeyStoreIntegrationTest, LifecycleAndRepresentationValidation) {
         'x'
     );
     EXPECT_EQ(
-        store.put(KeyInput{oversized}, value),
+        store.put(KeyCodec::make_string(oversized), value),
         KeyStoreStatus::InvalidKey
     );
     EXPECT_EQ(
-        store.put(key, ValueInput{oversized}),
+        store.put(key, ValueCodec::make_char(oversized)),
         KeyStoreStatus::InvalidValue
     );
     EXPECT_EQ(
-        store.scan_prefix(KeyPrefix{oversized}).status,
+        store.scan_prefix(KeyCodec::make_string(oversized)).status,
         KeyStoreStatus::InvalidKey
     );
+    EXPECT_EQ(
+        store.scan_prefix(KeyCodec::make_uint64(1)).status,
+        KeyStoreStatus::InvalidKey
+    );
+
+    Value malformed_bool{};
+    malformed_bool.type = ValueType::Bool;
+    malformed_bool.size = 1;
+    malformed_bool.data = {'x'};
+    EXPECT_EQ(store.put(key, malformed_bool), KeyStoreStatus::InvalidValue);
 
     EXPECT_EQ(store.close(), KeyStoreStatus::Success);
     EXPECT_EQ(store.close(), KeyStoreStatus::Success);
@@ -150,7 +182,10 @@ TEST_F(KeyStoreIntegrationTest, TypedValuesRoundTripAndRemoveAcrossReopen) {
         KeyStore store;
         ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
         for (const auto &[key, value] : entries) {
-            ASSERT_EQ(store.put(key, value), KeyStoreStatus::Success);
+            ASSERT_EQ(
+                store.put(encode_key(key), encode_value(value)),
+                KeyStoreStatus::Success
+            );
         }
         ASSERT_EQ(store.close(), KeyStoreStatus::Success);
     }
@@ -164,15 +199,15 @@ TEST_F(KeyStoreIntegrationTest, TypedValuesRoundTripAndRemoveAcrossReopen) {
 
         const ValueInput replacement = std::string{"replacement"};
         ASSERT_EQ(
-            store.put(entries[0].first, replacement),
+            store.put(encode_key(entries[0].first), encode_value(replacement)),
             KeyStoreStatus::Success
         );
         expect_value(store, entries[0].first, replacement);
 
-        KeyStoreRemoveResult removed = store.remove(entries[3].first);
+        KeyStoreRemoveResult removed = store.remove(encode_key(entries[3].first));
         ASSERT_EQ(removed.status, KeyStoreStatus::Success);
         ASSERT_TRUE(removed.value.has_value());
-        EXPECT_EQ(*removed.value, entries[3].second);
+        expect_value_input(*removed.value, entries[3].second);
         expect_missing(store, entries[3].first);
         ASSERT_EQ(store.close(), KeyStoreStatus::Success);
     }
@@ -189,10 +224,10 @@ TEST_F(KeyStoreIntegrationTest, ExplicitPolicyCommitsAndRollsBack) {
     });
     ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
 
-    const KeyInput first_key = std::uint64_t{10};
-    const KeyInput second_key = std::uint64_t{20};
+    const Key first_key = encode_key(KeyInput{std::uint64_t{10}});
+    const Key second_key = encode_key(KeyInput{std::uint64_t{20}});
     EXPECT_EQ(
-        store.put(first_key, ValueInput{std::string{"first"}}),
+        store.put(first_key, encode_value(ValueInput{std::string{"first"}})),
         KeyStoreStatus::NoActiveTransaction
     );
     EXPECT_EQ(
@@ -212,14 +247,14 @@ TEST_F(KeyStoreIntegrationTest, ExplicitPolicyCommitsAndRollsBack) {
 
     ASSERT_EQ(store.begin_write_transaction(), KeyStoreStatus::Success);
     ASSERT_EQ(
-        store.put(first_key, ValueInput{std::string{"first"}}),
+        store.put(first_key, encode_value(ValueInput{std::string{"first"}})),
         KeyStoreStatus::Success
     );
     ASSERT_EQ(
-        store.put(second_key, ValueInput{std::string{"second"}}),
+        store.put(second_key, encode_value(ValueInput{std::string{"second"}})),
         KeyStoreStatus::Success
     );
-    expect_value(store, first_key, ValueInput{std::string{"first"}});
+    expect_value(store, KeyInput{std::uint64_t{10}}, ValueInput{std::string{"first"}});
     EXPECT_EQ(store.close(), KeyStoreStatus::WriteTransactionActive);
     ASSERT_EQ(store.commit(), KeyStoreStatus::Success);
     EXPECT_FALSE(store.write_transaction_active());
@@ -228,28 +263,28 @@ TEST_F(KeyStoreIntegrationTest, ExplicitPolicyCommitsAndRollsBack) {
     KeyStoreRemoveResult removed = store.remove(first_key);
     ASSERT_EQ(removed.status, KeyStoreStatus::Success);
     ASSERT_TRUE(removed.value.has_value());
-    EXPECT_EQ(*removed.value, ValueInput{std::string{"first"}});
-    expect_missing(store, first_key);
+    expect_value_input(*removed.value, ValueInput{std::string{"first"}});
+    expect_missing(store, KeyInput{std::uint64_t{10}});
     ASSERT_EQ(store.rollback(), KeyStoreStatus::Success);
-    expect_value(store, first_key, ValueInput{std::string{"first"}});
+    expect_value(store, KeyInput{std::uint64_t{10}}, ValueInput{std::string{"first"}});
 
     ASSERT_EQ(store.close(), KeyStoreStatus::Success);
 
     KeyStore reopened;
     ASSERT_EQ(reopened.open(db_path.string()), KeyStoreStatus::Success);
-    expect_value(reopened, first_key, ValueInput{std::string{"first"}});
-    expect_value(reopened, second_key, ValueInput{std::string{"second"}});
+    expect_value(reopened, KeyInput{std::uint64_t{10}}, ValueInput{std::string{"first"}});
+    expect_value(reopened, KeyInput{std::uint64_t{20}}, ValueInput{std::string{"second"}});
 }
 
 TEST_F(KeyStoreIntegrationTest, DestructorRollsBackUnresolvedTransaction) {
-    const KeyInput key = std::uint64_t{77};
+    const Key key = encode_key(KeyInput{std::uint64_t{77}});
 
     {
         KeyStore store;
         ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
         ASSERT_EQ(store.begin_write_transaction(), KeyStoreStatus::Success);
         ASSERT_EQ(
-            store.put(key, ValueInput{std::string{"temporary"}}),
+            store.put(key, encode_value(ValueInput{std::string{"temporary"}})),
             KeyStoreStatus::Success
         );
         EXPECT_EQ(store.close(), KeyStoreStatus::WriteTransactionActive);
@@ -257,7 +292,7 @@ TEST_F(KeyStoreIntegrationTest, DestructorRollsBackUnresolvedTransaction) {
 
     KeyStore reopened;
     ASSERT_EQ(reopened.open(db_path.string()), KeyStoreStatus::Success);
-    expect_missing(reopened, key);
+    expect_missing(reopened, KeyInput{std::uint64_t{77}});
 }
 
 TEST_F(KeyStoreIntegrationTest, FullScanUsesTypedOrderAcrossLeaves) {
@@ -265,25 +300,40 @@ TEST_F(KeyStoreIntegrationTest, FullScanUsesTypedOrderAcrossLeaves) {
     ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
     ASSERT_EQ(store.begin_write_transaction(), KeyStoreStatus::Success);
 
-    ASSERT_EQ(store.put(KeyInput{false}, ValueInput{false}), KeyStoreStatus::Success);
+    ASSERT_EQ(
+        store.put(
+            encode_key(KeyInput{false}),
+            encode_value(ValueInput{false})
+        ),
+        KeyStoreStatus::Success
+    );
     for (std::uint64_t key = 0; key < 260; key++) {
         ASSERT_EQ(
-            store.put(KeyInput{key}, ValueInput{std::string{"v"}}),
+            store.put(
+                encode_key(KeyInput{key}),
+                encode_value(ValueInput{std::string{"v"}})
+            ),
             KeyStoreStatus::Success
         );
     }
     ASSERT_EQ(
-        store.put(KeyInput{std::int64_t{-1}}, ValueInput{std::string{"i"}}),
-        KeyStoreStatus::Success
-    );
-    ASSERT_EQ(
-        store.put(KeyInput{std::string{"a"}}, ValueInput{std::string{"s"}}),
+        store.put(
+            encode_key(KeyInput{std::int64_t{-1}}),
+            encode_value(ValueInput{std::string{"i"}})
+        ),
         KeyStoreStatus::Success
     );
     ASSERT_EQ(
         store.put(
-            KeyInput{std::vector<char>{'a'}},
-            ValueInput{std::string{"b"}}
+            encode_key(KeyInput{std::string{"a"}}),
+            encode_value(ValueInput{std::string{"s"}})
+        ),
+        KeyStoreStatus::Success
+    );
+    ASSERT_EQ(
+        store.put(
+            encode_key(KeyInput{std::vector<char>{'a'}}),
+            encode_value(ValueInput{std::string{"b"}})
         ),
         KeyStoreStatus::Success
     );
@@ -295,13 +345,16 @@ TEST_F(KeyStoreIntegrationTest, FullScanUsesTypedOrderAcrossLeaves) {
     std::vector<KeyStoreEntry> entries = drain_cursor(*scan.cursor);
 
     ASSERT_EQ(entries.size(), 264u);
-    EXPECT_EQ(entries[0].key, KeyInput{false});
+    expect_key_input(entries[0].key, KeyInput{false});
     for (std::uint64_t key = 0; key < 260; key++) {
-        EXPECT_EQ(entries[static_cast<std::size_t>(key) + 1].key, KeyInput{key});
+        expect_key_input(
+            entries[static_cast<std::size_t>(key) + 1].key,
+            KeyInput{key}
+        );
     }
-    EXPECT_EQ(entries[261].key, KeyInput{std::int64_t{-1}});
-    EXPECT_EQ(entries[262].key, KeyInput{std::string{"a"}});
-    EXPECT_EQ(entries[263].key, KeyInput{std::vector<char>{'a'}});
+    expect_key_input(entries[261].key, KeyInput{std::int64_t{-1}});
+    expect_key_input(entries[262].key, KeyInput{std::string{"a"}});
+    expect_key_input(entries[263].key, KeyInput{std::vector<char>{'a'}});
     EXPECT_FALSE(scan.cursor->valid());
     EXPECT_EQ(scan.cursor->next(), KeyStoreCursorStatus::EndOfScan);
     EXPECT_EQ(scan.cursor->close(), KeyStoreCursorStatus::Success);
@@ -313,36 +366,41 @@ TEST_F(KeyStoreIntegrationTest, LowerBoundAndHalfOpenRangeScans) {
     ASSERT_EQ(store.begin_write_transaction(), KeyStoreStatus::Success);
     for (std::uint64_t key : {10, 20, 30, 40}) {
         ASSERT_EQ(
-            store.put(KeyInput{key}, ValueInput{key}),
+            store.put(
+                encode_key(KeyInput{key}),
+                encode_value(ValueInput{key})
+            ),
             KeyStoreStatus::Success
         );
     }
     ASSERT_EQ(store.commit(), KeyStoreStatus::Success);
 
-    KeyStoreScanResult from = store.scan_from(KeyInput{std::uint64_t{25}});
+    KeyStoreScanResult from = store.scan_from(
+        encode_key(KeyInput{std::uint64_t{25}})
+    );
     ASSERT_EQ(from.status, KeyStoreStatus::Success);
     ASSERT_TRUE(from.cursor.has_value());
     std::vector<KeyStoreEntry> from_entries = drain_cursor(*from.cursor);
     ASSERT_EQ(from_entries.size(), 2u);
-    EXPECT_EQ(from_entries[0].key, KeyInput{std::uint64_t{30}});
-    EXPECT_EQ(from_entries[1].key, KeyInput{std::uint64_t{40}});
+    expect_key_input(from_entries[0].key, KeyInput{std::uint64_t{30}});
+    expect_key_input(from_entries[1].key, KeyInput{std::uint64_t{40}});
     ASSERT_EQ(from.cursor->close(), KeyStoreCursorStatus::Success);
 
     KeyStoreScanResult range = store.scan_range(
-        KeyInput{std::uint64_t{20}},
-        KeyInput{std::uint64_t{40}}
+        encode_key(KeyInput{std::uint64_t{20}}),
+        encode_key(KeyInput{std::uint64_t{40}})
     );
     ASSERT_EQ(range.status, KeyStoreStatus::Success);
     ASSERT_TRUE(range.cursor.has_value());
     std::vector<KeyStoreEntry> range_entries = drain_cursor(*range.cursor);
     ASSERT_EQ(range_entries.size(), 2u);
-    EXPECT_EQ(range_entries[0].key, KeyInput{std::uint64_t{20}});
-    EXPECT_EQ(range_entries[1].key, KeyInput{std::uint64_t{30}});
+    expect_key_input(range_entries[0].key, KeyInput{std::uint64_t{20}});
+    expect_key_input(range_entries[1].key, KeyInput{std::uint64_t{30}});
     ASSERT_EQ(range.cursor->close(), KeyStoreCursorStatus::Success);
 
     KeyStoreScanResult empty = store.scan_range(
-        KeyInput{std::uint64_t{30}},
-        KeyInput{std::uint64_t{30}}
+        encode_key(KeyInput{std::uint64_t{30}}),
+        encode_key(KeyInput{std::uint64_t{30}})
     );
     ASSERT_EQ(empty.status, KeyStoreStatus::Success);
     ASSERT_TRUE(empty.cursor.has_value());
@@ -353,13 +411,15 @@ TEST_F(KeyStoreIntegrationTest, LowerBoundAndHalfOpenRangeScans) {
     ASSERT_EQ(empty.cursor->close(), KeyStoreCursorStatus::Success);
 
     KeyStoreScanResult reversed = store.scan_range(
-        KeyInput{std::uint64_t{40}},
-        KeyInput{std::uint64_t{20}}
+        encode_key(KeyInput{std::uint64_t{40}}),
+        encode_key(KeyInput{std::uint64_t{20}})
     );
     EXPECT_EQ(reversed.status, KeyStoreStatus::InvalidRange);
     EXPECT_FALSE(reversed.cursor.has_value());
 
-    KeyStoreScanResult past_end = store.scan_from(KeyInput{std::uint64_t{50}});
+    KeyStoreScanResult past_end = store.scan_from(
+        encode_key(KeyInput{std::uint64_t{50}})
+    );
     ASSERT_EQ(past_end.status, KeyStoreStatus::Success);
     ASSERT_TRUE(past_end.cursor.has_value());
     EXPECT_EQ(
@@ -386,37 +446,42 @@ TEST_F(KeyStoreIntegrationTest, PrefixScansStayWithinKeyFamily) {
     };
     for (const KeyInput &key : keys) {
         ASSERT_EQ(
-            store.put(key, ValueInput{std::string{"v"}}),
+            store.put(
+                encode_key(key),
+                encode_value(ValueInput{std::string{"v"}})
+            ),
             KeyStoreStatus::Success
         );
     }
     ASSERT_EQ(store.commit(), KeyStoreStatus::Success);
 
-    KeyStoreScanResult strings = store.scan_prefix(KeyPrefix{std::string{"app"}});
+    KeyStoreScanResult strings = store.scan_prefix(
+        encode_key(KeyInput{std::string{"app"}})
+    );
     ASSERT_EQ(strings.status, KeyStoreStatus::Success);
     ASSERT_TRUE(strings.cursor.has_value());
     std::vector<KeyStoreEntry> string_entries = drain_cursor(*strings.cursor);
     ASSERT_EQ(string_entries.size(), 2u);
-    EXPECT_EQ(string_entries[0].key, KeyInput{std::string{"app"}});
-    EXPECT_EQ(string_entries[1].key, KeyInput{std::string{"apple"}});
+    expect_key_input(string_entries[0].key, KeyInput{std::string{"app"}});
+    expect_key_input(string_entries[1].key, KeyInput{std::string{"apple"}});
     ASSERT_EQ(strings.cursor->close(), KeyStoreCursorStatus::Success);
 
     KeyStoreScanResult bytes = store.scan_prefix(
-        KeyPrefix{std::vector<char>{'a'}}
+        encode_key(KeyInput{std::vector<char>{'a'}})
     );
     ASSERT_EQ(bytes.status, KeyStoreStatus::Success);
     ASSERT_TRUE(bytes.cursor.has_value());
     std::vector<KeyStoreEntry> byte_entries = drain_cursor(*bytes.cursor);
     ASSERT_EQ(byte_entries.size(), 2u);
-    EXPECT_EQ(byte_entries[0].key, KeyInput{std::vector<char>{'a'}});
-    EXPECT_EQ(
+    expect_key_input(byte_entries[0].key, KeyInput{std::vector<char>{'a'}});
+    expect_key_input(
         byte_entries[1].key,
-        (KeyInput{std::vector<char>{'a', '\0'}})
+        KeyInput{std::vector<char>{'a', '\0'}}
     );
     ASSERT_EQ(bytes.cursor->close(), KeyStoreCursorStatus::Success);
 
     KeyStoreScanResult all_strings = store.scan_prefix(
-        KeyPrefix{std::string{}}
+        encode_key(KeyInput{std::string{}})
     );
     ASSERT_EQ(all_strings.status, KeyStoreStatus::Success);
     ASSERT_TRUE(all_strings.cursor.has_value());
@@ -424,7 +489,7 @@ TEST_F(KeyStoreIntegrationTest, PrefixScansStayWithinKeyFamily) {
         drain_cursor(*all_strings.cursor);
     ASSERT_EQ(all_string_entries.size(), 4u);
     for (const KeyStoreEntry &entry : all_string_entries) {
-        EXPECT_TRUE(std::holds_alternative<std::string>(entry.key));
+        EXPECT_EQ(entry.key.type, KeyType::String);
     }
     EXPECT_EQ(all_strings.cursor->close(), KeyStoreCursorStatus::Success);
 }
@@ -433,7 +498,10 @@ TEST_F(KeyStoreIntegrationTest, CursorOwnershipBlocksWritesAndBoundaries) {
     KeyStore store;
     ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
     ASSERT_EQ(
-        store.put(KeyInput{std::uint64_t{1}}, ValueInput{std::string{"one"}}),
+        store.put(
+            encode_key(KeyInput{std::uint64_t{1}}),
+            encode_value(ValueInput{std::string{"one"}})
+        ),
         KeyStoreStatus::Success
     );
 
@@ -449,8 +517,8 @@ TEST_F(KeyStoreIntegrationTest, CursorOwnershipBlocksWritesAndBoundaries) {
     EXPECT_TRUE(moved.valid());
     EXPECT_EQ(
         store.put(
-            KeyInput{std::uint64_t{2}},
-            ValueInput{std::string{"two"}}
+            encode_key(KeyInput{std::uint64_t{2}}),
+            encode_value(ValueInput{std::string{"two"}})
         ),
         KeyStoreStatus::CursorActive
     );
@@ -459,8 +527,8 @@ TEST_F(KeyStoreIntegrationTest, CursorOwnershipBlocksWritesAndBoundaries) {
     ASSERT_EQ(store.begin_write_transaction(), KeyStoreStatus::Success);
     EXPECT_EQ(
         store.put(
-            KeyInput{std::uint64_t{2}},
-            ValueInput{std::string{"two"}}
+            encode_key(KeyInput{std::uint64_t{2}}),
+            encode_value(ValueInput{std::string{"two"}})
         ),
         KeyStoreStatus::CursorActive
     );
@@ -473,8 +541,8 @@ TEST_F(KeyStoreIntegrationTest, CursorOwnershipBlocksWritesAndBoundaries) {
 
     ASSERT_EQ(
         store.put(
-            KeyInput{std::uint64_t{2}},
-            ValueInput{std::string{"two"}}
+            encode_key(KeyInput{std::uint64_t{2}}),
+            encode_value(ValueInput{std::string{"two"}})
         ),
         KeyStoreStatus::Success
     );
@@ -491,7 +559,10 @@ TEST_F(KeyStoreIntegrationTest, ScanCanReadUncommittedWritesBeforeCommit) {
     ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
     ASSERT_EQ(store.begin_write_transaction(), KeyStoreStatus::Success);
     ASSERT_EQ(
-        store.put(KeyInput{std::uint64_t{9}}, ValueInput{std::string{"nine"}}),
+        store.put(
+            encode_key(KeyInput{std::uint64_t{9}}),
+            encode_value(ValueInput{std::string{"nine"}})
+        ),
         KeyStoreStatus::Success
     );
 
@@ -501,8 +572,8 @@ TEST_F(KeyStoreIntegrationTest, ScanCanReadUncommittedWritesBeforeCommit) {
     KeyStoreCursorResult current = scan.cursor->current();
     ASSERT_EQ(current.status, KeyStoreCursorStatus::Success);
     ASSERT_TRUE(current.entry.has_value());
-    EXPECT_EQ(current.entry->key, KeyInput{std::uint64_t{9}});
-    EXPECT_EQ(current.entry->value, ValueInput{std::string{"nine"}});
+    expect_key_input(current.entry->key, KeyInput{std::uint64_t{9}});
+    expect_value_input(current.entry->value, ValueInput{std::string{"nine"}});
     EXPECT_EQ(store.commit(), KeyStoreStatus::CursorActive);
     ASSERT_EQ(scan.cursor->close(), KeyStoreCursorStatus::Success);
     ASSERT_EQ(store.commit(), KeyStoreStatus::Success);
@@ -517,8 +588,8 @@ TEST_F(KeyStoreIntegrationTest, WriterConflictRequiresExplicitRollback) {
         );
         ASSERT_EQ(
             initializer.put(
-                KeyInput{std::uint64_t{1}},
-                ValueInput{std::string{"seed"}}
+                encode_key(KeyInput{std::uint64_t{1}}),
+                encode_value(ValueInput{std::string{"seed"}})
             ),
             KeyStoreStatus::Success
         );
@@ -543,8 +614,8 @@ TEST_F(KeyStoreIntegrationTest, WriterConflictRequiresExplicitRollback) {
             holder.open(db_path.string()) == KeyStoreStatus::Success &&
             holder.begin_write_transaction() == KeyStoreStatus::Success &&
             holder.put(
-                KeyInput{std::uint64_t{1}},
-                ValueInput{std::string{"held"}}
+                encode_key(KeyInput{std::uint64_t{1}}),
+                encode_value(ValueInput{std::string{"held"}})
             ) == KeyStoreStatus::Success;
 
         const char ready = ok ? '1' : '0';
@@ -574,16 +645,16 @@ TEST_F(KeyStoreIntegrationTest, WriterConflictRequiresExplicitRollback) {
     );
     EXPECT_EQ(
         contender.put(
-            KeyInput{std::uint64_t{2}},
-            ValueInput{std::string{"blocked"}}
+            encode_key(KeyInput{std::uint64_t{2}}),
+            encode_value(ValueInput{std::string{"blocked"}})
         ),
         KeyStoreStatus::WriteFailed
     );
     EXPECT_TRUE(contender.write_transaction_active());
     EXPECT_EQ(
         contender.put(
-            KeyInput{std::uint64_t{3}},
-            ValueInput{std::string{"retry"}}
+            encode_key(KeyInput{std::uint64_t{3}}),
+            encode_value(ValueInput{std::string{"retry"}})
         ),
         KeyStoreStatus::TransactionNeedsRollback
     );
@@ -615,8 +686,8 @@ TEST_F(KeyStoreIntegrationTest, AutocommitFailureRollsBackBlockedCommit) {
         );
         ASSERT_EQ(
             initializer.put(
-                KeyInput{std::uint64_t{1}},
-                ValueInput{std::string{"seed"}}
+                encode_key(KeyInput{std::uint64_t{1}}),
+                encode_value(ValueInput{std::string{"seed"}})
             ),
             KeyStoreStatus::Success
         );
@@ -669,8 +740,8 @@ TEST_F(KeyStoreIntegrationTest, AutocommitFailureRollsBackBlockedCommit) {
     EXPECT_EQ(writer.open(db_path.string()), KeyStoreStatus::Success);
     EXPECT_EQ(
         writer.put(
-            KeyInput{std::uint64_t{5}},
-            ValueInput{std::string{"not committed"}}
+            encode_key(KeyInput{std::uint64_t{5}}),
+            encode_value(ValueInput{std::string{"not committed"}})
         ),
         KeyStoreStatus::CommitFailed
     );

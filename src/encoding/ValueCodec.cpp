@@ -1,8 +1,9 @@
 #include <ValueCodec.h>
 
 #include <limits>
+#include <type_traits>
 
-namespace valuecodec {
+namespace ValueCodec {
 
 namespace {
 
@@ -61,12 +62,56 @@ std::int64_t zigzag_decode(std::uint64_t value) {
 
 } // namespace
 
+std::optional<Value> encode(const ValueInput &input) {
+    return std::visit(
+        [](const auto &value) -> std::optional<Value> {
+            using T = std::decay_t<decltype(value)>;
+
+            if constexpr (std::is_same_v<T, bool>) {
+                return make_bool(value);
+            } else if constexpr (std::is_same_v<T, std::uint64_t>) {
+                return make_varuint(value);
+            } else if constexpr (std::is_same_v<T, std::int64_t>) {
+                return make_varint(value);
+            } else {
+                if (value.size() > MAX_PAYLOAD_SIZE) return std::nullopt;
+                return make_char(value);
+            }
+        },
+        input
+    );
+}
+
+std::optional<ValueInput> decode(const Value &value) {
+    if (!validate_value(value)) return std::nullopt;
+
+    switch (value.type) {
+        case ValueType::VarUInt: {
+            std::uint64_t decoded = 0;
+            if (!decode_varuint(value, &decoded)) return std::nullopt;
+            return ValueInput{decoded};
+        }
+        case ValueType::VarInt: {
+            std::int64_t decoded = 0;
+            if (!decode_varint(value, &decoded)) return std::nullopt;
+            return ValueInput{decoded};
+        }
+        case ValueType::Bool:
+            return ValueInput{value.data[0] == '\1'};
+        case ValueType::Char:
+            return ValueInput{std::string(value.data.begin(), value.data.end())};
+    }
+
+    return std::nullopt;
+}
+
 bool equal(const Value &lhs, const Value &rhs) {
     return lhs.type == rhs.type && lhs.size == rhs.size && lhs.data == rhs.data;
 }
 
 bool validate_value(const Value &value) {
     if (value.size != value.data.size()) return false;
+    if (value.size > MAX_PAYLOAD_SIZE) return false;
 
     switch (value.type) {
         case ValueType::VarUInt: {
@@ -84,7 +129,8 @@ bool validate_value(const Value &value) {
         }
         case ValueType::Bool:
             // Bool is fixed-width in this model: exactly one payload byte.
-            return value.size == 1;
+            return value.size == 1 &&
+                (value.data[0] == '\0' || value.data[0] == '\1');
         case ValueType::Char:
             // Char values are just arbitrary raw bytes for now.
             return true;
@@ -142,4 +188,4 @@ bool decode_varint(const Value &value, std::int64_t *out) {
     return true;
 }
 
-} // namespace valuecodec
+} // namespace ValueCodec

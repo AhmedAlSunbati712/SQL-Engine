@@ -2,30 +2,12 @@
 
 #include <BTree.h>
 #include <BTreeCursor.h>
+#include <Key.h>
+#include <Value.h>
 
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <variant>
-#include <vector>
-
-using KeyInput = std::variant<
-    bool,
-    std::uint64_t,
-    std::int64_t,
-    std::string,
-    std::vector<char>
->;
-
-using ValueInput = std::variant<
-    bool,
-    std::uint64_t,
-    std::int64_t,
-    std::string
->;
-
-// Prefix scans only apply to the two variable-length key families.
-using KeyPrefix = std::variant<std::string, std::vector<char>>;
 
 enum class KeyStoreWritePolicy : std::uint8_t {
     AutoCommit = 0,
@@ -71,17 +53,17 @@ enum class KeyStoreCursorStatus : std::uint8_t {
 
 struct KeyStoreGetResult {
     KeyStoreStatus status = KeyStoreStatus::Success;
-    std::optional<ValueInput> value;
+    std::optional<Value> value;
 };
 
 struct KeyStoreRemoveResult {
     KeyStoreStatus status = KeyStoreStatus::Success;
-    std::optional<ValueInput> value;
+    std::optional<Value> value;
 };
 
 struct KeyStoreEntry {
-    KeyInput key;
-    ValueInput value;
+    Key key;
+    Value value;
 };
 
 struct KeyStoreCursorResult {
@@ -116,8 +98,6 @@ class KeyStoreCursor {
 
         bool current_key_is_in_bounds(const Key &key) const;
         static KeyStoreCursorStatus translate_cursor_status(BTreeCursorStatus status);
-        static std::optional<KeyInput> decode_key(const Key &key);
-        static std::optional<ValueInput> decode_value(const Value &value);
 
         BTreeCursor cursor;
         std::optional<Key> exclusive_end;
@@ -147,9 +127,9 @@ class KeyStore {
         // transactions must be committed or rolled back before an explicit close.
         KeyStoreStatus close();
 
-        KeyStoreGetResult get(const KeyInput &key);
-        KeyStoreStatus put(const KeyInput &key, const ValueInput &value);
-        KeyStoreRemoveResult remove(const KeyInput &key);
+        KeyStoreGetResult get(const Key &key);
+        KeyStoreStatus put(const Key &key, const Value &value);
+        KeyStoreRemoveResult remove(const Key &key);
 
         KeyStoreStatus begin_write_transaction();
         KeyStoreStatus commit();
@@ -162,13 +142,13 @@ class KeyStore {
         KeyStoreScanResult scan();
 
         // Lower-bound scan over [start, end of tree).
-        KeyStoreScanResult scan_from(const KeyInput &start);
+        KeyStoreScanResult scan_from(const Key &start);
 
         // Half-open range scan over [start, end).
-        KeyStoreScanResult scan_range(const KeyInput &start, const KeyInput &end);
+        KeyStoreScanResult scan_range(const Key &start, const Key &end);
 
-        // Scan string or byte keys beginning with prefix.
-        KeyStoreScanResult scan_prefix(const KeyPrefix &prefix);
+        // Scan encoded string or byte keys beginning with prefix.
+        KeyStoreScanResult scan_prefix(const Key &prefix);
 
     private:
         enum class TransactionState : std::uint8_t {
@@ -176,10 +156,6 @@ class KeyStore {
             Active,
             Failed
         };
-
-        static std::optional<Key> encode_key(const KeyInput &key);
-        static std::optional<Value> encode_value(const ValueInput &value);
-        static std::optional<ValueInput> decode_value(const Value &value);
 
         KeyStoreStatus finish_autocommit_write(BTreeStatus write_status);
         KeyStoreStatus handle_transactional_write(BTreeStatus write_status);
