@@ -12,7 +12,7 @@ class Client {
         void close_session(int session_id);
     private:
         struct sockaddr_in server_addr;
-        std::unordered_map<int, std::unique_ptr<Session>> sessions;
+        std::unordered_map<int, Session> sessions;
         int seq_number; // Monotonically increasing number used to assign ids to sessions
 
 };
