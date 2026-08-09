@@ -16,6 +16,7 @@ SRC = \
 	src/client/Client.cpp \
 	src/client/Command.cpp \
 	src/client/NetCodec.cpp \
+	src/client/Session.cpp \
 	src/JournalCodec.cpp \
 	src/Log/Index.cpp \
 	src/Log/Segment.cpp \
@@ -40,6 +41,7 @@ OBJ = \
 	build/client/Client.o \
 	build/client/Command.o \
 	build/client/NetCodec.o \
+	build/client/Session.o \
 	build/JournalCodec.o \
 	build/Log/Index.o \
 	build/Log/Segment.o \
