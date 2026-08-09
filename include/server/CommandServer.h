@@ -1,0 +1,14 @@
+#pragma once
+
+#include <KeyStore.h>
+
+namespace CommandServer {
+
+void handle_get(KeyStore &key_store, KeyStoreGetResult &result, const Key &key);
+void handle_put(KeyStore &key_store, KeyStoreStatus &result, const Key &key, const Value &value);
+void handle_remove(KeyStore &key_store, KeyStoreRemoveResult &result, const Key &key);
+void handle_begin_transaction(KeyStore &key_store, KeyStoreStatus &result);
+void handle_commit(KeyStore &key_store, KeyStoreStatus &result);
+void handle_rollback(KeyStore &key_store, KeyStoreStatus &result);
+
+} // namespace CommandServer
