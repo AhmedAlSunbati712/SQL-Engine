@@ -10,5 +10,6 @@ void handle_remove(KeyStore &key_store, KeyStoreRemoveResult &result, const Key 
 void handle_begin_transaction(KeyStore &key_store, KeyStoreStatus &result);
 void handle_commit(KeyStore &key_store, KeyStoreStatus &result);
 void handle_rollback(KeyStore &key_store, KeyStoreStatus &result);
+void serve_connection(int socket_fd, KeyStore &key_store) noexcept;
 
 } // namespace CommandServer
