@@ -8,6 +8,8 @@
 static constexpr std::size_t SHARD_COUNT = 64;
 enum class LockManagerStatus : std::uint8_t {
     Success = 0,
+    TxnHoldsExclusive,
+    TxnHoldsShared,
     Busy
 };
 
@@ -22,11 +24,11 @@ class LockManager {
         LockManager(LockManager&&) = delete;
         LockManager& operator=(LockManager&&) = delete;
 
-        LockManagerStatus lock_shared(TransactionId txn_id, Key& key);
-        LockManagerStatus lock_exclusive(TransactionId txn_id, Key& key);
+        LockManagerStatus lock_shared(TransactionId txn_id, const Key& key);
+        LockManagerStatus lock_exclusive(TransactionId txn_id, const Key& key);
 
-        LockManagerStatus unlock_shared(TransactionId txn_id, Key& key);
-        LockManagerStatus unlock_exclusive(TransactionId txn_id, Key& key);
+        LockManagerStatus unlock_shared(TransactionId txn_id, const Key& key);
+        LockManagerStatus unlock_exclusive(TransactionId txn_id, const Key& key);
 
     private:
         std::array<LockShard, SHARD_COUNT> shards;

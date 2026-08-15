@@ -1,0 +1,54 @@
+#include <LockManager.h>
+#include <mutex>
+#include <Waiter.h>
+#include <LockMode.h>
+
+// Currently handles:
+// NoLock to Shared Lock
+// Shared stays shared
+// Exclusive stays exclusive
+LockManagerStatus LockManager::lock_shared(TransactionId txn_id, const Key& key) {
+    std::size_t _hash = KeyHash{}(key);
+    LockShard &shard = shards[_hash % SHARD_COUNT];
+
+    // Need to acquire a lock on the shard first
+    std::unique_lock lock(shard.mutex_);
+
+    // Then find the lock state corresponding to this key
+    LockState& state = shard.states[key];
+
+    // First check if the lock is one of the shared owners already
+    // Callers shouldn't add another lock to the txn held locks
+    auto it = state.shared_owners.find(txn_id);
+    if (it != state.shared_owners.end()) {
+        return LockManagerStatus::TxnHoldsShared;
+    }
+
+    // Check if it's an exclusive owner
+    if (state.exclusive_owner && *state.exclusive_owner == txn_id) {
+        return LockManagerStatus::TxnHoldsExclusive;
+    }
+
+    // We can grant lock access immediately without waiting only if there's
+    // no exclusive owners and waiters is empty
+    if (!state.exclusive_owner && state.waiters.empty()) {
+        // Add this transaction id to the shared owners
+        state.shared_owners.insert(txn_id);
+        return LockManagerStatus::Success;
+    }
+
+    // Otherwise, create a waiter and add it to the waiters queue
+    std::shared_ptr<Waiter> waiter = std::make_shared<Waiter>();
+    waiter->txn_id = txn_id;
+    waiter->lock_mode = LockMode::Shared;
+
+    // Push it to the queue of waiters
+    state.waiters.push(waiter);
+
+    // Wait until someone grants us the lock on the key
+    state.cv_.wait(lock, [&]{
+        return waiter->granted;
+    });
+
+    return LockManagerStatus::Success;
+}

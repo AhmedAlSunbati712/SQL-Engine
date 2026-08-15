@@ -12,8 +12,7 @@ struct LockState {
     std::unordered_set<TransactionId> shared_owners;
     std::optional<TransactionId> exclusive_owner;
 
-    std::queue<Waiter> waiters;
-    std::mutex mutex_;
+    std::queue<std::shared_ptr<Waiter>> waiters;
     std::condition_variable cv_;
 
     static bool grant_waiters(LockState& state);
