@@ -14,6 +14,9 @@ public:
     std::filesystem::path path;
 };
 Config config() { return {.max_index_bytes = 120, .max_store_bytes = 8192, .initial_lsn = 1}; }
+PendingWalRecord system(std::vector<char> data = {}) {
+    return {.type = WalRecordType::SystemAction, .data = std::move(data)};
+}
 
 TEST(LogTest, CreatesDirectoryAndInitialSegment) {
     TempDir parent; auto directory = parent.path / "wal";
@@ -39,5 +42,24 @@ TEST(LogTest, RejectsMalformedNamesAndSegmentGaps) {
     { std::ofstream(gap.path / "segment-00000000000000000001.store"); std::ofstream(gap.path / "segment-00000000000000000001.index");
       std::ofstream(gap.path / "segment-00000000000000000003.store"); std::ofstream(gap.path / "segment-00000000000000000003.index"); }
     Log second(config()); EXPECT_THROW(second.open(gap.path.string()), std::runtime_error);
+}
+
+TEST(LogTest, AssignsDenseLsnsAndSupportsReadScanAndReopen) {
+    TempDir dir;
+    { Log log(config()); log.open(dir.path.string());
+      EXPECT_EQ(log.append(system({'a'})), 1u); EXPECT_EQ(log.append(system({'b'})), 2u);
+      EXPECT_EQ(log.read(2).data, (std::vector<char>{'b'}));
+      auto records = log.scan(); ASSERT_EQ(records.size(), 2u); EXPECT_EQ(records[0].lsn, 1u); log.close(); }
+    Log reopened(config()); reopened.open(dir.path.string());
+    EXPECT_EQ(reopened.next_lsn(), 3u); EXPECT_EQ(reopened.append(system({'c'})), 3u);
+}
+
+TEST(LogTest, RollsBeforeAppendAfterARecordCrossesLimit) {
+    TempDir dir; Config small = config(); small.max_store_bytes = 44;
+    Log log(small); log.open(dir.path.string());
+    EXPECT_EQ(log.append(system({'a'})), 1u);
+    EXPECT_EQ(log.append(system({'b'})), 2u);
+    EXPECT_TRUE(std::filesystem::exists(dir.path / "segment-00000000000000000002.store"));
+    auto records = log.scan(); ASSERT_EQ(records.size(), 2u); EXPECT_EQ(records[1].lsn, 2u);
 }
 } // namespace

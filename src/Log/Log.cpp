@@ -99,9 +99,43 @@ void Log::close() {
 }
 
 bool Log::is_open() const noexcept { std::shared_lock lock(mutex_); return !segments_.empty(); }
-Lsn Log::append(PendingWalRecord) { throw std::runtime_error("Log append is not implemented"); }
-WalRecord Log::read(Lsn) const { throw std::runtime_error("Log read is not implemented"); }
-std::vector<WalRecord> Log::scan() const { throw std::runtime_error("Log scan is not implemented"); }
+
+Lsn Log::append(PendingWalRecord pending) {
+    std::unique_lock lock(mutex_);
+    if (segments_.empty()) throw std::runtime_error("Log is not open");
+    if (recovery_required_) throw std::runtime_error("Log must be reopened and recovered before appending");
+
+    // A complete record that crosses a limit remains in its original segment.
+    // Rollover happens before the following append.
+    if (segments_.back()->is_maxed()) create_segment(next_lsn_);
+    WalRecord record{.lsn = next_lsn_, .type = pending.type,
+                     .transaction_id = pending.transaction_id,
+                     .prev_lsn = pending.prev_lsn, .data = std::move(pending.data)};
+    segments_.back()->append(record);
+    next_lsn_ += 1;
+    return record.lsn;
+}
+
+WalRecord Log::read(Lsn lsn) const {
+    std::shared_lock lock(mutex_);
+    if (segments_.empty()) throw std::runtime_error("Log is not open");
+    if (lsn < config_.initial_lsn || lsn >= next_lsn_) throw std::out_of_range("LSN is not present in Log");
+    for (const auto& segment : segments_) {
+        if (lsn >= segment->base_lsn() && lsn < segment->next_lsn()) return segment->read(lsn);
+    }
+    throw std::out_of_range("LSN is not present in Log");
+}
+
+std::vector<WalRecord> Log::scan() const {
+    std::shared_lock lock(mutex_);
+    if (segments_.empty()) throw std::runtime_error("Log is not open");
+    std::vector<WalRecord> records;
+    for (const auto& segment : segments_) {
+        auto part = segment->scan();
+        records.insert(records.end(), std::make_move_iterator(part.begin()), std::make_move_iterator(part.end()));
+    }
+    return records;
+}
 void Log::sync_through(Lsn) { throw std::runtime_error("Log synchronization is not implemented"); }
 Lsn Log::next_lsn() const noexcept { std::shared_lock lock(mutex_); return next_lsn_; }
 Lsn Log::durable_lsn() const noexcept { std::shared_lock lock(mutex_); return durable_lsn_; }
