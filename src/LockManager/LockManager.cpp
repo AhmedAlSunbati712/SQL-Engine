@@ -104,3 +104,42 @@ LockManagerStatus LockManager::lock_exclusive(TransactionId txn_id, const Key& k
 
     return LockManagerStatus::Success;
 }
+
+LockManagerStatus LockManager::unlock_shared(TransactionId txn_id, const Key& key) {
+    std::size_t hash = KeyHash{}(key);
+    LockShard& shard = shards[hash % SHARD_COUNT];
+
+    // Need to acquire a lock on the shard first
+    std::unique_lock lock(shard.mutex_);
+
+    // Then find the lock state corresponding to this key
+    auto state_it = shard.states.find(key);
+    if (state_it == shard.states.end()) {
+        return LockManagerStatus::NotOwner;
+    }
+    LockState& state = state_it->second;
+
+    // Try to erase it from the shared owners
+    // if it doesn't exist, this transaction isn't an owner
+    if (state.shared_owners.erase(txn_id) == 0) {
+        return LockManagerStatus::NotOwner;
+    }
+
+    // Then try to grant eligible waiters their requested locks
+    // if there was at least one eligible waiter, this will return true
+    const bool granted = LockState::grant_waiters(state);
+
+    // If there's an eligible waiter, notify all threads to wake up
+    // those that werent granted will go back to sleep zzzz
+    if (granted) {
+        state.cv_.notify_all();
+    }
+
+    // Finally, if there are no shared owners, no exclusive owner
+    // and no waiters, delete this state from the shard
+    if (!state.exclusive_owner && state.waiters.empty() && state.shared_owners.empty()) {
+        shard.states.erase(state_it);
+    }
+
+    return LockManagerStatus::Success;
+}

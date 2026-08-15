@@ -10,7 +10,8 @@ enum class LockManagerStatus : std::uint8_t {
     Success = 0,
     TxnHoldsExclusive,
     TxnHoldsShared,
-    Busy
+    Busy,
+    NotOwner
 };
 
 class LockManager {
