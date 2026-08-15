@@ -3,12 +3,29 @@
 #include <cstdint>
 #include <vector>
 
-/// Minimal self-identifying record stored in the local write-ahead log.
-///
-/// `lsn` is the absolute, node-local WAL sequence number. `data` remains an
-/// opaque byte payload until transaction and page-mutation record families are
-/// introduced. Empty payloads are valid.
+using Lsn = std::uint64_t;
+
+enum class WalRecordType : std::uint16_t {
+    TxnBegin = 1,
+    BTreeAction = 2,
+    Compensation = 3,
+    SystemAction = 4,
+    TxnCommit = 5,
+    TxnAbort = 6,
+    TxnEnd = 7,
+};
+
+struct PendingWalRecord {
+    WalRecordType type = WalRecordType::SystemAction;
+    std::uint64_t transaction_id = 0;
+    Lsn prev_lsn = 0;
+    std::vector<char> data;
+};
+
 struct WalRecord {
-    std::uint64_t lsn = 0;
+    Lsn lsn = 0;
+    WalRecordType type = WalRecordType::SystemAction;
+    std::uint64_t transaction_id = 0;
+    Lsn prev_lsn = 0;
     std::vector<char> data;
 };

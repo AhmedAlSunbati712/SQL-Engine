@@ -22,12 +22,17 @@ SRC = \
 	src/Log/Segment.cpp \
 	src/Log/Store.cpp \
 	src/Log/WalRecordCodec.cpp \
+	src/Log/WalPayloadCodec.cpp \
+	src/Log/WalRecords.cpp \
+	src/Log/PendingBTreeAction.cpp \
+	src/Log/Log.cpp \
 	src/LockMgr.cpp \
 	src/LockManager/LockManager.cpp \
 	src/PCache.cpp \
 	src/Pager.cpp \
 	src/disk/DiskIO.cpp \
 	src/encoding/Endian.cpp \
+	src/encoding/Crc32c.cpp \
 	src/encoding/KeyCodec.cpp \
 	src/encoding/ValueCodec.cpp \
 	src/DBHeaderCodec.cpp \
@@ -48,12 +53,17 @@ OBJ = \
 	build/Log/Segment.o \
 	build/Log/Store.o \
 	build/Log/WalRecordCodec.o \
+	build/Log/WalPayloadCodec.o \
+	build/Log/WalRecords.o \
+	build/Log/PendingBTreeAction.o \
+	build/Log/Log.o \
 	build/LockMgr.o \
 	build/LockManager/LockManager.o \
 	build/PCache.o \
 	build/Pager.o \
 	build/disk/DiskIO.o \
 	build/encoding/Endian.o \
+	build/encoding/Crc32c.o \
 	build/encoding/KeyCodec.o \
 	build/encoding/ValueCodec.o \
 	build/DBHeaderCodec.o \
@@ -115,6 +125,8 @@ build/tests/unit/%: build/tests/unit/%.o $(LIB)
 
 build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
+build/tests/unit/Log_test: CXXFLAGS += -pthread
+build/tests/unit/Log_test: LDLIBS += -pthread
 
 test-unit: $(UNIT_TEST_BIN)
 	for test_bin in $(UNIT_TEST_BIN); do ./$$test_bin; done

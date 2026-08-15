@@ -52,6 +52,7 @@ class Segment {
 
         std::uint64_t base_lsn() const;
         std::uint64_t next_lsn() const;
+        bool recovery_required() const;
 
     private:
         Config config_;

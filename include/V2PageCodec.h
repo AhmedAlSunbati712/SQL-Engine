@@ -21,9 +21,6 @@ constexpr std::array<char, 4> PAGE_MAGIC{
     'G',
 };
 
-constexpr std::uint32_t CRC32C_POLYNOMIAL = 0x82F63B78u;
-constexpr std::uint32_t CRC32C_INITIAL = 0xFFFFFFFFu;
-
 /// Result of validating a complete serialized V2 page image.
 ///
 /// Callers may use the individual failures for diagnostics or translate all
@@ -74,26 +71,27 @@ namespace V2PageCodec {
 
     /// Writes a pageLSN in big-endian order.
     ///
-    /// The pageLSN lies outside the checksummed payload, so this write does not
-    /// change the stored checksum.
+    /// The stored checksum becomes stale until update_checksum is called.
     void set_page_lsn(std::span<char, V2_PAGE_SIZE> page, std::uint64_t lsn);
 
     /// Writes a valid page kind in big-endian order.
     ///
     /// `kind` must name one of the four declared V2PageKind enumerators. Page
-    /// kind lies outside the checksummed payload.
+    /// kind must name a declared kind. The stored checksum becomes stale.
     void set_page_kind(std::span<char, V2_PAGE_SIZE> page, V2PageKind kind);
 
     /// Recomputes and stores the page's CRC32C checksum.
     ///
-    /// CRC32C uses the Castagnoli polynomial and covers only the 4072-byte
-    /// page-kind payload at bytes 24..4095.
+    /// CRC32C covers all 4096 bytes with the checksum field treated as zero.
     void update_checksum(std::span<char, V2_PAGE_SIZE> page);
 
     /// Validates a complete serialized V2 page image.
     ///
-    /// Validation checks exact size, magic, page kind, and payload CRC32C
+    /// Validation checks exact size, magic, page kind, and whole-page CRC32C
     /// without modifying `page`.
     V2PageCodecResult validate(std::span<const char> page);
+
+    /// Validates framing needed before an image is installed during recovery.
+    V2PageCodecResult validate_structure(std::span<const char> page);
 
 } // namespace V2PageCodec

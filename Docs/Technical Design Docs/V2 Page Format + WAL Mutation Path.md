@@ -8,9 +8,10 @@ header, the pager-to-B+ tree boundary, page mutation capture, the first logger,
 the rollback-journal transition, and startup recovery sequencing.
 
 The implementation remains on the current rollback journal today. The
-standalone V2 page representation and common codec are implemented and tested,
-but they are not integrated into the pager or B+ tree. The logger, mutation
-boundary, WAL cutover, and WAL recovery remain future work.
+standalone V2 page representation, whole-page checksum codec, typed WAL, and
+Log coordinator are implemented and tested, but they are not integrated into
+the pager or B+ tree. The mutation boundary, WAL cutover, and WAL recovery
+executor remain future work.
 
 `V2` is the name of this migration path and its new source files. It is not a
 version number stored in the page bytes.
@@ -23,8 +24,8 @@ version number stored in the page bytes.
   the runtime `page_num` mirror is only a cache lookup key.
 - Give the B+ tree all 4096 raw cached bytes, not a pager-owned `PageV2`
   object or separately decoded header fields.
-- Replace `begin_write` with a mutation boundary that captures exact physical
-  before- and after-images.
+- Replace `begin_write` with an operation-scoped mutation boundary that logs
+  the complete physical after-images propagated by one B+ tree action.
 - Build and validate the logger independently, then run it beside the rollback
   journal while pager paths are converted one at a time.
 - Remove the rollback journal only after WAL-before-data, commit durability,
@@ -35,13 +36,12 @@ version number stored in the page bytes.
 
 ## Non-Goals for This Stage
 
-- Thread-safety, page latches, transaction lock ownership, or multi-writer undo
-  policy.
+- The concrete concurrent B+ tree latch-coupling algorithm.
 - Periodic or fuzzy checkpoints.
 - WAL reclamation or bounded startup time.
 - Raft, networking, snapshots, or cross-process reader consistency during the
   transitional embedded-engine stage.
-- Delta or physiological WAL records.
+- Delta or physiological redo records.
 - Automatic migration of existing database files.
 
 ## V2 Page Format
@@ -69,8 +69,9 @@ older database files unsupported.
 
 Persistent integers are big-endian. Page number zero is valid and identifies
 the database metadata page. LSN zero means that no WAL update has yet been
-assigned. The CRC32C covers only the 4072-byte page-kind payload at bytes 24
-through 4095; the 24-byte common header is not included.
+assigned. CRC32C covers the complete 4096-byte page with bytes 16 through 19,
+the CRC field itself, treated as zero. Covering the header is required because
+recovery must not trust a `pageLSN` from a torn page.
 
 V2 page kinds are:
 
@@ -150,10 +151,11 @@ namespace V2PageCodec {
 }
 ```
 
-The codec validates exact size, magic, page kind, and payload CRC32C before the
-pager exposes a disk-loaded page. The pager separately compares the decoded
-page number with the page number it requested from disk. The common-header
-`pageLSN` does not receive checksum protection in this format.
+The codec validates exact size, magic, page kind, and whole-page CRC32C before
+the pager exposes a disk-loaded page. The pager separately compares the
+decoded page number with the page number it requested from disk. Only after
+whole-page validation succeeds may recovery use the encoded `pageLSN` for its
+redo comparison.
 
 ## Pager-to-B+ Tree Boundary
 
@@ -191,113 +193,122 @@ rollback-journal behavior unchanged. Each converted call site uses a complete
 `begin_mutation`/`finish_mutation` pair; after the last conversion,
 `begin_write` is removed.
 
-### Mutation Object
+### Operation Mutation Batch
 
-One mutation owns one additional 4 KiB before-image. The cached page itself is
-the working after-image; there is no separate after-image array.
+The WAL unit is one complete user-visible B+ tree action, not an independently
+undoable page replacement. One insert, update, or delete may propagate through
+a leaf, one or more internal pages, newly allocated pages, and database
+metadata. The operation therefore owns a mutation batch containing every page
+it changes.
 
 ```cpp
-class PageMutationV2 {
+class OperationMutationBatch {
   public:
-    PageMutationV2(const PageMutationV2 &) = delete;
-    PageMutationV2 &operator=(const PageMutationV2 &) = delete;
-    PageMutationV2(PageMutationV2 &&) noexcept;
-    PageMutationV2 &operator=(PageMutationV2 &&) noexcept;
-    ~PageMutationV2();
-
-    std::span<char, 4096> bytes();
+    PageMutationV2 &begin_mutation(PageNumber page_num);
+    WalAppendResult finish(UndoDescriptor undo);
+    void cancel();
 
   private:
-    friend class Pager;
-
-    std::span<char, 4096> cached_bytes;
-    std::array<char, 4096> before_image{};
-    bool finished = false;
+    Transaction &transaction;
+    std::vector<PageMutationV2> mutations;
 };
 ```
 
-The sketch omits small lifecycle fields such as the prior dirty state.
-Crucially, the mutation does not contain a `PageV2*`, `PageImageV2`, copied
-header fields, or a second after-image. `cached_bytes` points directly at the
-pager's cached 4096 bytes, `before_image` is the one owned copy, and `bytes()`
-is exactly what the pager returns to the B+ tree.
+Each `PageMutationV2` keeps the page pinned, exposes its cached 4096 bytes, and
+owns one transient before-image plus prior runtime dirty state. The before-image
+is only for cancelling an operation that has not successfully appended its WAL
+record. It is not persisted as transaction undo information.
 
-The B+ tree uses the common codec on `bytes()` when it needs to inspect or
-change the page kind. `finish_mutation` owns assignment of `pageLSN` and the
-checksum. It also validates that immutable identity bytes such as magic and
-page number were not accidentally changed and that the encoded page number
-still equals the owning cache page's runtime `page_num`.
+The operation batch prevents its pages from being evicted or modified by a
+second physical operation until the compound WAL append completes. Page
+latches are held only across this in-memory operation and WAL append, never
+across WAL synchronization, transaction commit, or client think-time.
 
-The mutation keeps the page pinned until it finishes or cancels. Concurrency
-protection will be added when the separate concurrency design is implemented.
+### Beginning a Page Mutation
 
-### Beginning a Mutation
+`begin_mutation(page_num)` within a batch:
 
-`begin_mutation(page_num)`:
+1. Finds, pins, and exclusively latches the cached page.
+2. Copies its current 4096 bytes into transient scratch memory.
+3. Records the prior dirty and flushability state.
+4. Returns the mutable full-page span used by the B+ tree.
 
-1. Finds and pins the cached page.
-2. Performs the existing transaction-start and rollback-journal first-write
-   bookkeeping while the rollback journal remains active.
-3. Copies the current 4096 bytes into `before_image`.
-4. Records enough prior runtime dirty state to restore it on cancellation.
-5. Returns a move-only mutation whose full-page span targets the cached bytes.
+Touching the same page again in the same batch reuses its existing mutation;
+the compound record needs only that page's final after-image. The batch keeps
+the first scratch image so complete cancellation returns the cache to the
+state before the logical action began.
 
-The rollback-journal image and mutation before-image have different meanings:
+### Finishing an Operation
 
-- The rollback journal retains the page's first image in the transaction.
-- Each WAL mutation retains the page image immediately before that physical
-  change.
+After the B+ tree completes all propagated changes, `finish(undo)`:
 
-### Finishing a Mutation
+1. Counts the affected pages and determines the compound record size.
+2. Copies every final page content image into the pending action payload. The
+   encoded image's `pageLSN` and checksum are recovery-owned fields rather than
+   values trusted during replay.
+3. Encodes the logical undo descriptor and all physical effects.
+4. Calls `Log::append`, which assigns and returns the record LSN.
+5. Sets the transaction's `lastLSN` to the returned LSN.
+6. Writes that LSN into every affected cached page and recomputes its checksum.
+7. Marks the affected frames dirty and flushable.
+8. Releases the operation's page latches and pins.
 
-After the B+ tree modifies the raw cached bytes, `finish_mutation`:
+All affected pages use the compound action LSN as `pageLSN`. A page cannot be
+written while the action is incomplete. Once it is flushable, the ordinary
+spill path first makes WAL durable through that shared action LSN.
 
-1. Reserves the `PAGE_UPDATE_FULL` record LSN.
-2. Writes that LSN into the cached page's `pageLSN` field.
-3. Recomputes the cached page checksum.
-4. Appends a record containing `before_image` and the current cached 4096 bytes.
-5. Marks the cached page dirty.
-6. Marks the mutation finished and releases its mutation pin.
+Appending copies the complete record before `finish` returns. Redo applies the
+recorded page content, assigns the enclosing record's LSN as `pageLSN`, and
+recomputes the whole-page checksum. Append does not synchronize WAL; commit
+and cache-spill paths perform durability waits. The append path must reserve
+required memory before modifying pages so a full WAL buffer cannot force disk
+I/O while B+ tree latches are held.
 
-Appending copies the complete record into logger-owned memory before
-`finish_mutation` returns. The cache may change again afterward, so the logger
-must not retain a span into the cached page as the durable after-image.
+If preparation fails before physical append begins, the batch restores every
+transient before-image and its prior runtime state before releasing pins and
+latches. An unfinished batch destructor performs the same cancellation. An
+ambiguous physical append failure instead places the engine in
+recovery-required state. After append succeeds, later transaction abort uses
+logical undo rather than the discarded scratch images.
 
-Appending does not synchronize the WAL. Commit and cache-spill paths perform
-the required durability waits later.
+### Propagated Structural Change
 
-If record reservation or append fails, `finish_mutation` restores the complete
-`before_image`, including the old kind, `pageLSN`, checksum, and payload, and
-restores the prior runtime dirty state. An unfinished mutation's destructor
-performs the same restoration so early returns cannot leave an unlogged page
-change in the cache.
-
-### Repeated Mutations
-
-Every finished physical change receives its own record:
+Inserting one key may split a leaf, propagate a separator, split an internal
+page, create a root, and update page-allocation metadata. One action record can
+therefore contain effects such as:
 
 ```text
-R1: X   -> X_m
-R2: X_m -> X_mm
+BTREE_ACTION Insert(K)
+undo: Delete(K)
+physical effects:
+    Write old leaf after-image
+    Allocate right leaf after-image
+    Write old parent after-image
+    Allocate right internal after-image
+    Allocate new root after-image
+    Write database metadata after-image
 ```
 
-The second `begin_mutation` copies the already-installed `X_m` image. Redo in
-LSN order produces `X_m` and then `X_mm`. Undo follows the transaction's
-`prevLSN` chain in reverse and restores `X_m` and then `X`. Recovery must not
-skip repeated page numbers with a hash set.
+Recovery installs these images in their encoded order. Temporary inconsistency
+while recovery applies part of the record is acceptable because recovery runs
+before clients start. If recovery itself crashes, the intact WAL record is
+replayed again; valid pages already carrying the action LSN are skipped and
+the remaining pages are installed.
 
 ### Allocation, Free, and Kind Changes
 
-Allocation accepts the desired page kind. Whether the page comes from file
-extension or the freelist, the pager initializes the cached header and payload
-through a mutation before returning the mutation's full 4096-byte span to the
-B+ tree.
+An effect distinguishes writing an existing page, allocating a page, and
+turning a page into a freelist page. Allocation by file extension first ensures
+that the file can address the page and then installs its complete initialized
+after-image. Reuse is represented by the logged free-page and initialization
+images in LSN order. The first implementation does not shrink the database
+file during ordinary free.
 
-Freeing a page similarly uses a mutation to change the kind to `Freelist` and
-write the freelist payload. A rare deliberate reinitialization uses
-`set_page_kind()` on the mutation and rebuilds the payload before finishing.
-Header and payload changes therefore appear in one full-page after-image and
-one eventual 4096-byte database write.
+V2 deliberately has no page generation. Ordered WAL replay, logged allocation
+and initialization, and monotonic `pageLSN` values distinguish reuse. When a
+valid reused page already has a later LSN, an old record is skipped. When the
+page is torn, recovery replays retained complete after-images in order so the
+newest initialization and subsequent images win.
 
 ## Logger Module
 
@@ -422,20 +433,440 @@ The logger abstraction also owns existing segments, the active segment,
 record append, sequential scan, record lookup needed by `prevLSN`, and
 durability tracking.
 
-The first physical record family includes transaction boundaries, full-page
-updates, allocation, initialization, free, and the metadata/freelist page
-updates needed to make those operations reversible. Exact record headers and
-payload layouts are finalized with the logger codec rather than inferred from
-the current rollback journal.
+### Finishing the Existing `Log` Layer
+
+The repository already has the lower mechanical layers:
+
+- `Store` owns length-prefixed record bytes.
+- `Index` maps a segment-relative LSN to a Store offset.
+- `Segment` coordinates Store and Index append, read, scan, synchronization,
+  tail recovery, dense LSN validation, and size-limit detection.
+- `WalRecord` currently contains an absolute LSN and an opaque byte payload.
+- `WalRecordCodec` currently encodes that minimal envelope.
+
+The next logger task is to finish `Log` as the owner and coordinator above
+`Segment`, rather than introducing transaction or B+ tree behavior into the
+lower layers. Its first public responsibilities are:
+
+```cpp
+class Log {
+  public:
+    void open(const std::string &directory);
+    void close();
+
+    Lsn append(PendingWalRecord record);
+    WalRecord read(Lsn lsn) const;
+    std::vector<WalRecord> scan() const;
+
+    void sync_through(Lsn target_lsn);
+    Lsn durable_lsn() const noexcept;
+
+  private:
+    std::string directory_;
+    std::unique_ptr<Segment> active_segment_;
+    std::vector<std::unique_ptr<Segment>> segments_;
+    Lsn next_lsn_ = 1;
+    Lsn durable_lsn_ = 0;
+};
+```
+
+`Log::open` discovers and orders existing segments, opens each segment so its
+Store/Index pair can recover, selects or creates the active segment, and
+reconstructs the next absolute LSN. `append` assigns that LSN, appends through
+the active segment, and creates the next segment only after the complete
+crossing record leaves the current segment maxed. `sync_through` synchronizes
+the required segments in LSN order, always Store before its derived Index, and
+advances `durable_lsn_` through at least the requested record.
+
+`Log`, `Segment`, `Store`, and `Index` remain unaware of `Key`, `Value`, page
+layout, splits, or logical undo. The common WAL envelope gains record type,
+transaction ID, `prevLSN`, framing validation, and checksum, but its payload
+remains opaque bytes produced by a higher-level typed payload codec.
+
+```cpp
+struct PendingWalRecord {
+    WalRecordType type;
+    TransactionId txn_id;
+    Lsn prev_lsn;
+    std::vector<char> data;
+};
+```
+
+Callers do not choose an LSN. `Log::append` converts the pending record into a
+stored `WalRecord` using its current `next_lsn_` and returns the assigned LSN.
+`Segment` retains its existing responsibility to reject any record whose LSN
+does not equal that segment's next dense value.
+
+An append failure after physical Store I/O begins is potentially ambiguous:
+the authoritative Store record may exist even when its Index append failed.
+The existing `Segment::recovery_required_` boundary is therefore preserved.
+Such a result poisons the open storage engine and requires close, reopen, and
+WAL recovery; it is not treated as a definitely unappended action that can be
+restored in memory and followed by more writes.
+
+## Typed WAL Record Family
+
+Every typed record has a framed, checksummed common header conceptually
+containing:
+
+```cpp
+enum class WalRecordType : std::uint16_t {
+    TxnBegin,
+    BTreeAction,
+    Compensation,
+    SystemAction,
+    TxnCommit,
+    TxnAbort,
+    TxnEnd,
+};
+
+struct WalRecordHeader {
+    std::uint32_t total_size;
+    std::uint16_t format_version;
+    WalRecordType type;
+    Lsn lsn;
+    TransactionId txn_id;
+    Lsn prev_lsn;
+    std::uint32_t checksum;
+};
+```
+
+Exact serialized offsets are finalized with the typed codec. `prev_lsn` is the
+previous record for the same transaction and `Transaction::last_lsn` is
+advanced after each successful append.
+
+### Transaction Boundary Records
+
+`TXN_BEGIN` starts the chain and has `prevLSN = 0`. `TXN_COMMIT` records the
+commit decision and becomes the transaction's durability point when WAL is
+synchronized through its end. `TXN_ABORT` records the reason rollback began;
+it does not mean rollback finished. `TXN_END` records completed cleanup,
+especially after every required compensation record has been appended during
+abort. The first implementation synchronizes WAL through an aborting
+transaction's `TXN_END` before releasing its logical locks or acknowledging
+rollback.
+
+```cpp
+struct TxnBeginPayload {};
+struct TxnCommitPayload {};
+
+enum class AbortReason : std::uint8_t {
+    ClientRequest,
+    DeadlockVictim,
+    StatementFailure,
+    InternalError,
+};
+
+struct TxnAbortPayload {
+    AbortReason reason;
+};
+
+struct TxnEndPayload {};
+```
+
+Empty payloads serialize as zero payload bytes rather than relying on the C++
+size of an empty struct. Commit timestamps, isolation metadata, or replicated
+command identity can be added only through an explicit WAL format revision.
+
+### B+ Tree Action Record
+
+One `BTREE_ACTION` record combines one logical inverse with every physical
+after-image produced by that operation:
+
+```cpp
+enum class BTreeActionKind : std::uint8_t {
+    Insert,
+    Update,
+    Delete,
+};
+
+struct InsertUndo { Key key; };
+struct UpdateUndo { Key key; Value old_value; };
+struct DeleteUndo { Key key; Value old_value; };
+
+using UndoDescriptor = std::variant<
+    InsertUndo,
+    UpdateUndo,
+    DeleteUndo
+>;
+
+enum class PageEffectKind : std::uint8_t {
+    Write,
+    Allocate,
+    Free,
+};
+
+struct PageEffect {
+    PageEffectKind kind;
+    PageNumber page_num;
+    PageImage after_image;
+};
+
+struct BTreeActionPayload {
+    BTreeActionKind action;
+    UndoDescriptor undo;
+    std::vector<PageEffect> physical_effects;
+};
+```
+
+The undo mapping is:
+
+```text
+Insert(key, value)       -> Delete(key)
+Delete(key, old_value)   -> Insert(key, old_value)
+Update(key, old, new)    -> Update(key, new, old)
+```
+
+The logical inverse appears once even when the operation changes many pages.
+Redo applies the physical effects; undo searches the current tree by key and
+executes the inverse once. Existing strict logical locking retains the key's
+lock until commit or complete abort, so the inverse cannot race a conflicting
+operation on that key.
+
+### Compensation Record
+
+Every completed logical inverse appends a redo-only CLR:
+
+```cpp
+struct CompensationPayload {
+    Lsn undo_of_lsn;
+    Lsn undo_next_lsn;
+    std::vector<PageEffect> physical_effects;
+};
+```
+
+`undo_of_lsn` identifies the action reversed. `undo_next_lsn` is that action's
+`prevLSN` and tells recovery where the transaction's remaining undo resumes.
+The effects are the complete physical after-images produced by executing the
+inverse against the current B+ tree. A CLR is redone but never undone.
+
+Undo restores logical contents, not the former physical tree shape. An insert
+that caused a split is undone by deleting the inserted key; the split may
+remain as a valid underfilled structure. Merge-on-delete is postponed in the
+first implementation.
+
+### System Action Record
+
+A redo-only `SYSTEM_ACTION` contains a system action kind plus a vector of
+physical page effects. It is available for compaction, independent structural
+maintenance, and allocator maintenance that is not logically owned by one
+user action. Initially, splits and root propagation caused directly by an
+insert can remain inside that insert's compound `BTREE_ACTION` record.
+
+```cpp
+enum class SystemActionKind : std::uint8_t {
+    PageCompaction,
+    AllocatorMaintenance,
+    IndependentStructuralMaintenance,
+};
+
+struct SystemActionPayload {
+    SystemActionKind action;
+    std::vector<PageEffect> physical_effects;
+};
+```
+
+An independent system action uses transaction ID and `prevLSN` zero and is
+always redo-only. A structural effect caused directly by a user action stays
+inside that transaction's `BTREE_ACTION` rather than being duplicated here.
+
+### Why There Are No Persistent Before-Images
+
+Persistent transaction undo is logical, so an action record does not store a
+full-page before-image. Restoring one would erase later updates made by other
+transactions to different keys on the same physical page. Before-images exist
+only as operation-local scratch used to cancel a mutation whose compound WAL
+append has not succeeded.
+
+## KeyStore-to-Pager Integration
+
+The cross-layer object is a pending action payload, not an encoded `WalRecord`.
+KeyStore creates it where the logical meaning is known, B+ tree helpers pass it
+through physical propagation, Pager adds exact page effects, and the completed
+payload is encoded and appended only after the operation succeeds.
+
+```cpp
+struct PendingBTreeAction {
+    TransactionId txn_id;
+    Lsn prev_lsn;
+
+    std::optional<BTreeActionKind> action;
+    std::optional<UndoDescriptor> undo;
+
+    std::vector<PageEffect> page_effects;
+
+    void add_or_replace_page_effect(PageEffect effect);
+};
+```
+
+This is a higher-level builder. The final action kind and inverse may remain
+unset until B+ tree returns whether a `put` inserted or replaced and returns
+any old value. Both must be set before encoding. The builder does not have an
+LSN because only `Log` assigns LSNs, and it does not contain already encoded
+WAL bytes while lower layers are still discovering physical effects.
+
+### KeyStore Responsibility
+
+KeyStore obtains the required logical key lock, associates the action with its
+transaction, and provides the logical inverse. A `put` must distinguish a new
+insert from replacement of an existing value; a remove must retain the removed
+value:
+
+```cpp
+struct BTreePutResult {
+    BTreeStatus status;
+    std::optional<Value> old_value;
+};
+```
+
+After B+ tree success, KeyStore selects:
+
+```text
+no old value      -> InsertUndo { key }
+old value exists  -> UpdateUndo { key, old_value }
+successful remove -> DeleteUndo { key, removed_value }
+```
+
+This avoids a second lookup solely for WAL construction. If no logical change
+occurred, KeyStore cancels the pending action and appends no action record.
+
+### B+ Tree Responsibility
+
+Every mutating B+ tree entry point and propagation helper receives the same
+pending action:
+
+```cpp
+BTreePutResult put(
+    const Key &key,
+    const Value &value,
+    PendingBTreeAction &wal_action
+);
+
+BTreeStatus propagate_splitting(
+    PageNumber page_num,
+    std::vector<TraversalPathEntry> &path,
+    PendingBTreeAction &wal_action
+);
+```
+
+The B+ tree does not encode records or copy page bytes. It passes the action to
+every Pager call that can mutate an existing page, allocate or free a page,
+change a root, or update metadata. This includes every current `begin_write`,
+`allocate_page`, `free_page`, and `set_btree_root` path.
+
+Because the current `BTree` privately owns its `Pager`, it also exposes narrow
+completion forwarding during this transition:
+
+```cpp
+void complete_wal_action(
+    PendingBTreeAction &wal_action,
+    Lsn assigned_lsn
+);
+
+void cancel_wal_action(PendingBTreeAction &wal_action);
+```
+
+These methods delegate frame finalization or scratch restoration to Pager.
+They do not encode or append WAL themselves. A future shared `StorageEngine`
+may own this orchestration directly, but that larger refactor is not required
+to integrate the current ownership layout.
+
+### Pager Responsibility
+
+Pager owns exact physical capture and frame lifecycle. Its mutating interface
+requires the pending action:
+
+```cpp
+PageMutation begin_mutation(
+    PageNumber page_num,
+    PendingBTreeAction &wal_action
+);
+
+PagerAllocateResult allocate_page(
+    V2PageKind kind,
+    PendingBTreeAction &wal_action
+);
+
+PagerResult free_page(
+    PageNumber page_num,
+    PendingBTreeAction &wal_action
+);
+
+PagerResult set_btree_root(
+    PageNumber root_page_num,
+    PendingBTreeAction &wal_action
+);
+```
+
+On first touch, Pager captures transient cancellation state, takes an extra
+operation pin, and marks the frame WAL-pending and therefore not flushable. At
+each completed physical change it adds or replaces that page's effect. If the
+same logical operation touches one page repeatedly, only its final after-image
+remains in the compound record.
+
+Pager, not B+ tree, understands the exact persistent 4096-byte representation,
+allocation/free effect kind, page checksum, and runtime frame state. B+ tree
+therefore never constructs a `PageEffect` from raw bytes itself.
+
+### Successful Operation
+
+The end-to-end write path is:
+
+```text
+KeyStore creates PendingBTreeAction with txn ID and prevLSN
+    -> BTree performs the operation and propagates the same action
+    -> Pager collects every final physical effect and keeps pages WAL-pending
+    -> KeyStore supplies the final logical undo descriptor
+    -> BTreeActionCodec encodes the completed opaque payload
+    -> Log assigns an LSN and appends the record
+    -> transaction.lastLSN becomes the returned LSN
+    -> KeyStore calls BTree::complete_wal_action with the returned LSN
+    -> Pager installs that LSN/checksum in affected frames
+    -> Pager marks frames dirty and flushable and releases operation pins
+```
+
+The after-image payload need not trust recovery fields copied before LSN
+assignment. Redo installs the recorded page content, writes the enclosing
+record's LSN into `pageLSN`, and recomputes the whole-page checksum. After the
+runtime append succeeds, Pager performs the same `pageLSN` and checksum update
+on the cached frames before making them flushable.
+
+Appending does not synchronize WAL. Commit and page-spill paths retain their
+separate durability responsibilities.
+
+### Failure Boundaries
+
+Before physical WAL append begins, B+ tree failure, validation failure, codec
+failure, or buffer-allocation failure cancels the operation. Pager restores
+the transient page images and prior dirty state, releases pins, and discards
+the pending action through `BTree::cancel_wal_action`.
+
+After physical append begins, failure may leave a valid authoritative Store
+record without its derived Index entry. The engine enters a recovery-required
+state and stops accepting operations. It does not restore pages and continue
+because reopening may discover and redo that record.
+
+The practical conversion order is:
+
+1. Finish `Log` over the existing Segment/Store/Index implementation. Complete.
+2. Add the typed, checksummed common WAL envelope. Complete.
+3. Add the typed payload codec and `PendingBTreeAction`. Complete.
+4. Thread the pending action through KeyStore, B+ tree, and every Pager mutation
+   path while the rollback journal remains authoritative.
+5. Add WAL-pending frame state and complete page-effect collection tests.
+6. Enforce WAL-before-data on spill and eviction.
+7. Add transaction-manager commit, logical abort, CLRs, and startup recovery.
+8. Remove rollback journaling only after crash-injection equivalence tests pass.
 
 ## Incremental Rollback-Journal-to-WAL Transition
 
 ### Stage 1: V2 Page Format — Complete
 
-Implement V2-named page types, the common page codec, CRC32C, corruption tests,
-and raw full-page views without changing the legacy pager or B+ tree.
+V2-named page types, the common page codec, whole-page CRC32C, corruption
+tests, and raw full-page views are implemented without changing the legacy
+pager or B+ tree.
 
-### Stage 2: Standalone Logger — Next
+### Stage 2: Standalone Logger — Complete
 
 Implement store/index segments, LSN allocation, append, rollover, scan,
 lookup, durability tracking, and torn-tail tests without pager integration.
@@ -444,8 +875,9 @@ lookup, durability tracking, and torn-tail tests without pager integration.
 
 Add `begin_mutation` and `finish_mutation` beside `begin_write`. Convert pager
 and B+ tree modification paths one at a time. Converted operations append WAL
-records, while the rollback journal remains the authoritative commit and crash
-recovery mechanism.
+records. The operation coordinator groups every propagated page effect into
+one compound action record, while the rollback journal remains the
+authoritative commit and crash-recovery mechanism.
 
 The transitional engine is intentionally awkward: it may force database pages
 according to the rollback-journal policy even though it also emits WAL. That
@@ -453,8 +885,9 @@ temporary behavior is removed only after all physical mutations are logged.
 
 ### Stage 4: WAL Cutover
 
-After allocation, free, metadata, root, leaf, internal, split, merge, and file
-length changes all emit complete WAL records:
+After allocation, free, metadata, root, leaf, internal, split, and file-length
+changes all emit complete compound WAL records, and logical undo plus CLRs are
+implemented:
 
 - Remove `begin_write` and make `begin_mutation` the only page-write boundary.
 - Append and synchronize `TXN_COMMIT` before acknowledging commit.
@@ -474,16 +907,45 @@ On database open, before accepting embedded callers, recovery:
 
 1. Scans retained WAL from the first segment.
 2. Reconstructs transaction state and per-transaction `lastLSN` values.
-3. Redoes required physical records in LSN order when the persisted page LSN is
-   smaller than the record LSN.
-4. Undoes loser transactions through their `prevLSN` chains using full
-   before-images.
-5. Synchronizes required recovery output before opening the database.
+3. Redoes every required physical after-image in LSN order, including history
+   from transactions that did not commit. A valid page is skipped when its
+   `pageLSN` is already at least the record LSN.
+4. Uses checksums to detect torn pages. A torn page's `pageLSN` is not trusted;
+   retained complete after-images reconstruct that page in WAL order.
+5. After physical redo has restored a structurally valid B+ tree, identifies
+   transactions without durable commit records as losers.
+6. Undoes each loser logically by following `lastLSN`, `prevLSN`, and any
+   CLR `undoNextLSN` values. Every newly completed inverse emits a CLR with its
+   propagated physical after-images.
+7. Synchronizes recovery-generated WAL before allowing any page carrying those
+   CLR effects to reach disk, then opens the database.
 
-The exact concurrent-writer undo and compensation-record policy is a separate
-decision that must be complete before concurrent writers are enabled. The
-page format, logger, and mutation API must not encode an exactly-one-writer
-restriction.
+Redo-before-undo is essential for structural operations. If only some pages of
+an uncommitted split reached disk, physical redo first installs all pages from
+the intact compound record. Logical undo then removes the losing key without
+trying to reverse the split itself.
+
+### Torn Pages and Recovery Re-entry
+
+WAL-before-data guarantees that the complete compound record is durable before
+any page carrying its LSN is written. A crash can nevertheless interrupt the
+database-page write itself and leave a mixture of old and new sectors. Because
+the whole-page checksum includes `pageLSN`, recovery treats any checksum
+failure as an invalid page and does not perform an LSN comparison against it.
+It reconstructs that page from retained full after-images in increasing LSN
+order, ending at the newest action applicable to that page.
+
+WAL records themselves use length framing and checksums. A partial final WAL
+record is excluded from the valid WAL prefix. No database page may depend on
+that excluded record because the page could not have been written until WAL
+was synchronized through the complete record.
+
+Applying a compound action to several database pages is restartable rather
+than an atomic multi-page disk write. Recovery may crash after installing only
+some effects. On the next start, pages with a valid checksum and
+`pageLSN >= actionLSN` are skipped; torn or older pages receive their recorded
+after-images. Repetition eventually installs the complete structurally valid
+state before logical undo begins.
 
 Without regular checkpoints:
 
@@ -503,15 +965,20 @@ checkpoint metadata, and safe segment reclamation are a later milestone.
 - Database pages are not forced at commit.
 - WAL append buffers must own record bytes; they cannot retain spans into
   mutable cached pages.
-- A failed or abandoned mutation restores its before-image before releasing
-  its pin.
+- A page participating in an unfinished compound action is pinned and not
+  flushable.
+- A failed or abandoned action restores all transient scratch before-images
+  before releasing its pins.
+- A page checksum failure makes its encoded `pageLSN` untrusted. Recovery uses
+  retained complete WAL after-images to reconstruct it.
+- WAL records have length framing and checksums; recovery ignores only a
+  defined incomplete final record and rejects corruption inside retained
+  history.
 
 ## Immediate Implementation Order
 
-Stage 1's common V2 page representation, codec, CRC32C implementation, and
-corruption tests are complete. They remain standalone and do not modify the
-legacy pager, B+ tree, rollback journal, or transaction flow.
-
-The next bounded task is Stage 2's standalone logger. Mutation integration
-remains a later, separately tested task. No replacement `BTreePageV2` or legacy
-pager/B+ tree adaptation is part of the logger milestone.
+Stages 1 and 2 are complete and remain standalone: V2 CRC32C covers the whole
+page with the checksum field zeroed, and the typed Log stack is implemented
+without modifying the legacy pager, B+ tree, rollback journal, or transaction
+flow. The next bounded task is operation-scoped mutation integration using
+`PendingBTreeAction`; WAL cutover remains a later, separately tested task.

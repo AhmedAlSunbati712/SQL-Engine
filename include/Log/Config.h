@@ -9,7 +9,7 @@
 struct Config {
     std::uint64_t max_index_bytes = 0;
     std::uint64_t max_store_bytes = 0;
-    std::uint64_t initial_offset = 0;
+    std::uint64_t initial_lsn = 1;
 
     /// Validates configuration rules finalized by the current logger layers.
     ///
@@ -22,6 +22,9 @@ struct Config {
         }
         if (max_store_bytes == 0) {
             throw std::invalid_argument("max_store_bytes must be nonzero");
+        }
+        if (initial_lsn == 0) {
+            throw std::invalid_argument("initial_lsn must be nonzero");
         }
     }
 };

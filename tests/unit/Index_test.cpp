@@ -229,21 +229,21 @@ TEST(IndexTest, ConfigRequiresIndexLimitAlignedToEntryWidth) {
     Config valid{
         .max_index_bytes = 10 * Index::ENTRY_SIZE,
         .max_store_bytes = 4096,
-        .initial_offset = 1,
+        .initial_lsn = 1,
     };
     EXPECT_NO_THROW(valid.validate());
 
     Config zero{
         .max_index_bytes = 0,
         .max_store_bytes = 4096,
-        .initial_offset = 1,
+        .initial_lsn = 1,
     };
     EXPECT_THROW(zero.validate(), std::invalid_argument);
 
     Config misaligned{
         .max_index_bytes = 10 * Index::ENTRY_SIZE + 1,
         .max_store_bytes = 4096,
-        .initial_offset = 1,
+        .initial_lsn = 1,
     };
     EXPECT_THROW(misaligned.validate(), std::invalid_argument);
 }
