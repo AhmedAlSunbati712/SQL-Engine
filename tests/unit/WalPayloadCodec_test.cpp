@@ -58,4 +58,10 @@ TEST(WalPayloadCodecTest, RejectsPageNumberMismatchAndBadStructure) {
     auto invalid = effect(); invalid.after_image[0] = 0;
     EXPECT_THROW(WalPayloadCodec::encode(WalRecordType::SystemAction, SystemActionPayload{SystemActionKind::BTreeSplit, {invalid}}), std::invalid_argument);
 }
+
+TEST(WalPayloadCodecTest, FactoriesRejectInvalidTransactionMetadata) {
+    EXPECT_THROW(WalRecords::begin(0), std::invalid_argument);
+    EXPECT_THROW(WalRecords::commit(1, 0), std::invalid_argument);
+    EXPECT_THROW(WalRecords::abort(0, 1, AbortReason::ClientRequest), std::invalid_argument);
+}
 } // namespace

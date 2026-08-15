@@ -85,4 +85,13 @@ TEST(LogTest, ConcurrentAppendsRemainUniqueAndDense) {
     auto records = log.scan(); ASSERT_EQ(records.size(), thread_count * records_per_thread);
     for (std::size_t i = 0; i < records.size(); ++i) EXPECT_EQ(records[i].lsn, i + 1);
 }
+
+TEST(LogTest, InvalidAppendDoesNotRollOrConsumeLsn) {
+    TempDir dir; Config small = config(); small.max_store_bytes = 40;
+    Log log(small); log.open(dir.path.string());
+    EXPECT_EQ(log.append(system()), 1u);
+    EXPECT_THROW(log.append({.type = WalRecordType::TxnCommit, .transaction_id = 1}), std::invalid_argument);
+    EXPECT_EQ(log.next_lsn(), 2u);
+    EXPECT_FALSE(std::filesystem::exists(dir.path / "segment-00000000000000000002.store"));
+}
 } // namespace

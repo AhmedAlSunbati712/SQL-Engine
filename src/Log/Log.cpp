@@ -1,6 +1,7 @@
 #include <Log/Log.h>
 
 #include <DiskIO.h>
+#include <Log/WalRecordCodec.h>
 
 #include <fcntl.h>
 #include <filesystem>
@@ -106,12 +107,17 @@ Lsn Log::append(PendingWalRecord pending) {
     if (segments_.empty()) throw std::runtime_error("Log is not open");
     if (recovery_required_) throw std::runtime_error("Log must be reopened and recovered before appending");
 
-    // A complete record that crosses a limit remains in its original segment.
-    // Rollover happens before the following append.
-    if (segments_.back()->is_maxed()) create_segment(next_lsn_);
     WalRecord record{.lsn = next_lsn_, .type = pending.type,
                      .transaction_id = pending.transaction_id,
                      .prev_lsn = pending.prev_lsn, .data = std::move(pending.data)};
+
+    // Validate before rollover so rejected caller input cannot create an empty
+    // segment or otherwise mutate the logger.
+    (void)WalRecordCodec::encode(record);
+
+    // A complete record that crosses a limit remains in its original segment.
+    // Rollover happens before the following append.
+    if (segments_.back()->is_maxed()) create_segment(next_lsn_);
     try {
         segments_.back()->append(record);
     } catch (...) {

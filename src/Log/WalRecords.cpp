@@ -1,8 +1,18 @@
 #include <Log/WalRecords.h>
 #include <Log/WalPayloadCodec.h>
 
+#include <stdexcept>
+
 namespace {
 PendingWalRecord make(WalRecordType type, std::uint64_t txn, Lsn prev, const WalPayload& payload) {
+    if (type == WalRecordType::SystemAction) {
+        if (txn != 0 || prev != 0) throw std::invalid_argument("System action must not belong to a transaction");
+    } else {
+        if (txn == 0) throw std::invalid_argument("WAL record requires a transaction ID");
+        if (type == WalRecordType::TxnBegin ? prev != 0 : prev == 0) {
+            throw std::invalid_argument("WAL record has an invalid prevLSN");
+        }
+    }
     return {.type = type, .transaction_id = txn, .prev_lsn = prev,
             .data = WalPayloadCodec::encode(type, payload)};
 }
