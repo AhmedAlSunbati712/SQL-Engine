@@ -5,7 +5,9 @@
 
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -21,7 +23,7 @@ enum class PageLatchMode : std::uint8_t {
 class BTreeOperation {
 public:
     BTreeOperation(TransactionId txn_id, Pager& pager);
-    ~BTreeOperation();
+    ~BTreeOperation() noexcept;
 
     BTreeOperation(const BTreeOperation&) = delete;
     BTreeOperation& operator=(const BTreeOperation&) = delete;
@@ -32,9 +34,10 @@ public:
     PageV2* lock_shared(PageV2* pinned_page);
     PageV2* lock_exclusive(PageV2* pinned_page);
 
-    void release(std::uint32_t page_num);
-    void release_all();
+    void release(std::uint32_t page_num) noexcept;
+    void release_all() noexcept;
 
+    std::optional<PageLatchMode> latch_mode(std::uint32_t page_num) const noexcept;
     TransactionId transaction_id() const noexcept { return txn_id_; }
 
 private:
@@ -50,4 +53,5 @@ private:
     TransactionId txn_id_;
     Pager& pager_;
     std::vector<HeldPage> held_pages_;
+    std::unordered_map<std::uint32_t, PageLatchMode> held_modes_;
 };

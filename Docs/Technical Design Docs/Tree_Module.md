@@ -171,11 +171,13 @@ public:
 
     void release(std::uint32_t page_num);
     void release_all();
+    std::optional<PageLatchMode> latch_mode(std::uint32_t page_num) const;
 
 private:
     TransactionId txn_id_;
     Pager& pager_;
     std::vector<HeldPage> held_pages_;
+    std::unordered_map<std::uint32_t, PageLatchMode> held_modes_;
 };
 ```
 
@@ -187,6 +189,10 @@ construction, or page modification throws. Holding a latch without the pager
 reference is invalid because the cached `PageV2` could otherwise be evicted.
 Transaction IDs are not part of latch compatibility and there is no latch
 wait-for graph.
+
+The small `held_modes_` index makes inspection of the latch mode held for a
+page an average `O(1)` lookup. The vector remains authoritative for guard
+ownership and reverse-order release.
 
 ### Global Acquisition Order
 

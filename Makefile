@@ -11,6 +11,7 @@ SRC = \
 	src/KeyStore.cpp \
 	src/containers/BTree.cpp \
 	src/containers/BTreeCursor.cpp \
+	src/containers/BTreeOperation.cpp \
 	src/containers/BTreePage.cpp \
 	src/containers/DLList.cpp \
 	src/client/Client.cpp \
@@ -44,6 +45,7 @@ OBJ = \
 	build/KeyStore.o \
 	build/containers/BTree.o \
 	build/containers/BTreeCursor.o \
+	build/containers/BTreeOperation.o \
 	build/containers/BTreePage.o \
 	build/containers/DLList.o \
 	build/client/Client.o \
@@ -156,6 +158,8 @@ build/tests/unit/%: build/tests/unit/%.o $(LIB)
 
 build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
+build/tests/unit/BTreeOperation_test: CXXFLAGS += -pthread
+build/tests/unit/BTreeOperation_test: LDLIBS += -pthread
 build/tests/unit/Log_test: CXXFLAGS += -pthread
 build/tests/unit/Log_test: LDLIBS += -pthread
 build/tests/unit/TransactionManager_test: CXXFLAGS += -pthread
