@@ -3,5 +3,6 @@ SQLite Database System Design and Implementation (Sibsankar Haldar) (Z-Library)-
 *.o
 build/
 benchmarks/*
+!benchmarks/LockManager_benchmark.cpp
 design-review.md
 STATUS.md

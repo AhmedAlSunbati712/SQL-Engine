@@ -87,8 +87,14 @@ SERVER_SRC = \
 SERVER_OBJ = $(patsubst src/%.cpp,build/%.o,$(SERVER_SRC))
 SERVER_BIN = build/stoneleaf-server
 
-.PHONY: all server test test-unit test-integration clean
-.SECONDARY: $(UNIT_TEST_OBJ) $(INTEGRATION_TEST_OBJ)
+BENCHMARK_SRC = benchmarks/LockManager_benchmark.cpp
+BENCHMARK_OBJ = build/benchmarks/LockManager_benchmark.o
+BENCHMARK_BIN = build/benchmarks/LockManager_benchmark
+BENCHMARK_LIB = build/benchmarks/libstoneleafdb.a
+BENCHMARK_LIB_OBJ = $(patsubst src/%.cpp,build/benchmarks/lib/%.o,$(SRC))
+
+.PHONY: all server benchmark benchmark-run test test-unit test-integration clean
+.SECONDARY: $(UNIT_TEST_OBJ) $(INTEGRATION_TEST_OBJ) $(BENCHMARK_OBJ) $(BENCHMARK_LIB_OBJ)
 
 all: $(LIB) $(UNIT_TEST_BIN) $(INTEGRATION_TEST_BIN)
 
@@ -97,6 +103,11 @@ $(LIB): $(OBJ)
 	$(AR) $(ARFLAGS) $@ $^
 
 server: $(SERVER_BIN)
+
+benchmark: $(BENCHMARK_BIN)
+
+benchmark-run: $(BENCHMARK_BIN)
+	./$(BENCHMARK_BIN)
 
 $(SERVER_BIN): CXXFLAGS += -pthread
 $(SERVER_BIN): $(SERVER_OBJ) $(LIB)
@@ -122,6 +133,22 @@ build/tests/integration/%: build/tests/integration/%.o $(LIB)
 build/tests/unit/%.o: tests/unit/%.cpp
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+build/benchmarks/%.o: benchmarks/%.cpp
+	mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -O3 -DNDEBUG -pthread -c $< -o $@
+
+build/benchmarks/lib/%.o: src/%.cpp
+	mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -O3 -DNDEBUG -pthread -c $< -o $@
+
+$(BENCHMARK_LIB): $(BENCHMARK_LIB_OBJ)
+	mkdir -p $(dir $@)
+	$(AR) $(ARFLAGS) $@ $^
+
+$(BENCHMARK_BIN): $(BENCHMARK_OBJ) $(BENCHMARK_LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) -pthread
 
 build/tests/unit/%: build/tests/unit/%.o $(LIB)
 	mkdir -p $(dir $@)
