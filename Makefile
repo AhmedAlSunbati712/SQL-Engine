@@ -22,6 +22,8 @@ SRC = \
 	src/Log/Segment.cpp \
 	src/Log/Store.cpp \
 	src/Log/WalRecordCodec.cpp \
+	src/Log/WalPayloadCodec.cpp \
+	src/Log/WalRecords.cpp \
 	src/LockMgr.cpp \
 	src/LockManager/LockManager.cpp \
 	src/PCache.cpp \
@@ -49,6 +51,8 @@ OBJ = \
 	build/Log/Segment.o \
 	build/Log/Store.o \
 	build/Log/WalRecordCodec.o \
+	build/Log/WalPayloadCodec.o \
+	build/Log/WalRecords.o \
 	build/LockMgr.o \
 	build/LockManager/LockManager.o \
 	build/PCache.o \
