@@ -15,4 +15,6 @@ struct LockState {
     std::queue<Waiter> waiters;
     std::mutex mutex_;
     std::condition_variable cv_;
+
+    static bool grant_waiters(LockState& state);
 };
