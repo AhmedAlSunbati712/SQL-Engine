@@ -1,6 +1,7 @@
 #include <V2PageCodec.h>
 
 #include <Endian.h>
+#include <Crc32c.h>
 
 #include <algorithm>
 #include <array>
@@ -23,24 +24,11 @@ bool is_valid_page_kind(V2PageKind kind) {
     return false;
 }
 
-std::uint32_t compute_checksum(
-    std::span<const char, V2_PAGE_PAYLOAD_SIZE> payload) {
-    std::uint32_t crc = CRC32C_INITIAL;
-
-    for (char value : payload) {
-        const std::uint8_t byte = static_cast<std::uint8_t>(
-            static_cast<unsigned char>(value));
-
-        crc ^= byte;
-        for (int bit = 0; bit < 8; ++bit) {
-            if ((crc & 1u) != 0) {
-                crc = (crc >> 1) ^ CRC32C_POLYNOMIAL;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    return crc ^ CRC32C_INITIAL;
+std::uint32_t compute_checksum(std::span<const char, V2_PAGE_SIZE> page) {
+    std::array<char, V2_PAGE_SIZE> copy{};
+    std::copy(page.begin(), page.end(), copy.begin());
+    std::fill_n(copy.begin() + PAGE_CHECKSUM_OFFSET, PAGE_CHECKSUM_SIZE, '\0');
+    return crc32c(copy);
 }
 
 } // namespace
@@ -84,11 +72,10 @@ void set_page_kind(std::span<char, V2_PAGE_SIZE> page, V2PageKind kind) {
 
 void update_checksum(std::span<char, V2_PAGE_SIZE> page) {
     const std::span<const char, V2_PAGE_SIZE> const_page{page};
-    const auto payload = const_page.subspan<V2_PAGE_HEADER_SIZE, V2_PAGE_PAYLOAD_SIZE>();
-    put_u32_be(page.data() + PAGE_CHECKSUM_OFFSET, compute_checksum(payload));
+    put_u32_be(page.data() + PAGE_CHECKSUM_OFFSET, compute_checksum(const_page));
 }
 
-V2PageCodecResult validate(std::span<const char> page) {
+V2PageCodecResult validate_structure(std::span<const char> page) {
     if (page.size() != V2_PAGE_SIZE) {
         return V2PageCodecResult::InvalidSize;
     }
@@ -102,10 +89,16 @@ V2PageCodecResult validate(std::span<const char> page) {
 
     if (!is_valid_page_kind(page_kind(full_page))) return V2PageCodecResult::InvalidPageKind;
 
-    const std::uint32_t stored_checksum = get_u32_be(full_page.data() + PAGE_CHECKSUM_OFFSET);
-    const auto payload = full_page.subspan<V2_PAGE_HEADER_SIZE, V2_PAGE_PAYLOAD_SIZE>();
-    if (stored_checksum != compute_checksum(payload)) return V2PageCodecResult::ChecksumMismatch;
+    return V2PageCodecResult::Success;
+}
 
+V2PageCodecResult validate(std::span<const char> page) {
+    const auto structure = validate_structure(page);
+    if (structure != V2PageCodecResult::Success) return structure;
+
+    const std::span<const char, V2_PAGE_SIZE> full_page{page.data(), V2_PAGE_SIZE};
+    const auto stored = get_u32_be(full_page.data() + PAGE_CHECKSUM_OFFSET);
+    if (stored != compute_checksum(full_page)) return V2PageCodecResult::ChecksumMismatch;
     return V2PageCodecResult::Success;
 }
 

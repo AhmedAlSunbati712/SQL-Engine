@@ -54,7 +54,7 @@ TEST(V2PageCodecTest, InitializeBuildsValidPageAndClearsPayload) {
     EXPECT_TRUE(page.need_flushing);
 }
 
-TEST(V2PageCodecTest, InitializeUsesBigEndianAndStandardCrc32c) {
+TEST(V2PageCodecTest, InitializeUsesBigEndian) {
     PageV2 page;
     page.page_num = 0x01020304u;
 
@@ -75,14 +75,10 @@ TEST(V2PageCodecTest, InitializeUsesBigEndianAndStandardCrc32c) {
     EXPECT_EQ(byte_value(page.data[PAGE_KIND_OFFSET + 2]), 0x00u);
     EXPECT_EQ(byte_value(page.data[PAGE_KIND_OFFSET + 3]), 0x04u);
 
-    // Independently verified CRC32C for the 4072-byte all-zero payload.
-    EXPECT_EQ(byte_value(page.data[PAGE_CHECKSUM_OFFSET]), 0xC5u);
-    EXPECT_EQ(byte_value(page.data[PAGE_CHECKSUM_OFFSET + 1]), 0xD5u);
-    EXPECT_EQ(byte_value(page.data[PAGE_CHECKSUM_OFFSET + 2]), 0x02u);
-    EXPECT_EQ(byte_value(page.data[PAGE_CHECKSUM_OFFSET + 3]), 0xC0u);
+    EXPECT_EQ(V2PageCodec::validate(page.data), V2PageCodecResult::Success);
 }
 
-TEST(V2PageCodecTest, PageLsnRoundTripsWithoutChangingPayloadChecksum) {
+TEST(V2PageCodecTest, PageLsnRequiresChecksumRecomputation) {
     PageV2 page;
     V2PageCodec::initialize(page.data, 7, V2PageKind::Freelist);
     const auto checksum_before = std::array{
@@ -106,10 +102,12 @@ TEST(V2PageCodecTest, PageLsnRoundTripsWithoutChangingPayloadChecksum) {
     EXPECT_EQ(page.data[PAGE_CHECKSUM_OFFSET + 1], checksum_before[1]);
     EXPECT_EQ(page.data[PAGE_CHECKSUM_OFFSET + 2], checksum_before[2]);
     EXPECT_EQ(page.data[PAGE_CHECKSUM_OFFSET + 3], checksum_before[3]);
+    EXPECT_EQ(V2PageCodec::validate(page.data), V2PageCodecResult::ChecksumMismatch);
+    V2PageCodec::update_checksum(page.data);
     EXPECT_EQ(V2PageCodec::validate(page.data), V2PageCodecResult::Success);
 }
 
-TEST(V2PageCodecTest, PageKindRoundTripsWithoutChangingPayloadChecksum) {
+TEST(V2PageCodecTest, PageKindRequiresChecksumRecomputation) {
     PageV2 page;
     V2PageCodec::initialize(page.data, 9, V2PageKind::BTreeLeaf);
     const auto checksum_before = std::array{
@@ -128,6 +126,8 @@ TEST(V2PageCodecTest, PageKindRoundTripsWithoutChangingPayloadChecksum) {
     EXPECT_EQ(page.data[PAGE_CHECKSUM_OFFSET + 1], checksum_before[1]);
     EXPECT_EQ(page.data[PAGE_CHECKSUM_OFFSET + 2], checksum_before[2]);
     EXPECT_EQ(page.data[PAGE_CHECKSUM_OFFSET + 3], checksum_before[3]);
+    EXPECT_EQ(V2PageCodec::validate(page.data), V2PageCodecResult::ChecksumMismatch);
+    V2PageCodec::update_checksum(page.data);
     EXPECT_EQ(V2PageCodec::validate(page.data), V2PageCodecResult::Success);
 }
 
@@ -176,6 +176,20 @@ TEST(V2PageCodecTest, ValidateRejectsPayloadCorruption) {
     EXPECT_EQ(
         V2PageCodec::validate(page.data),
         V2PageCodecResult::ChecksumMismatch);
+}
+
+TEST(V2PageCodecTest, ValidateProtectsPageNumber) {
+    PageV2 page;
+    V2PageCodec::initialize(page.data, 1, V2PageKind::BTreeLeaf);
+    page.data[PAGE_NUM_OFFSET + 3] ^= 1;
+    EXPECT_EQ(V2PageCodec::validate(page.data), V2PageCodecResult::ChecksumMismatch);
+}
+
+TEST(V2PageCodecTest, ValidateStructureIgnoresStaleChecksum) {
+    PageV2 page;
+    V2PageCodec::initialize(page.data, 1, V2PageKind::BTreeLeaf);
+    V2PageCodec::set_page_lsn(page.data, 42);
+    EXPECT_EQ(V2PageCodec::validate_structure(page.data), V2PageCodecResult::Success);
 }
 
 TEST(V2PageCodecTest, ValidateRejectsStoredChecksumCorruption) {

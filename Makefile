@@ -28,6 +28,7 @@ SRC = \
 	src/Pager.cpp \
 	src/disk/DiskIO.cpp \
 	src/encoding/Endian.cpp \
+	src/encoding/Crc32c.cpp \
 	src/encoding/KeyCodec.cpp \
 	src/encoding/ValueCodec.cpp \
 	src/DBHeaderCodec.cpp \
@@ -54,6 +55,7 @@ OBJ = \
 	build/Pager.o \
 	build/disk/DiskIO.o \
 	build/encoding/Endian.o \
+	build/encoding/Crc32c.o \
 	build/encoding/KeyCodec.o \
 	build/encoding/ValueCodec.o \
 	build/DBHeaderCodec.o \
