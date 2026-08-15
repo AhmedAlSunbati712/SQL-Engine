@@ -317,6 +317,14 @@ class WaitForGraph {
 `TransactionManager` owns this object and exposes the registration and removal
 operations needed by `LockManager`. `KeyStore` never updates the graph.
 
+The incremental `WaitForGraph` implementation maintains both outgoing and
+incoming adjacency sets under one shared mutex. Its single-edge helper returns
+`true` for a successful insertion or an existing duplicate, and returns
+`false` when a node is missing or the edge would create a cycle. A rejected
+edge is never installed. Transaction-manager integration must still wrap a
+complete blocker set in one atomic `register_wait()` operation so a rejected
+multi-blocker request cannot leave an earlier edge from that request behind.
+
 ### Acyclic-Graph Invariant
 
 Before a new request registers its blockers, the graph is assumed to be
@@ -840,7 +848,6 @@ support is enabled.
 
 ## Deferred Decisions
 
-- Concrete wait-for graph containers and whether reverse edges are stored.
 - DFS versus BFS and graph test strategy.
 - A later victim policy that may choose a transaction other than the
   requester.

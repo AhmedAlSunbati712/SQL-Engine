@@ -26,6 +26,7 @@ SRC = \
 	src/Log/WalRecords.cpp \
 	src/Log/PendingBTreeAction.cpp \
 	src/Log/Log.cpp \
+	src/TransactionManager/WaitForGraph.cpp \
 	src/LockMgr.cpp \
 	src/LockManager/LockManager.cpp \
 	src/PCache.cpp \
@@ -57,6 +58,7 @@ OBJ = \
 	build/Log/WalRecords.o \
 	build/Log/PendingBTreeAction.o \
 	build/Log/Log.o \
+	build/TransactionManager/WaitForGraph.o \
 	build/LockMgr.o \
 	build/LockManager/LockManager.o \
 	build/PCache.o \
@@ -127,6 +129,8 @@ build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
 build/tests/unit/Log_test: CXXFLAGS += -pthread
 build/tests/unit/Log_test: LDLIBS += -pthread
+build/tests/unit/WaitForGraph_test: CXXFLAGS += -pthread
+build/tests/unit/WaitForGraph_test: LDLIBS += -pthread
 
 test-unit: $(UNIT_TEST_BIN)
 	for test_bin in $(UNIT_TEST_BIN); do ./$$test_bin; done
