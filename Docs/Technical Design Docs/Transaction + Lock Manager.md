@@ -165,7 +165,6 @@ the information needed to undo its writes:
 ```cpp
 enum class TransactionState : std::uint8_t {
     Active,
-    Waiting,
     AbortRequested,
     Committing,
     Aborting,
@@ -186,7 +185,7 @@ class Transaction {
   private:
     friend class TransactionManager;
 
-    TransactionId id_;
+    const TransactionId id_;
     TransactionState state_ = TransactionState::Active;
 
     std::vector<HeldKeyLock> held_key_locks_;
@@ -195,6 +194,15 @@ class Transaction {
     Lsn last_lsn_ = 0;
 };
 ```
+
+The immutable ID prevents identity changes after registration. One client
+thread owns and executes each transaction, so lifecycle state and `lastLSN` do
+not need atomic storage. The transaction-manager map still needs synchronization
+because different client threads access different transactions through it. A
+transaction remains `Active` while its current statement waits for a lock;
+pending/granted/cancelled status belongs to the `Waiter`, because `LockManager`
+receives only a transaction ID. `TransactionManager` owns valid state
+transitions and WAL-chain updates.
 
 The transaction does not contain page latches. A normal operation and a
 logical inverse acquire the required page latches, modify the current tree,
@@ -220,9 +228,8 @@ undo executor required to finish either boundary.
 
 `TransactionManager::abort` coordinates:
 
-1. A single transition from `Active`, `Waiting`, or `AbortRequested` to
-   `Aborting`, so concurrent client rollback and deadlock cancellation cannot
-   run undo twice.
+1. A single transition from `Active` or `AbortRequested` to `Aborting`, so
+   concurrent client rollback and deadlock cancellation cannot run undo twice.
 2. Cancellation of any outstanding lock waiter while retaining granted locks.
 3. Append of `TXN_ABORT`.
 4. Reverse traversal from `last_lsn_` and execution of each logical inverse.

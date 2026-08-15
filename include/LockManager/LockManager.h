@@ -3,7 +3,7 @@
 #include <array>
 #include <LockShard.h>
 #include <cstdint>
-#include <Transaction.h>
+#include <TransactionManager/Transaction.h>
 #include <Key.h>
 static constexpr std::size_t SHARD_COUNT = 64;
 enum class LockManagerStatus : std::uint8_t {
