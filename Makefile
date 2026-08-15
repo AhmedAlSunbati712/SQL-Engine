@@ -125,6 +125,8 @@ build/tests/unit/%: build/tests/unit/%.o $(LIB)
 
 build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
+build/tests/unit/Log_test: CXXFLAGS += -pthread
+build/tests/unit/Log_test: LDLIBS += -pthread
 
 test-unit: $(UNIT_TEST_BIN)
 	for test_bin in $(UNIT_TEST_BIN); do ./$$test_bin; done

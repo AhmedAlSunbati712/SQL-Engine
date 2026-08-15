@@ -158,6 +158,11 @@ std::uint64_t Segment::next_lsn() const {
     return next_lsn_;
 }
 
+bool Segment::recovery_required() const {
+    std::shared_lock lock(mutex_);
+    return recovery_required_;
+}
+
 void Segment::recover() {
     // Phase 1: make the authoritative Store end at a complete frame. A crash
     // can leave either a partial length prefix or a partial record payload.

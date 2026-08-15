@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 namespace {
 class TempDir {
@@ -61,5 +62,27 @@ TEST(LogTest, RollsBeforeAppendAfterARecordCrossesLimit) {
     EXPECT_EQ(log.append(system({'b'})), 2u);
     EXPECT_TRUE(std::filesystem::exists(dir.path / "segment-00000000000000000002.store"));
     auto records = log.scan(); ASSERT_EQ(records.size(), 2u); EXPECT_EQ(records[1].lsn, 2u);
+}
+
+TEST(LogTest, SyncThroughTracksWholeSegmentDurability) {
+    TempDir dir; Config small = config(); small.max_store_bytes = 44;
+    Log log(small); log.open(dir.path.string());
+    log.append(system({'a'})); log.append(system({'b'}));
+    EXPECT_EQ(log.durable_lsn(), 0u);
+    log.sync_through(1); EXPECT_EQ(log.durable_lsn(), 1u);
+    log.sync_through(2); EXPECT_EQ(log.durable_lsn(), 2u);
+    EXPECT_THROW(log.sync_through(3), std::out_of_range);
+}
+
+TEST(LogTest, ConcurrentAppendsRemainUniqueAndDense) {
+    TempDir dir; Log log(config()); log.open(dir.path.string());
+    constexpr int thread_count = 8; constexpr int records_per_thread = 50;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&] { for (int j = 0; j < records_per_thread; ++j) log.append(system()); });
+    }
+    for (auto& thread : threads) thread.join();
+    auto records = log.scan(); ASSERT_EQ(records.size(), thread_count * records_per_thread);
+    for (std::size_t i = 0; i < records.size(); ++i) EXPECT_EQ(records[i].lsn, i + 1);
 }
 } // namespace

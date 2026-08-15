@@ -73,6 +73,7 @@ void Log::open(const std::string& directory) {
                 try {
                     index_fd = disk::open_file(stem.string() + ".index", O_RDWR | O_CREAT, 0644);
                     segments_.push_back(std::make_unique<Segment>(base, store_fd, index_fd, config_));
+                    if (!files.index) disk::sync_directory(directory_);
                 } catch (...) {
                     if (index_fd == -1) disk::close_file(store_fd);
                     throw;
@@ -111,7 +112,14 @@ Lsn Log::append(PendingWalRecord pending) {
     WalRecord record{.lsn = next_lsn_, .type = pending.type,
                      .transaction_id = pending.transaction_id,
                      .prev_lsn = pending.prev_lsn, .data = std::move(pending.data)};
-    segments_.back()->append(record);
+    try {
+        segments_.back()->append(record);
+    } catch (...) {
+        // Only a failure after physical append begins is ambiguous. Invalid
+        // input leaves the Segment writable and must not poison the Log.
+        if (segments_.back()->recovery_required()) recovery_required_ = true;
+        throw;
+    }
     next_lsn_ += 1;
     return record.lsn;
 }
@@ -136,7 +144,24 @@ std::vector<WalRecord> Log::scan() const {
     }
     return records;
 }
-void Log::sync_through(Lsn) { throw std::runtime_error("Log synchronization is not implemented"); }
+void Log::sync_through(Lsn target_lsn) {
+    std::unique_lock lock(mutex_);
+    if (segments_.empty()) throw std::runtime_error("Log is not open");
+    if (recovery_required_) throw std::runtime_error("Log must be reopened and recovered before synchronization");
+    if (target_lsn < config_.initial_lsn || target_lsn >= next_lsn_) throw std::out_of_range("Target LSN is not present in Log");
+    if (target_lsn <= durable_lsn_) return;
+
+    // Synchronize complete segments in authority order. Segment sync writes
+    // Store before Index, so durability may advance beyond the requested LSN.
+    for (auto& segment : segments_) {
+        if (segment->next_lsn() == segment->base_lsn()) continue;
+        const Lsn segment_last = segment->next_lsn() - 1;
+        if (segment_last <= durable_lsn_) continue;
+        segment->sync();
+        durable_lsn_ = segment_last;
+        if (durable_lsn_ >= target_lsn) break;
+    }
+}
 Lsn Log::next_lsn() const noexcept { std::shared_lock lock(mutex_); return next_lsn_; }
 Lsn Log::durable_lsn() const noexcept { std::shared_lock lock(mutex_); return durable_lsn_; }
 bool Log::recovery_required() const noexcept { std::shared_lock lock(mutex_); return recovery_required_; }
