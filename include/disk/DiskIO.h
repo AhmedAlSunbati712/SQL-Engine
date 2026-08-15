@@ -25,4 +25,5 @@ namespace disk {
     void write_exact_at(int fd, std::span<const char> buffer, std::streamoff offset);
     void truncate_file(int fd, std::streamoff size);
     void sync_file_to_disk_fd(int fd);
+    void sync_directory(const std::string& path);
 }

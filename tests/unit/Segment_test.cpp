@@ -62,7 +62,7 @@ Config config(
     return Config{
         .max_index_bytes = max_index_bytes,
         .max_store_bytes = max_store_bytes,
-        .initial_offset = 1,
+        .initial_lsn = 1,
     };
 }
 

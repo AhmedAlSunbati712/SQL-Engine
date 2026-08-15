@@ -228,4 +228,16 @@ namespace disk {
         }
 #endif
     }
+
+    void sync_directory(const std::string& path) {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd == -1) throw std::runtime_error("Error (sync_directory): Failed to open directory!");
+        if (::fsync(fd) == -1) {
+            const int saved_errno = errno;
+            ::close(fd);
+            errno = saved_errno;
+            throw std::runtime_error("Error (sync_directory): Failed to sync directory!");
+        }
+        if (::close(fd) == -1) throw std::runtime_error("Error (sync_directory): Failed to close directory!");
+    }
 }
