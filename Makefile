@@ -24,6 +24,7 @@ SRC = \
 	src/Log/WalRecordCodec.cpp \
 	src/Log/WalPayloadCodec.cpp \
 	src/Log/WalRecords.cpp \
+	src/Log/PendingBTreeAction.cpp \
 	src/LockMgr.cpp \
 	src/LockManager/LockManager.cpp \
 	src/PCache.cpp \
@@ -53,6 +54,7 @@ OBJ = \
 	build/Log/WalRecordCodec.o \
 	build/Log/WalPayloadCodec.o \
 	build/Log/WalRecords.o \
+	build/Log/PendingBTreeAction.o \
 	build/LockMgr.o \
 	build/LockManager/LockManager.o \
 	build/PCache.o \
