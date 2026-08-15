@@ -113,6 +113,9 @@ build/tests/unit/%: build/tests/unit/%.o $(LIB)
 	mkdir -p $(dir $@)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
+build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
+build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
+
 test-unit: $(UNIT_TEST_BIN)
 	for test_bin in $(UNIT_TEST_BIN); do ./$$test_bin; done
 
