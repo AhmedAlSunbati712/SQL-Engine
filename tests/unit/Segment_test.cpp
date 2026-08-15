@@ -252,7 +252,7 @@ TEST(SegmentTest, IsMaxedUsesStrictPostAppendIndexLimit) {
 TEST(SegmentTest, IsMaxedUsesStrictPostAppendStoreLimit) {
     TempSegmentFiles files;
     constexpr std::uint64_t FIRST_FRAME_SIZE =
-        Store::RECORD_LENGTH_SIZE + WalRecordCodec::LSN_SIZE + 1;
+        Store::RECORD_LENGTH_SIZE + WalRecordCodec::HEADER_SIZE + 1;
     Segment segment(
         110,
         files.open_store(),
