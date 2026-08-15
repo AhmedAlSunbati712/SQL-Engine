@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -Iinclude/client -I/opt/homebrew/include -Iinclude/API
+CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -Iinclude/client -Iinclude/LockManager -Iinclude/TransactionManager -I/opt/homebrew/include -Iinclude/API
 LDFLAGS = -L/opt/homebrew/lib
 LDLIBS = -lgtest -lgtest_main
 AR = ar
@@ -23,6 +23,7 @@ SRC = \
 	src/Log/Store.cpp \
 	src/Log/WalRecordCodec.cpp \
 	src/LockMgr.cpp \
+	src/LockManager/LockManager.cpp \
 	src/PCache.cpp \
 	src/Pager.cpp \
 	src/disk/DiskIO.cpp \
@@ -48,6 +49,7 @@ OBJ = \
 	build/Log/Store.o \
 	build/Log/WalRecordCodec.o \
 	build/LockMgr.o \
+	build/LockManager/LockManager.o \
 	build/PCache.o \
 	build/Pager.o \
 	build/disk/DiskIO.o \
