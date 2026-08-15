@@ -6,4 +6,5 @@ struct Waiter {
     TransactionId txn_id;
     LockMode lock_mode;
     bool granted = false;
+    bool cancelled = false;
 };

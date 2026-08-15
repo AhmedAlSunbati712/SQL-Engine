@@ -11,8 +11,12 @@ enum class LockManagerStatus : std::uint8_t {
     TxnHoldsExclusive,
     TxnHoldsShared,
     Busy,
-    NotOwner
+    NotOwner,
+    Deadlock,
+    TransactionNotFound,
 };
+
+class TransactionManager;
 
 class LockManager {
     public:
@@ -31,6 +35,11 @@ class LockManager {
         LockManagerStatus unlock_shared(TransactionId txn_id, const Key& key);
         LockManagerStatus unlock_exclusive(TransactionId txn_id, const Key& key);
 
+        void attach_txn_manager(TransactionManager &txn_mgr);
+        void detach_txn_manager(TransactionManager &txn_mgr) noexcept;
     private:
         std::array<LockShard, SHARD_COUNT> shards;
+        TransactionManager *txn_mgr_ = nullptr;
+
+        bool grant_waiters(LockState& state, const Key& key);
 };

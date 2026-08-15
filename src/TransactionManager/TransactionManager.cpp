@@ -1,14 +1,28 @@
 #include <TransactionManager/TransactionManager.h>
 
+#include <LockManager/KeyHash.h>
 #include <LockManager/LockManager.h>
 #include <Log/Log.h>
 #include <Log/WalRecords.h>
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
-TransactionManager::TransactionManager(Log& log, LockManager& lock_manager, TransactionUndoExecutor& undo_executor): log_(log), lock_manager_(lock_manager), undo_executor_(undo_executor) {}
+TransactionManager::TransactionManager(
+    Log& log,
+    LockManager& lock_manager,
+    TransactionUndoExecutor& undo_executor)
+    : log_(log),
+      lock_manager_(lock_manager),
+      undo_executor_(undo_executor) {
+    lock_manager_.attach_txn_manager(*this);
+}
+
+TransactionManager::~TransactionManager() noexcept {
+    lock_manager_.detach_txn_manager(*this);
+}
 
 TransactionHandle TransactionManager::begin() {
     std::unique_lock lock(transactions_mutex_);
@@ -192,6 +206,34 @@ WaitRegistrationStatus TransactionManager::register_wait(TransactionId waiting_t
 
 void TransactionManager::remove_wait(TransactionId waiting_txn) {
     wait_for_graph_.remove_outgoing(waiting_txn);
+}
+
+bool TransactionManager::record_lock(
+    TransactionId txn_id,
+    const Key& key,
+    LockMode mode) {
+    std::unique_lock lock(transactions_mutex_);
+    auto transaction = active_transactions_.find(txn_id);
+    if (transaction == active_transactions_.end() ||
+        transaction->second->state_ != TransactionState::Active) {
+        return false;
+    }
+
+    auto existing = std::find_if(
+        transaction->second->held_key_locks_.begin(),
+        transaction->second->held_key_locks_.end(),
+        [&](const HeldKeyLock& held) {
+            return KeyEqual{}(held.key, key);
+        });
+
+    // Keep only the strongest mode held for each logical key.
+    if (existing != transaction->second->held_key_locks_.end()) {
+        if (mode == LockMode::Exclusive) existing->mode = LockMode::Exclusive;
+        return true;
+    }
+
+    transaction->second->held_key_locks_.push_back({key, mode});
+    return true;
 }
 
 bool TransactionManager::owns_handle_locked(const TransactionHandle& transaction) const {

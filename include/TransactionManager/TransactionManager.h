@@ -52,7 +52,7 @@ class TransactionManager {
 public:
     TransactionManager(Log& log, LockManager& lock_manager, TransactionUndoExecutor& undo_executor);
 
-    ~TransactionManager() = default;
+    ~TransactionManager() noexcept;
 
     TransactionManager(const TransactionManager&) = delete;
     TransactionManager& operator=(const TransactionManager&) = delete;
@@ -80,6 +80,13 @@ public:
 
     // Removes all outgoing dependencies for a granted or cancelled request.
     void remove_wait(TransactionId waiting_txn);
+
+    // Records a lock after LockManager installs ownership. Returns false when
+    // the transaction is no longer active.
+    bool record_lock(
+        TransactionId txn_id,
+        const Key& key,
+        LockMode mode);
 
 private:
     Log& log_;
