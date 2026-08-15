@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -49,10 +50,7 @@ public:
 
 class TransactionManager {
 public:
-    TransactionManager(
-        Log& log,
-        LockManager& lock_manager,
-        TransactionUndoExecutor& undo_executor);
+    TransactionManager(Log& log, LockManager& lock_manager, TransactionUndoExecutor& undo_executor);
 
     ~TransactionManager() = default;
 
@@ -68,17 +66,17 @@ public:
     // Returns an empty handle when the transaction is not active.
     TransactionHandle find(TransactionId txn_id) const;
 
+    // Appends one completed B-tree action and advances the transaction's WAL
+    // chain only after Log assigns the record an LSN.
+    Lsn append_action(const TransactionHandle& transaction, PendingWalRecord action);
+
     // Commit and abort own the complete lifecycle boundary. I/O and WAL
     // corruption failures continue to use the logger's exception convention.
     CommitStatus commit(const TransactionHandle& transaction);
-    AbortStatus abort(
-        const TransactionHandle& transaction,
-        AbortReason reason);
+    AbortStatus abort(const TransactionHandle& transaction, AbortReason reason);
 
     // Registers one complete blocker set through WaitForGraph::add_edges().
-    WaitRegistrationStatus register_wait(
-        TransactionId waiting_txn,
-        std::span<const TransactionId> blockers);
+    WaitRegistrationStatus register_wait(TransactionId waiting_txn, std::span<const TransactionId> blockers);
 
     // Removes all outgoing dependencies for a granted or cancelled request.
     void remove_wait(TransactionId waiting_txn);
@@ -88,12 +86,17 @@ private:
     LockManager& lock_manager_;
     TransactionUndoExecutor& undo_executor_;
 
-    mutable std::mutex transactions_mutex_;
+    mutable std::shared_mutex transactions_mutex_;
     std::unordered_map<TransactionId, TransactionHandle> active_transactions_;
     TransactionId next_transaction_id_ = 1;
+    bool transaction_ids_initialized_ = false;
 
     WaitForGraph wait_for_graph_;
 
-    bool owns_handle(const TransactionHandle& transaction) const;
+    // The caller must hold transactions_mutex_.
+    bool owns_handle_locked(const TransactionHandle& transaction) const;
+
+    void release_locks(Transaction& transaction);
+    void initialize_transaction_ids();
     void remove_transaction(TransactionId txn_id);
 };

@@ -44,6 +44,7 @@ public:
 
     TransactionId id() const noexcept { return id_; }
     TransactionState state() const noexcept { return state_; }
+    Lsn last_lsn() const noexcept { return last_lsn_; }
 
 private:
     friend class TransactionManager;

@@ -26,6 +26,7 @@ SRC = \
 	src/Log/WalRecords.cpp \
 	src/Log/PendingBTreeAction.cpp \
 	src/Log/Log.cpp \
+	src/TransactionManager/TransactionManager.cpp \
 	src/TransactionManager/WaitForGraph.cpp \
 	src/LockMgr.cpp \
 	src/LockManager/LockManager.cpp \
@@ -58,6 +59,7 @@ OBJ = \
 	build/Log/WalRecords.o \
 	build/Log/PendingBTreeAction.o \
 	build/Log/Log.o \
+	build/TransactionManager/TransactionManager.o \
 	build/TransactionManager/WaitForGraph.o \
 	build/LockMgr.o \
 	build/LockManager/LockManager.o \
