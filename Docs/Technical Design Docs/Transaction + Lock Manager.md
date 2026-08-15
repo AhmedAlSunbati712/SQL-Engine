@@ -279,11 +279,19 @@ one greater than the largest prior transaction ID. This prevents transaction
 identity reuse across reopen until recovery or a checkpoint introduces a
 persisted transaction-ID allocator.
 
-Logical-lock acquisition and waiter cancellation are not wired into the
-coordinator yet. The manager releases every lock already listed in
-`held_key_locks_`, but the upcoming lock-manager integration must populate
-that list, populate `waiting_for_key_`, and expose cancellation before the
-full deadlock-victim path is operational.
+Logical-lock acquisition is now connected to the coordinator. Construction of
+`TransactionManager` attaches it to `LockManager`; immediate and delayed grants
+are recorded in `held_key_locks_`, and commit or abort releases those locks in
+reverse acquisition order. Contended requests enter the FIFO queue before
+their complete blocker set is registered. Failed registration removes the
+queue entry, while a successful grant removes its outgoing graph edges before
+notification.
+
+Explicit cancellation of a waiter by transaction ID and key remains to be
+implemented. That path will populate `waiting_for_key_`, remove the queued
+request under its shard mutex, remove the graph edges, mark the waiter
+cancelled, and notify it before deadlock-victim abort can be initiated from a
+different thread.
 
 ## Lock Table
 
@@ -891,8 +899,9 @@ enum class LockResult : std::uint8_t {
 ```
 
 For `lock_exclusive()`, finding the requester in `shared_owners` starts the
-promotion procedure. It must not simply return `AlreadyShared` once promotion
-support is enabled.
+promotion procedure. The requester retains its shared ownership while queued,
+is excluded from its own blocker set, and atomically replaces that ownership
+with exclusive ownership after every other reader and earlier waiter clears.
 
 ## Deferred Decisions
 
