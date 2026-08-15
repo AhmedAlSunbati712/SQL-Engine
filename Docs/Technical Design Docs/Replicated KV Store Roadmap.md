@@ -2,6 +2,14 @@
 
 ## Purpose
 
+> **Authority note:** The detailed one-writer WAL payloads, page generations,
+> private-page phases, and physical before-image undo later in this roadmap are
+> historical staging material. The current local transaction and recovery
+> contracts are defined by `Transaction + Lock Manager.md` and
+> `V2 Page Format + WAL Mutation Path.md`: compound full-page after-image redo,
+> logical key-level undo, CLRs, no page generation, and redo before undo. When
+> this roadmap conflicts with either focused design, the focused design wins.
+
 StoneleafDB is moving from an embedded, SQLite-inspired storage library toward a
 single-group replicated key-value server. The target is deliberately staged:
 

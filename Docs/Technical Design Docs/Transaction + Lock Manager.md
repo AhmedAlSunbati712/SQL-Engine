@@ -11,8 +11,10 @@ policy: the global wait-for graph is kept acyclic. When registering a new
 wait would create a cycle, the transaction making that request becomes the
 deadlock victim and its new dependencies are not left installed.
 
-This document does not yet choose the graph container, runtime rollback WAL
-format, client retry limit, or wire representation of a deadlock error.
+This document does not yet choose the graph container, client retry limit, or
+wire representation of a deadlock error. Runtime rollback uses logical
+key-level inverse operations, while the local WAL records complete physical
+after-images for redo and compensation records for restartable undo.
 
 ## Core Invariants
 
@@ -54,7 +56,7 @@ Server
 ├── LockManager
 │   └── sharded logical-key lock table
 └── client sessions
-    └── optional active transaction ID per connection
+    └── optional active transaction handle per connection
 ```
 
 The responsibilities are divided as follows:
@@ -73,6 +75,35 @@ The responsibilities are divided as follows:
   boundaries. It converts a lock-manager deadlock result into transaction
   abort and a client-visible error.
 
+### Write Operation Handoff
+
+One mutating KeyStore call creates a `PendingBTreeAction` after it owns the
+transaction's logical key lock. The object begins with transaction identity
+and `prevLSN`; KeyStore fills the final action kind and logical inverse once B+
+tree reports whether the operation inserted, replaced, removed, or made no
+change. The same object travels through B+ tree propagation into every Pager
+mutation path:
+
+```text
+KeyStore: transaction and logical inverse
+    -> BTree: leaf/internal/root propagation
+    -> Pager: exact physical after-images and frame state
+    -> BTreeActionCodec: opaque action payload
+    -> Log: LSN assignment and append
+```
+
+Low-level `Log`, `Segment`, `Store`, and `Index` objects do not understand keys,
+values, or B+ tree pages. KeyStore does not encode WAL bytes, and B+ tree does
+not copy persistent page images. Pager is the only layer that captures exact
+page effects.
+
+After `Log::append` succeeds, its returned LSN becomes the transaction's new
+`lastLSN`; Pager installs the same LSN and a recomputed checksum in every
+affected cached page before making those frames flushable. Before append, all
+affected frames remain operation-pinned and WAL-pending. A preparation failure
+can cancel from transient scratch images. An ambiguous physical append failure
+requires reopening and recovery rather than continuing the transaction.
+
 ## Session and Server Context
 
 `SessionContext` means the state of one client connection, not the state of
@@ -80,7 +111,7 @@ the complete server:
 
 ```cpp
 struct SessionContext {
-    std::optional<TransactionId> active_transaction;
+    std::optional<TransactionHandle> active_transaction;
 };
 ```
 
@@ -94,10 +125,13 @@ The server-wide active-transaction collection belongs to
 ```cpp
 class TransactionManager {
   public:
-    Transaction &begin();
-    Transaction *find(TransactionId txn_id);
-    CommitStatus commit(TransactionId txn_id);
-    AbortStatus abort(TransactionId txn_id);
+    TransactionHandle begin();
+    TransactionHandle find(TransactionId txn_id);
+    CommitStatus commit(const TransactionHandle &txn);
+    AbortStatus abort(
+        const TransactionHandle &txn,
+        AbortReason reason
+    );
 
     WaitRegistrationStatus register_wait(
         TransactionId waiting_txn,
@@ -110,16 +144,18 @@ class TransactionManager {
     std::mutex transactions_mutex;
     std::unordered_map<
         TransactionId,
-        std::unique_ptr<Transaction>
+        TransactionHandle
     > active_transactions;
 
     WaitForGraph wait_for_graph;
 };
 ```
 
-The exact ownership handle may later become `shared_ptr<Transaction>` if a
-transaction must remain alive while a worker uses it after removal from the
-lookup table. That is a lifetime decision, not a locking-policy decision.
+`TransactionHandle` is `std::shared_ptr<Transaction>`. The active table owns
+one handle and the session or current command owns another while using the
+transaction. Removing a terminal transaction from the table therefore cannot
+destroy it underneath an executing worker. B+ tree and key-store calls receive
+a non-owning `Transaction &` obtained from that handle.
 
 ## Transaction Context
 
@@ -131,6 +167,7 @@ enum class TransactionState : std::uint8_t {
     Active,
     Waiting,
     AbortRequested,
+    Committing,
     Aborting,
     Committed,
     Aborted,
@@ -141,21 +178,62 @@ struct HeldKeyLock {
     LockMode mode;
 };
 
-struct Transaction {
-    TransactionId id;
-    TransactionState state = TransactionState::Active;
+class Transaction {
+  public:
+    TransactionId id() const noexcept;
+    TransactionState state() const noexcept;
 
-    std::vector<HeldKeyLock> held_key_locks;
-    std::optional<Key> waiting_for_key;
+  private:
+    friend class TransactionManager;
 
-    // Exact WAL and undo fields remain part of the WAL design.
-    Lsn last_lsn;
+    TransactionId id_;
+    TransactionState state_ = TransactionState::Active;
+
+    std::vector<HeldKeyLock> held_key_locks_;
+    std::optional<Key> waiting_for_key_;
+
+    Lsn last_lsn_ = 0;
 };
 ```
 
-The transaction does not contain page latches. A normal operation and an undo
-operation acquire the required page latch, modify or restore the page, then
-release the latch before moving on.
+The transaction does not contain page latches. A normal operation and a
+logical inverse acquire the required page latches, modify the current tree,
+append their compound physical effects, and release the latches before moving
+on.
+
+### Lifecycle Interface Ownership
+
+Public `commit` and `abort` operations live on `TransactionManager`, not on
+`Transaction`. A transaction is state and transaction-local metadata; it does
+not own the WAL manager, lock manager, active table, wait-for graph, or B+ tree
+undo executor required to finish either boundary.
+
+`TransactionManager::commit` coordinates:
+
+1. The atomic transition from `Active` to `Committing`.
+2. Verification that the transaction has no unfinished B+ tree action.
+3. Append of `TXN_COMMIT` through the transaction's `prevLSN` chain.
+4. WAL synchronization through the commit record.
+5. The transition to `Committed`.
+6. Logical-lock and graph cleanup.
+7. Removal from the active table.
+
+`TransactionManager::abort` coordinates:
+
+1. A single transition from `Active`, `Waiting`, or `AbortRequested` to
+   `Aborting`, so concurrent client rollback and deadlock cancellation cannot
+   run undo twice.
+2. Cancellation of any outstanding lock waiter while retaining granted locks.
+3. Append of `TXN_ABORT`.
+4. Reverse traversal from `last_lsn_` and execution of each logical inverse.
+5. Append of a compensation log record for every completed inverse.
+6. Append of `TXN_END`, WAL synchronization through that record, and the
+   transition to `Aborted`.
+7. Release of logical locks, graph cleanup, and active-table removal.
+
+The transaction destructor never commits or aborts. Losing a client handle
+does not silently choose a durability outcome; connection cleanup explicitly
+asks `TransactionManager` to abort an active transaction.
 
 ## Lock Table
 
@@ -587,16 +665,38 @@ old locks and effects have been removed.
 
 ## Rollback and Page Latches
 
-Rollback uses the transaction's WAL or undo chain to reverse every completed
-mutation. The exact physical undo format is defined by the WAL design.
+Rollback does not restore an old complete page image. That would erase a later
+change made by another transaction to a different key on the same page.
+Instead, every user-visible B+ tree action stores one logical inverse:
 
-Logical locks remain granted during undo. Each undo step briefly obtains the
-required page pin and exclusive page latch, restores the page, releases the
-latch and pin, and continues. Only after complete undo may
-`TransactionManager` release the transaction's logical locks.
+```text
+INSERT(key, value)       -> DELETE(key)
+DELETE(key, old_value)   -> INSERT(key, old_value)
+UPDATE(key, old, new)    -> UPDATE(key, new, old)
+```
 
-This ordering prevents another transaction from observing or overwriting a
-partially undone state.
+The already-granted logical lock on that key remains held while the inverse
+runs, so it cannot race another transaction changing the same key. The inverse
+searches the current B+ tree for the key; it does not assume the record remains
+on the page changed by the original action.
+
+Each inverse briefly pins and exclusively latches the pages it changes. Its
+complete propagated physical effects are appended as one compensation log
+record before those pages become flushable. A CLR is redo-only and carries
+`undoNextLSN`, so recovery that crashes during rollback redoes completed
+inverse actions and continues at the next transaction record still requiring
+undo.
+
+Structural propagation is not reversed to its former physical shape. If an
+insert split a leaf and its transaction later aborts, logical undo deletes the
+inserted key but may leave the split pages underfilled. They remain a valid B+
+tree. The first implementation should avoid merge-on-delete so rollback does
+not need to recreate an earlier tree shape.
+
+Only after every inverse has a CLR and `TXN_END` is durable may
+`TransactionManager` release the transaction's logical locks and acknowledge
+abort. Page latches remain operation-scoped and are never retained through
+client think-time.
 
 ## Autocommit Statements
 
@@ -746,7 +846,6 @@ support is enabled.
   requester.
 - Deadlock timeout as a diagnostic fallback.
 - Client retry count, backoff, and wire error format.
-- Exact runtime undo and CLR representation.
 - Cancellation tokens and connection-shutdown behavior while waiting.
 - Whether a future API permits parallel statements inside one transaction.
 - Range-lock dependencies and phantom prevention.

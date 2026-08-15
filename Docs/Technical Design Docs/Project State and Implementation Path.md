@@ -648,9 +648,17 @@ the first complete architecture.
 
 ## Immediate Restart Point
 
-The roadmap locking reconciliation and local KeyStore boundary are complete.
-The next implementation task is to add WAL segment and record codecs without
-integrating them into the pager.
+The standalone typed WAL is complete. Store, Index, Segment, and Log now own
+segment discovery, recovery, dense LSN assignment, rollover, lookup,
+synchronization, and durability tracking. WAL records use the checksummed
+40-byte typed envelope, and the higher layer has typed payload codecs,
+factories, and `PendingBTreeAction`. V2 checksums cover the complete page.
+
+The next implementation task is to thread `PendingBTreeAction` through
+KeyStore, B+ tree propagation, and every Pager mutation path.
+Pager collects exact page effects and keeps affected frames WAL-pending until
+`Log::append` assigns the action LSN. Run this shadow logging beside the
+rollback journal before enforcing WAL-before-data or cutting recovery over.
 
 Do not begin the network server, thread-safe buffer pool, or Raft while these
 tasks are incomplete.
