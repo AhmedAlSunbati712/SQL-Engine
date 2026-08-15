@@ -133,6 +133,10 @@ class TransactionManager {
 
     TransactionHandle begin();
     TransactionHandle find(TransactionId txn_id) const;
+    Lsn append_action(
+        const TransactionHandle &txn,
+        PendingWalRecord action
+    );
     CommitStatus commit(const TransactionHandle &txn);
     AbortStatus abort(
         const TransactionHandle &txn,
@@ -151,7 +155,7 @@ class TransactionManager {
     LockManager &lock_manager;
     TransactionUndoExecutor &undo_executor;
 
-    mutable std::mutex transactions_mutex;
+    mutable std::shared_mutex transactions_mutex;
     std::unordered_map<
         TransactionId,
         TransactionHandle
@@ -198,6 +202,7 @@ class Transaction {
   public:
     TransactionId id() const noexcept;
     TransactionState state() const noexcept;
+    Lsn last_lsn() const noexcept;
 
   private:
     friend class TransactionManager;
@@ -214,8 +219,9 @@ class Transaction {
 
 The immutable ID prevents identity changes after registration. One client
 thread owns and executes each transaction, so lifecycle state and `lastLSN` do
-not need atomic storage. The transaction-manager map still needs synchronization
-because different client threads access different transactions through it. A
+not need atomic storage. A shared mutex protects the transaction-manager map:
+lookups and wait validation take shared ownership, while ID allocation, table
+mutation, and lifecycle transitions take exclusive ownership. A
 transaction remains `Active` while its current statement waits for a lock;
 pending/granted/cancelled status belongs to the `Waiter`, because `LockManager`
 receives only a transaction ID. `TransactionManager` owns valid state
@@ -258,6 +264,26 @@ undo executor required to finish either boundary.
 The transaction destructor never commits or aborts. Losing a client handle
 does not silently choose a durability outcome; connection cleanup explicitly
 asks `TransactionManager` to abort an active transaction.
+
+### Current Transaction-Manager Implementation
+
+The implemented coordinator now owns begin-record creation, active-table and
+wait-for-graph node ownership, transaction lookup, B-tree action appends,
+commit durability, logical abort traversal, CLR chaining, durable `TXN_END`,
+and terminal cleanup. `append_action()` accepts only a matching B-tree action
+whose transaction ID and `prevLSN` agree with the current transaction, then
+updates `last_lsn_` only after the append succeeds.
+
+The first `begin()` after opening a retained WAL scans its records and chooses
+one greater than the largest prior transaction ID. This prevents transaction
+identity reuse across reopen until recovery or a checkpoint introduces a
+persisted transaction-ID allocator.
+
+Logical-lock acquisition and waiter cancellation are not wired into the
+coordinator yet. The manager releases every lock already listed in
+`held_key_locks_`, but the upcoming lock-manager integration must populate
+that list, populate `waiting_for_key_`, and expose cancellation before the
+full deadlock-victim path is operational.
 
 ## Lock Table
 
