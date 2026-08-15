@@ -48,6 +48,42 @@ TEST(WaitForGraphTest, DuplicateEdgesAreSuccessfulNoOps) {
     EXPECT_TRUE(graph.add_edge(2, 1));
 }
 
+TEST(WaitForGraphTest, AddsCompleteEdgeSetAtomically) {
+    WaitForGraph graph;
+    for (TransactionId txn_id : {1, 2, 3}) graph.add_node(txn_id);
+
+    const std::vector<TransactionId> blockers = {2, 3, 2};
+    EXPECT_TRUE(graph.add_edges(1, blockers));
+
+    // Both dependencies were installed, and the duplicate was a no-op.
+    EXPECT_FALSE(graph.add_edge(2, 1));
+    EXPECT_FALSE(graph.add_edge(3, 1));
+}
+
+TEST(WaitForGraphTest, RejectsCompleteEdgeSetWithoutPartialInsertion) {
+    WaitForGraph graph;
+    for (TransactionId txn_id : {1, 2, 3}) graph.add_node(txn_id);
+    EXPECT_TRUE(graph.add_edge(2, 3));
+
+    const std::vector<TransactionId> blockers = {1, 2};
+    EXPECT_FALSE(graph.add_edges(3, blockers));
+
+    // The safe 3 -> 1 edge preceding the cyclic 3 -> 2 edge was not retained.
+    EXPECT_TRUE(graph.add_edge(1, 3));
+}
+
+TEST(WaitForGraphTest, RejectsMissingBatchDestinationWithoutPartialInsertion) {
+    WaitForGraph graph;
+    graph.add_node(1);
+    graph.add_node(2);
+
+    const std::vector<TransactionId> blockers = {2, 99};
+    EXPECT_FALSE(graph.add_edges(1, blockers));
+
+    // The valid 1 -> 2 edge preceding the missing node was not retained.
+    EXPECT_TRUE(graph.add_edge(2, 1));
+}
+
 TEST(WaitForGraphTest, RemovingNodeRemovesIncomingAndOutgoingEdges) {
     WaitForGraph graph;
     for (TransactionId txn_id : {1, 2, 3}) graph.add_node(txn_id);
@@ -60,6 +96,21 @@ TEST(WaitForGraphTest, RemovingNodeRemovesIncomingAndOutgoingEdges) {
     // Neither old edge remains after the node is recreated.
     EXPECT_TRUE(graph.add_edge(2, 1));
     EXPECT_TRUE(graph.add_edge(3, 2));
+}
+
+TEST(WaitForGraphTest, RemovingOutgoingEdgesPreservesIncomingEdges) {
+    WaitForGraph graph;
+    for (TransactionId txn_id : {1, 2, 3}) graph.add_node(txn_id);
+    EXPECT_TRUE(graph.add_edge(1, 2));
+    EXPECT_TRUE(graph.add_edge(3, 1));
+
+    graph.remove_outgoing(1);
+
+    // The old 1 -> 2 dependency is gone.
+    EXPECT_TRUE(graph.add_edge(2, 1));
+
+    // The existing 3 -> 1 dependency remains, so 1 -> 3 is still a cycle.
+    EXPECT_FALSE(graph.add_edge(1, 3));
 }
 
 TEST(WaitForGraphTest, ConcurrentOperationsKeepGraphConsistent) {

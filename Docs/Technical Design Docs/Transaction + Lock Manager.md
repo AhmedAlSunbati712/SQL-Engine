@@ -125,8 +125,14 @@ The server-wide active-transaction collection belongs to
 ```cpp
 class TransactionManager {
   public:
+    TransactionManager(
+        Log &log,
+        LockManager &lock_manager,
+        TransactionUndoExecutor &undo_executor
+    );
+
     TransactionHandle begin();
-    TransactionHandle find(TransactionId txn_id);
+    TransactionHandle find(TransactionId txn_id) const;
     CommitStatus commit(const TransactionHandle &txn);
     AbortStatus abort(
         const TransactionHandle &txn,
@@ -141,7 +147,11 @@ class TransactionManager {
     void remove_wait(TransactionId waiting_txn);
 
   private:
-    std::mutex transactions_mutex;
+    Log &log;
+    LockManager &lock_manager;
+    TransactionUndoExecutor &undo_executor;
+
+    mutable std::mutex transactions_mutex;
     std::unordered_map<
         TransactionId,
         TransactionHandle
@@ -156,6 +166,13 @@ one handle and the session or current command owns another while using the
 transaction. Removing a terminal transaction from the table therefore cannot
 destroy it underneath an executing worker. B+ tree and key-store calls receive
 a non-owning `Transaction &` obtained from that handle.
+
+The manager receives the WAL, logical-lock manager, and a logical-undo
+executor as non-owning references. The undo executor applies one stored
+logical inverse through the B+ tree and returns the resulting physical page
+effects; the transaction manager uses those effects to append the CLR. This
+keeps transaction lifecycle and WAL chaining in the manager without making it
+implement B+ tree operations itself.
 
 ## Transaction Context
 
@@ -304,9 +321,9 @@ A possible initial representation is:
 ```cpp
 class WaitForGraph {
   public:
-    WaitRegistrationStatus register_wait(
-        TransactionId waiting_txn,
-        std::span<const TransactionId> blockers
+    bool add_edges(
+        TransactionId from,
+        std::span<const TransactionId> destinations
     );
 
     void remove_outgoing(TransactionId txn_id);
@@ -325,12 +342,10 @@ class WaitForGraph {
 operations needed by `LockManager`. `KeyStore` never updates the graph.
 
 The incremental `WaitForGraph` implementation maintains both outgoing and
-incoming adjacency sets under one shared mutex. Its single-edge helper returns
-`true` for a successful insertion or an existing duplicate, and returns
-`false` when a node is missing or the edge would create a cycle. A rejected
-edge is never installed. Transaction-manager integration must still wrap a
-complete blocker set in one atomic `register_wait()` operation so a rejected
-multi-blocker request cannot leave an earlier edge from that request behind.
+incoming adjacency sets under one shared mutex. `add_edges()` validates and
+inserts a complete set under one exclusive lock. It returns `false` when a node
+is missing or any edge would create a cycle, and retains none of the new edges
+when the batch is rejected. Duplicate edges are successful no-ops.
 
 ### Acyclic-Graph Invariant
 

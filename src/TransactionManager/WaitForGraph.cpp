@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <queue>
+#include <vector>
 
 bool WaitForGraph::exists(TransactionId txn_id) const {
     std::shared_lock lock(mutex_);
@@ -50,27 +51,47 @@ void WaitForGraph::remove(TransactionId txn_id) {
 }
 
 bool WaitForGraph::add_edge(TransactionId from, TransactionId to) {
+    return add_edges(from, std::span<const TransactionId>(&to, 1));
+}
+
+bool WaitForGraph::add_edges(TransactionId from, std::span<const TransactionId> destinations) {
     std::unique_lock lock(mutex_);
     auto source = outgoing_links_.find(from);
-    auto destination = incoming_links_.find(to);
-    if (source == outgoing_links_.end() || destination == incoming_links_.end()) {
-        return false;
+    if (source == outgoing_links_.end()) return false;
+
+    // Validate the complete request before changing either adjacency index.
+    // Adding from -> to creates a cycle exactly when to can reach from.
+    for (TransactionId destination : destinations) {
+        if (incoming_links_.find(destination) == incoming_links_.end()) return false;
+        if (path_exists(destination, from)) return false;
     }
 
-    // Adding from -> to creates a cycle exactly when to can already reach
-    // from. A self-edge is covered because every node reaches itself.
-    if (path_exists(to, from)) return false;
+    std::vector<TransactionId> inserted_destinations;
+    inserted_destinations.reserve(destinations.size());
 
-    auto [_, inserted] = source->second.insert(to);
-    if (!inserted) return true;
-
-    // Preserve the two-index invariant if allocating the reverse entry fails.
     try {
-        destination->second.insert(from);
+        for (TransactionId destination : destinations) {
+            auto [_, inserted] = source->second.insert(destination);
+            if (!inserted) continue;
+
+            // Keep both indexes consistent if the reverse insertion fails.
+            try {
+                incoming_links_.at(destination).insert(from);
+            } catch (...) {
+                source->second.erase(destination);
+                throw;
+            }
+            inserted_destinations.push_back(destination);
+        }
     } catch (...) {
-        source->second.erase(to);
+        // Restore the graph to its state before this batch began.
+        for (TransactionId destination : inserted_destinations) {
+            source->second.erase(destination);
+            incoming_links_.at(destination).erase(from);
+        }
         throw;
     }
+
     return true;
 }
 
@@ -84,6 +105,22 @@ void WaitForGraph::remove_edge(TransactionId from, TransactionId to) {
     destination->second.erase(from);
 }
 
+void WaitForGraph::remove_outgoing(TransactionId txn_id) {
+    std::unique_lock lock(mutex_);
+    auto source = outgoing_links_.find(txn_id);
+    if (source == outgoing_links_.end()) return;
+
+    // Remove the reverse index entry for every dependency owned by this
+    // transaction, then leave the transaction node itself in the graph.
+    for (TransactionId destination : source->second) {
+        auto destination_links = incoming_links_.find(destination);
+        if (destination_links != incoming_links_.end()) {
+            destination_links->second.erase(txn_id);
+        }
+    }
+    source->second.clear();
+}
+
 bool WaitForGraph::path_exists(TransactionId from, TransactionId to) const {
     auto start = outgoing_links_.find(from);
     if (start == outgoing_links_.end() || outgoing_links_.find(to) == outgoing_links_.end()) {
@@ -91,7 +128,7 @@ bool WaitForGraph::path_exists(TransactionId from, TransactionId to) const {
     }
     if (from == to) return true;
 
-    // Traverse the existing graph while add_edge holds the exclusive mutex,
+    // Traverse the existing graph while add_edges holds the exclusive mutex,
     // so the reachability decision and insertion are one atomic operation.
     std::queue<TransactionId> pending;
     std::unordered_set<TransactionId> visited;

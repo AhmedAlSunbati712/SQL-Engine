@@ -2,6 +2,7 @@
 #include <TransactionManager/Transaction.h>
 
 #include <shared_mutex>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -22,7 +23,18 @@ class WaitForGraph {
         // Returns false when either node is missing or the edge would create
         // a cycle. Duplicate edges are successful no-ops.
         bool add_edge(TransactionId from, TransactionId to);
+
+        // Validates and adds the complete edge set atomically. If any edge is
+        // invalid, none of the new edges are retained.
+        bool add_edges(
+            TransactionId from,
+            std::span<const TransactionId> destinations);
+
         void remove_edge(TransactionId from, TransactionId to);
+
+        // Removes the dependencies created by one pending lock request while
+        // preserving transactions that are waiting for this transaction.
+        void remove_outgoing(TransactionId txn_id);
 
     private:
         // The caller must hold mutex_ for the complete traversal.
