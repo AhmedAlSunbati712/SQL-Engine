@@ -146,5 +146,189 @@ This is similar in spirit to the leaf-page case, but the key movement rules are 
 - After merging internal pages, the parent may itself go under the minimal number of keys. If that happens, continue the same repair process upward.
 - One last root case: if the root ends up with zero keys and has exactly one child, make that child the new root. This reduces the height of the tree by one.
 
+## Page Latching and Concurrent Traversal
+
+Logical key locks and page latches solve different problems. A key lock
+protects the transaction-visible value associated with a key and remains held
+until commit or abort. A page latch protects the in-memory bytes and routing
+metadata of one cached page and remains held only while one B+ tree operation
+needs that page.
+
+### B+ Tree Operation
+
+Every public B+ tree call creates a `BTreeOperation`. It carries the transaction
+ID for diagnostics and owns every pager reference and latch retained by that
+call:
+
+```cpp
+class BTreeOperation {
+public:
+    BTreeOperation(TransactionId txn_id, Pager& pager);
+    ~BTreeOperation();
+
+    PageV2* lock_shared(PageV2* pinned_page);
+    PageV2* lock_exclusive(PageV2* pinned_page);
+
+    void release(std::uint32_t page_num);
+    void release_all();
+
+private:
+    TransactionId txn_id_;
+    Pager& pager_;
+    std::vector<HeldPage> held_pages_;
+};
+```
+
+`PageV2` contains one `std::shared_mutex latch`. `BTreeOperation` stores either
+a `std::shared_lock` or `std::unique_lock` for every held page. The transaction
+does not own these locks. Destroying the operation releases every remaining
+latch and then calls `Pager::unref_page()` even when traversal, allocation, WAL
+construction, or page modification throws. Holding a latch without the pager
+reference is invalid because the cached `PageV2` could otherwise be evicted.
+Transaction IDs are not part of latch compatibility and there is no latch
+wait-for graph.
+
+### Global Acquisition Order
+
+Latch deadlocks are prevented by construction:
+
+1. Acquire a known logical key lock before acquiring page latches.
+2. Acquire the header before the root.
+3. Acquire pages from parent to child.
+4. Acquire a child before releasing its parent.
+5. Never acquire an ancestor while retaining a descendant.
+6. When an operation needs siblings, acquire them in one documented order,
+   such as left-to-right or ascending page number.
+7. Never retain a shared latch while requesting an exclusive latch on the same
+   page. Release and restart or reacquire, then revalidate.
+8. Never wait for a logical key lock, disk I/O, or an evictable buffer while
+   retaining a page latch.
+
+Ordinary latch contention waits rather than aborting a transaction. A cycle
+would indicate that an implementation violated the ordering protocol, so a
+second transaction-level wait-for graph is not used. A writer-preferring page
+latch may be introduced if `std::shared_mutex` permits writer starvation.
+
+### Header and Root
+
+The header protects publication of the current root page number. A point read
+uses shared latch coupling:
+
+```text
+S(header)
+    -> read root page number
+    -> pin and S(root)
+    -> release header
+```
+
+The simple first write path takes `X(header)` followed by `X(root)`. It may
+release the header once the operation reaches a child that is safe and can no
+longer propagate a split, merge, or root replacement to the header. A later
+optimization may start optimistically and restart with `X(header)` only when a
+root structural change is required. It must not upgrade the header latch while
+retaining a shared latch.
+
+### Point Reads
+
+`get(key)` knows its logical key in advance, so it acquires `S(key)` first. It
+then descends using shared latch crabbing:
+
+```text
+S(parent)
+    -> read child page number
+    -> pin and S(child)
+    -> release and unpin parent
+```
+
+At the target leaf it copies the result, releases the leaf latch and pin, and
+returns. The logical `S(key)` lock remains held until transaction completion.
+
+### Put and Delete
+
+`put` and `delete` acquire `X(key)` before entering the tree. The simple first
+implementation descends with exclusive latch crabbing. After latching a child,
+it releases all unnecessary ancestors only when that child is safe:
+
+- For insertion, the child is safe when the new encoded entry cannot make it
+  overflow.
+- For deletion, the child is safe when removing the entry cannot make it
+  underflow. The root follows its special occupancy rules.
+
+Unsafe ancestors remain pinned and exclusively latched so a split, merge,
+redistribution, separator update, or root replacement can propagate upward
+without reacquiring an ancestor. Every retained latch is released when the
+operation ends; only the logical `X(key)` lock survives until commit or abort.
+
+### Range Scans Without Leaf Links
+
+The current leaf format has no next-leaf pointer, so a cursor cannot move from
+one leaf to another using leaf-to-leaf latch coupling. Holding the complete
+root-to-leaf path for a long scan would block structural writers near the root.
+The first implementation therefore retains at most the leaf's immediate
+parent and the current leaf during steady-state scanning:
+
+```text
+S(parent-of-leaves)
+S(current-leaf)
+```
+
+While the parent remains shared latched, its child array cannot be split,
+merged, or rewritten. After exhausting one leaf, the cursor reads and pins the
+next child through that parent, releases the old leaf, and acquires the next
+leaf's shared latch. Retaining the parent makes that handoff safe without
+reacquiring an ancestor.
+
+After exhausting every child of the retained parent, the cursor:
+
+1. Saves the last key it returned.
+2. Releases and unpins both the leaf and parent.
+3. Restarts from the header and root.
+4. Seeks the first key strictly greater than the saved key.
+5. Retains the newly found leaf and its immediate parent and continues.
+
+The restart uses the last key, not the old parent page number. Once its latch
+and pin are released, an old parent may be split, merged, freed, or reused.
+This design uses one additional `O(log N)` traversal per exhausted parent,
+rather than per leaf, while bounding the steady-state latch footprint to two
+pages.
+
+That bound describes physical cursor navigation between logical-lock waits.
+With the current blocking-only key-lock interface, the cursor must
+conservatively release and reseek for each candidate. A future nonblocking
+`try_lock_shared` may preserve the parent-and-leaf guards when the logical lock
+is immediately available; if it reports `Busy`, the cursor still releases both
+guards before using the blocking lock path.
+
+A cursor never retains page latches across a client round trip. It stores the
+last returned key and reseeks when the next cursor operation arrives. Since the
+first isolation level permits phantoms, a new key inserted beyond the last
+returned key may appear in the remaining scan. Seeking strictly beyond the
+last returned key prevents duplicates.
+
+### Logical Locks During a Range Scan
+
+A scan does not know its next logical key until it inspects a leaf. It must not
+wait for `S(candidate)` while holding the parent or leaf latch:
+
+```text
+scanner: holds S(leaf) -> waits for S(key)
+writer:  holds X(key)  -> waits for X(leaf)
+```
+
+That ordering forms a deadlock. For each candidate, the cursor instead:
+
+1. Copies the encoded candidate key while the leaf is pinned and shared
+   latched.
+2. Releases the leaf and parent latches and pins.
+3. Acquires the logical `S(candidate)` lock and waits if necessary.
+4. Reseeks from the root using the candidate key.
+5. Revalidates that the key still exists before copying its value.
+
+The second lookup is required because a writer may have changed or deleted the
+candidate while the scan waited. If it disappeared, the cursor continues from
+the first key strictly greater than the last key already returned. Every
+successfully acquired logical key lock remains held until transaction end,
+while all page latches remain operation-scoped.
+
 ## Footnotes
 - We need to keep the page-num of the root page of the b+ tree in the header of the db and make sure to modify it accordingly whenever we change the node.

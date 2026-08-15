@@ -22,8 +22,8 @@ version number stored in the page bytes.
 - Add `pageLSN` and a page checksum before integrating WAL.
 - Treat the cached 4096 bytes as the authoritative persistent representation;
   the runtime `page_num` mirror is only a cache lookup key.
-- Give the B+ tree all 4096 raw cached bytes, not a pager-owned `PageV2`
-  object or separately decoded header fields.
+- Let the B+ tree borrow pinned `PageV2` objects so operation-scoped latch
+  ownership remains explicit, while `BTreePage` interprets their raw bytes.
 - Replace `begin_write` with an operation-scoped mutation boundary that logs
   the complete physical after-images propagated by one B+ tree action.
 - Build and validate the logger independently, then run it beside the rollback
@@ -133,8 +133,15 @@ struct PageV2 {
     std::uint32_t refs_num = 0;
     bool is_dirty = false;
     bool need_flushing = false;
+    std::shared_mutex latch;
 };
 ```
+
+The latch protects the cached page image for one short B+ tree operation. A
+thread keeps the page referenced while waiting for or holding the latch,
+unlocks before unreferencing, and never stores the latch in a transaction.
+The first implementation uses `std::shared_mutex`; a fairer custom latch is
+deferred until profiling demonstrates starvation.
 
 `V2PageCodec` provides checked readers, writers, and whole-page validation:
 
@@ -159,15 +166,14 @@ redo comparison.
 
 ## Pager-to-B+ Tree Boundary
 
-`PageV2` remains internal to the pager and cache. The B+ tree never owns or
-receives that cache object, and the pager does not separately return decoded
-header fields. A pinned read exposes one read-only
-`std::span<const char, 4096>` over the complete cached page. A mutation exposes
-one mutable `std::span<char, 4096>` over the same complete page.
+The pager and cache retain ownership of every `PageV2`. The B+ tree may borrow
+a pinned `PageV2*` so `BTreeOperation` can hold its shared or exclusive latch
+and later unreference it through the pager. The pointer is invalid after that
+reference is released and must never be stored in a transaction.
 
-`BTreePage` receives all 4096 raw bytes. It uses `V2PageCodec` to read and
-validate the common page kind from those bytes, then interprets bytes 24
-through 4095 as its B+ tree payload. It can change the page kind through the
+`BTreePage` receives the complete `PageV2::data` span. It uses `V2PageCodec` to
+read and validate the common page kind from those bytes, then interprets bytes
+24 through 4095 as its B+ tree payload. It can change the page kind through the
 codec when a deliberate reinitialization requires that. The pager does not
 pass page number, page kind, `pageLSN`, CRC, and payload as separate values.
 

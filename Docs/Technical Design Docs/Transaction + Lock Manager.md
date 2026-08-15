@@ -75,6 +75,27 @@ The responsibilities are divided as follows:
   boundaries. It converts a lock-manager deadlock result into transaction
   abort and a client-visible error.
 
+### Operation-Scoped Page Latches
+
+Transactions own logical key locks, but they do not own page latches. Each B+
+tree call creates a `BTreeOperation` containing its transaction ID and the
+shared or exclusive locks acquired from pinned `PageV2` objects. `PageV2`
+stores one `std::shared_mutex`; no separate page-latch table or manager is
+needed. The operation releases every remaining latch and pager reference on
+normal return or stack unwinding, always unlocking before unreferencing.
+
+The B+ tree prevents latch cycles with one global order: header before root,
+parent before child, and a consistent sibling order. Code never reacquires an
+ancestor while retaining a descendant and never waits for a logical key lock
+while retaining a page latch. No latch wait-for graph is maintained.
+
+Point operations know their key and acquire the transaction-level key lock
+before entering the tree. A range scan must first discover a candidate under a
+shared page latch. It copies that key, releases its page guards, acquires
+`S(candidate)`, and reseeks from the root to revalidate the candidate before
+returning its value. The complete cursor and latch-crabbing protocol is
+specified in [Tree_Module.md](Tree_Module.md).
+
 ### Write Operation Handoff
 
 One mutating KeyStore call creates a `PendingBTreeAction` after it owns the
