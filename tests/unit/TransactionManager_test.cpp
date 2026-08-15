@@ -8,12 +8,16 @@
 #include <TransactionManager/TransactionManager.h>
 #include <V2PageCodec.h>
 
+#include <chrono>
 #include <filesystem>
+#include <future>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+using namespace std::chrono_literals;
 
 class TempDir {
 public:
@@ -268,6 +272,217 @@ TEST(TransactionManagerTest, ReopenContinuesAfterGreatestTransactionId) {
     EXPECT_EQ(
         manager.abort(transaction, AbortReason::ClientRequest),
         AbortStatus::Success);
+}
+
+TEST(TransactionManagerTest, CommitReleasesRecordedLogicalLocks) {
+    ManagerFixture fixture;
+    const Key key = KeyCodec::make_string("key");
+    const TransactionHandle reader = fixture.manager.begin();
+
+    EXPECT_EQ(
+        fixture.lock_manager.lock_shared(reader->id(), key),
+        LockManagerStatus::Success);
+    EXPECT_EQ(fixture.manager.commit(reader), CommitStatus::Success);
+
+    const TransactionHandle writer = fixture.manager.begin();
+    EXPECT_EQ(
+        fixture.lock_manager.lock_exclusive(writer->id(), key),
+        LockManagerStatus::Success);
+    EXPECT_EQ(fixture.manager.commit(writer), CommitStatus::Success);
+}
+
+TEST(TransactionManagerTest, GrantRemovesWaitEdgesAndRecordsDelayedLock) {
+    ManagerFixture fixture;
+    const Key key = KeyCodec::make_string("key");
+    const TransactionHandle writer = fixture.manager.begin();
+    const TransactionHandle reader = fixture.manager.begin();
+
+    ASSERT_EQ(
+        fixture.lock_manager.lock_exclusive(writer->id(), key),
+        LockManagerStatus::Success);
+
+    std::promise<void> reader_started;
+    std::future<void> started = reader_started.get_future();
+    std::future<LockManagerStatus> waiting_reader = std::async(
+        std::launch::async,
+        [&fixture, &key, reader_id = reader->id(),
+         signal = std::move(reader_started)]() mutable {
+            signal.set_value();
+            return fixture.lock_manager.lock_shared(reader_id, key);
+        });
+
+    started.wait();
+    EXPECT_EQ(waiting_reader.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(fixture.manager.commit(writer), CommitStatus::Success);
+
+    ASSERT_EQ(waiting_reader.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(waiting_reader.get(), LockManagerStatus::Success);
+    EXPECT_EQ(fixture.manager.commit(reader), CommitStatus::Success);
+
+    const TransactionHandle next_writer = fixture.manager.begin();
+    EXPECT_EQ(
+        fixture.lock_manager.lock_exclusive(next_writer->id(), key),
+        LockManagerStatus::Success);
+    EXPECT_EQ(fixture.manager.commit(next_writer), CommitStatus::Success);
+}
+
+TEST(TransactionManagerTest, SharedRequestReportsCrossKeyDeadlock) {
+    ManagerFixture fixture;
+    const Key first_key = KeyCodec::make_string("first");
+    const Key second_key = KeyCodec::make_string("second");
+    const TransactionHandle first = fixture.manager.begin();
+    const TransactionHandle second = fixture.manager.begin();
+
+    ASSERT_EQ(
+        fixture.lock_manager.lock_exclusive(first->id(), first_key),
+        LockManagerStatus::Success);
+    ASSERT_EQ(
+        fixture.lock_manager.lock_exclusive(second->id(), second_key),
+        LockManagerStatus::Success);
+
+    std::promise<void> first_started;
+    std::future<void> started = first_started.get_future();
+    std::future<LockManagerStatus> first_wait = std::async(
+        std::launch::async,
+        [&fixture, &second_key, first_id = first->id(),
+         signal = std::move(first_started)]() mutable {
+            signal.set_value();
+            return fixture.lock_manager.lock_shared(first_id, second_key);
+        });
+
+    started.wait();
+    EXPECT_EQ(first_wait.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(
+        fixture.lock_manager.lock_shared(second->id(), first_key),
+        LockManagerStatus::Deadlock);
+
+    EXPECT_EQ(
+        fixture.manager.abort(second, AbortReason::DeadlockVictim),
+        AbortStatus::Success);
+    ASSERT_EQ(first_wait.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(first_wait.get(), LockManagerStatus::Success);
+    EXPECT_EQ(fixture.manager.commit(first), CommitStatus::Success);
+}
+
+TEST(TransactionManagerTest, SharedOwnerPromotesAfterOtherReaderFinishes) {
+    ManagerFixture fixture;
+    const Key key = KeyCodec::make_string("key");
+    const TransactionHandle promoter = fixture.manager.begin();
+    const TransactionHandle reader = fixture.manager.begin();
+
+    ASSERT_EQ(
+        fixture.lock_manager.lock_shared(promoter->id(), key),
+        LockManagerStatus::Success);
+    ASSERT_EQ(
+        fixture.lock_manager.lock_shared(reader->id(), key),
+        LockManagerStatus::Success);
+
+    std::promise<void> promotion_started;
+    std::future<void> started = promotion_started.get_future();
+    std::future<LockManagerStatus> promotion = std::async(
+        std::launch::async,
+        [&fixture, &key, txn_id = promoter->id(),
+         signal = std::move(promotion_started)]() mutable {
+            signal.set_value();
+            return fixture.lock_manager.lock_exclusive(txn_id, key);
+        });
+
+    started.wait();
+    EXPECT_EQ(promotion.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(fixture.manager.commit(reader), CommitStatus::Success);
+
+    ASSERT_EQ(promotion.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(promotion.get(), LockManagerStatus::Success);
+    EXPECT_EQ(fixture.manager.commit(promoter), CommitStatus::Success);
+}
+
+TEST(TransactionManagerTest, SecondSharedPromotionDetectsDeadlock) {
+    ManagerFixture fixture;
+    const Key key = KeyCodec::make_string("key");
+    const TransactionHandle first = fixture.manager.begin();
+    const TransactionHandle second = fixture.manager.begin();
+
+    ASSERT_EQ(
+        fixture.lock_manager.lock_shared(first->id(), key),
+        LockManagerStatus::Success);
+    ASSERT_EQ(
+        fixture.lock_manager.lock_shared(second->id(), key),
+        LockManagerStatus::Success);
+
+    std::promise<void> first_started;
+    std::future<void> started = first_started.get_future();
+    std::future<LockManagerStatus> first_promotion = std::async(
+        std::launch::async,
+        [&fixture, &key, txn_id = first->id(),
+         signal = std::move(first_started)]() mutable {
+            signal.set_value();
+            return fixture.lock_manager.lock_exclusive(txn_id, key);
+        });
+
+    started.wait();
+    EXPECT_EQ(first_promotion.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(
+        fixture.lock_manager.lock_exclusive(second->id(), key),
+        LockManagerStatus::Deadlock);
+
+    EXPECT_EQ(
+        fixture.manager.abort(second, AbortReason::DeadlockVictim),
+        AbortStatus::Success);
+    ASSERT_EQ(first_promotion.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(first_promotion.get(), LockManagerStatus::Success);
+    EXPECT_EQ(fixture.manager.commit(first), CommitStatus::Success);
+}
+
+TEST(TransactionManagerTest, UnknownTransactionDoesNotRetainOwnerOrWaiter) {
+    ManagerFixture fixture;
+    const Key immediate_key = KeyCodec::make_string("immediate");
+    const Key contended_key = KeyCodec::make_string("contended");
+    const TransactionHandle owner = fixture.manager.begin();
+
+    EXPECT_EQ(
+        fixture.lock_manager.lock_shared(999, immediate_key),
+        LockManagerStatus::TransactionNotFound);
+    EXPECT_EQ(
+        fixture.lock_manager.lock_exclusive(owner->id(), immediate_key),
+        LockManagerStatus::Success);
+
+    EXPECT_EQ(
+        fixture.lock_manager.lock_exclusive(owner->id(), contended_key),
+        LockManagerStatus::Success);
+    EXPECT_EQ(
+        fixture.lock_manager.lock_shared(999, contended_key),
+        LockManagerStatus::TransactionNotFound);
+
+    EXPECT_EQ(fixture.manager.commit(owner), CommitStatus::Success);
+}
+
+TEST(TransactionManagerTest, MissingBlockerRemovesNewQueueEntry) {
+    TempDir directory;
+    Log log(config());
+    log.open(directory.path.string());
+    LockManager lock_manager;
+    RecordingUndoExecutor undo_executor;
+    const Key key = KeyCodec::make_string("key");
+
+    // Standalone mode permits direct lock-table testing without transaction
+    // tracking, which lets this test construct a stale blocker explicitly.
+    ASSERT_EQ(
+        lock_manager.lock_exclusive(999, key),
+        LockManagerStatus::Success);
+
+    TransactionManager manager(log, lock_manager, undo_executor);
+    const TransactionHandle transaction = manager.begin();
+    EXPECT_EQ(
+        lock_manager.lock_shared(transaction->id(), key),
+        LockManagerStatus::TransactionNotFound);
+
+    EXPECT_EQ(
+        lock_manager.unlock_exclusive(999, key),
+        LockManagerStatus::Success);
+    EXPECT_EQ(
+        lock_manager.lock_shared(transaction->id(), key),
+        LockManagerStatus::Success);
+    EXPECT_EQ(manager.commit(transaction), CommitStatus::Success);
 }
 
 } // namespace

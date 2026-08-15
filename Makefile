@@ -131,6 +131,8 @@ build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
 build/tests/unit/Log_test: CXXFLAGS += -pthread
 build/tests/unit/Log_test: LDLIBS += -pthread
+build/tests/unit/TransactionManager_test: CXXFLAGS += -pthread
+build/tests/unit/TransactionManager_test: LDLIBS += -pthread
 build/tests/unit/WaitForGraph_test: CXXFLAGS += -pthread
 build/tests/unit/WaitForGraph_test: LDLIBS += -pthread
 

@@ -37,6 +37,16 @@ TEST(KeyLockManagerTest, ExclusiveOwnerIsReportedAndValidatedOnUnlock) {
     EXPECT_EQ(manager.unlock_exclusive(1, key), LockManagerStatus::Success);
 }
 
+TEST(KeyLockManagerTest, SoleSharedOwnerPromotesImmediately) {
+    LockManager manager;
+    Key key = KeyCodec::make_string("key");
+
+    ASSERT_EQ(manager.lock_shared(1, key), LockManagerStatus::Success);
+    EXPECT_EQ(manager.lock_exclusive(1, key), LockManagerStatus::Success);
+    EXPECT_EQ(manager.unlock_shared(1, key), LockManagerStatus::NotOwner);
+    EXPECT_EQ(manager.unlock_exclusive(1, key), LockManagerStatus::Success);
+}
+
 TEST(KeyLockManagerTest, InvalidUnlockDoesNotCreateOrRetainLockState) {
     LockManager manager;
     Key key = KeyCodec::make_string("key");
@@ -135,16 +145,16 @@ TEST(KeyLockManagerTest, FrontWriterPreventsReaderFromBypassingQueue) {
     reader->txn_id = 3;
     reader->lock_mode = LockMode::Shared;
 
-    state.waiters.push(writer);
-    state.waiters.push(reader);
+    state.waiters.push_back(writer);
+    state.waiters.push_back(reader);
 
-    EXPECT_FALSE(LockState::grant_waiters(state));
+    EXPECT_TRUE(LockState::grant_waiters(state).empty());
     EXPECT_FALSE(writer->granted);
     EXPECT_FALSE(reader->granted);
 
     state.shared_owners.erase(1);
 
-    EXPECT_TRUE(LockState::grant_waiters(state));
+    EXPECT_EQ(LockState::grant_waiters(state).size(), 1u);
     EXPECT_TRUE(writer->granted);
     EXPECT_FALSE(reader->granted);
     ASSERT_TRUE(state.exclusive_owner.has_value());
@@ -154,7 +164,7 @@ TEST(KeyLockManagerTest, FrontWriterPreventsReaderFromBypassingQueue) {
 
     state.exclusive_owner.reset();
 
-    EXPECT_TRUE(LockState::grant_waiters(state));
+    EXPECT_EQ(LockState::grant_waiters(state).size(), 1u);
     EXPECT_TRUE(reader->granted);
     EXPECT_TRUE(state.shared_owners.contains(3));
     EXPECT_TRUE(state.waiters.empty());
