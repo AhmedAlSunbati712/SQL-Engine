@@ -2,6 +2,7 @@
 #include <DBHeaderCodec.h>
 #include <DiskIO.h>
 #include <JournalCodec.h>
+#include <Log/Log.h>
 #include <V2PageCodec.h>
 #include <containers/BTreeOperation.h>
 
@@ -772,10 +773,45 @@ PagerResult Pager::install_page_lsn(
     V2PageCodec::set_page_lsn(page->data, lsn);
     V2PageCodec::update_checksum(page->data);
     page->is_dirty = true;
+    page->wal_pending = false;
 
     if (must_unref) {
         PagerResult unref_result = unref_page(static_cast<int>(page_num));
         if (unref_result != PagerResult::Success) return unref_result;
+    }
+    return PagerResult::Success;
+}
+
+PagerResult Pager::mark_wal_pending(
+    BTreeOperation& operation,
+    std::uint32_t page_num
+) {
+    if (!is_open) return PagerResult::DatabaseNotOpen;
+
+    // A frame may become non-evictable only while the operation still owns
+    // the exclusive logical latch protecting its unlogged bytes.
+    const std::optional<PageLatchMode> mode = operation.latch_mode(page_num);
+    if (!mode || *mode != PageLatchMode::Exclusive) {
+        return PagerResult::Busy;
+    }
+
+    PageV2 *page = nullptr;
+    bool must_unref = false;
+    if (page_num == DB_HEADER_PAGE_NUM) {
+        PagerResult load_result = ensure_header_page_loaded(page);
+        if (load_result != PagerResult::Success) return load_result;
+    } else {
+        PagerGetResult get_result = get(static_cast<int>(page_num));
+        if (get_result.status != PagerResult::Success) return get_result.status;
+        page = get_result.page;
+        must_unref = true;
+    }
+
+    page->is_dirty = true;
+    page->wal_pending = true;
+
+    if (must_unref) {
+        return unref_page(static_cast<int>(page_num));
     }
     return PagerResult::Success;
 }
@@ -953,6 +989,20 @@ PagerResult Pager::commit_phase_one() {
 
     // The backup images are durable now, so it is finally safe to overwrite the db pages.
     for (const auto &[page_num, dPage_entry] : dirty_pages) {
+        if (dPage_entry->page->wal_pending) return PagerResult::CacheSpillFailed;
+
+        // WAL must reach stable storage before a page carrying that record's
+        // LSN is allowed to overwrite the database file.
+        const Lsn page_lsn = V2PageCodec::page_lsn(dPage_entry->page->data);
+        if (page_lsn != 0) {
+            if (!log_) return PagerResult::CacheSpillFailed;
+            try {
+                log_->sync_through(page_lsn);
+            } catch (...) {
+                return PagerResult::CacheSpillFailed;
+            }
+        }
+
         // The common checksum covers the complete persistent page and must
         // reflect the final bytes that are about to reach the database file.
         V2PageCodec::update_checksum(dPage_entry->page->data);
@@ -1747,6 +1797,9 @@ PagerResult Pager::cache_put(PageV2 *page) {
     delete page;
     // TODO: In the future, we will expand the cache temporarily
     if (put_result.status == PCacheResult::NoVictim) {
+        return PagerResult::NoEvictablePage;
+    }
+    if (put_result.status == PCacheResult::WalPending) {
         return PagerResult::NoEvictablePage;
     }
     // If it was dirty flush and we still failed to overspill, then we are cooked

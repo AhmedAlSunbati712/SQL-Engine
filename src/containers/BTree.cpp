@@ -81,6 +81,7 @@ BTreeStatus BTree::open(std::string db_file) {
     assert(!pager_open && pager == nullptr);
 
     pager = new Pager();
+    if (transaction_manager) pager->attach_log(transaction_manager->log());
     PagerResult open_result = pager->open(db_file);
     if (open_result != PagerResult::Success) {
         delete pager;
@@ -90,6 +91,7 @@ BTreeStatus BTree::open(std::string db_file) {
 
     currently_open_db_file = std::move(db_file);
     pager_open = true;
+    storage_poisoned = false;
     return BTreeStatus::Success;
 }
 
@@ -185,6 +187,10 @@ BTreeGetStatus BTree::get(const Key &key) {
      * return status
     */
     BTreeGetStatus get_result{};
+    if (storage_poisoned) {
+        get_result.status = BTreeStatus::FailedToRead;
+        return get_result;
+    }
     get_result.status = BTreeStatus::Success;
     BTreeOperation operation(0, pager->page_latch_manager());
 
@@ -300,6 +306,7 @@ BTreeStatus BTree::insert_impl(
      * return success
     */
     // A split or even an in-place insert can invalidate an active cursor's position.
+    if (storage_poisoned) return BTreeStatus::FailedToInsert;
     if (active_cursor_count > 0) return BTreeStatus::CursorActive;
 
     // Descend from the root to the target leaf.
@@ -473,6 +480,10 @@ BTreeRemoveStatus BTree::remove_impl(
     BTreeRemoveStatus remove_result{};
 
     // Deletes can change separator keys, merge pages, or free the cursor's current page.
+    if (storage_poisoned) {
+        remove_result.status = BTreeStatus::FailedToRemove;
+        return remove_result;
+    }
     if (active_cursor_count > 0) {
         remove_result.status = BTreeStatus::CursorActive;
         return remove_result;
@@ -579,6 +590,7 @@ void BTree::attach_transaction_manager(
     TransactionManager &manager
 ) noexcept {
     transaction_manager = &manager;
+    if (pager) pager->attach_log(manager.log());
 }
 
 bool BTree::finalize_action(
@@ -588,11 +600,29 @@ bool BTree::finalize_action(
 ) {
     if (!transaction_manager || !transaction) return false;
 
-    // Append the complete action before publishing its LSN into any page.
-    // The operation still owns every exclusive logical latch at this point.
-    const Lsn lsn = transaction_manager->append_action(
-        transaction,
-        action.build());
+    // Pending frames cannot be flushed or selected for eviction while the
+    // complete multi-page action is waiting for its assigned WAL LSN.
+    for (const PageEffect &effect : action.effects()) {
+        PagerResult pending_result = pager->mark_wal_pending(
+            operation,
+            effect.page_num);
+        if (pending_result != PagerResult::Success) {
+            storage_poisoned = true;
+            return false;
+        }
+    }
+
+    Lsn lsn = 0;
+    try {
+        // Append the complete action before publishing its LSN into any page.
+        // The operation still owns every exclusive logical latch at this point.
+        lsn = transaction_manager->append_action(
+            transaction,
+            action.build());
+    } catch (...) {
+        storage_poisoned = true;
+        throw;
+    }
 
     // Reload each affected frame by logical page number, install the assigned
     // LSN, and recompute its checksum before allowing the latch to be released.
@@ -601,7 +631,10 @@ bool BTree::finalize_action(
             operation,
             effect.page_num,
             lsn);
-        if (install_result != PagerResult::Success) return false;
+        if (install_result != PagerResult::Success) {
+            storage_poisoned = true;
+            return false;
+        }
     }
     return true;
 }

@@ -44,6 +44,7 @@ struct PageV2 {
     std::uint32_t page_num = 0;
     std::uint32_t refs_num = 0;
     bool is_dirty = false;
+    bool wal_pending = false;
     bool need_flushing = false;
 };
 

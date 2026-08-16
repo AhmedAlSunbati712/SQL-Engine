@@ -9,6 +9,7 @@ enum class PCacheResult : std::uint8_t {
 	Success = 0,
 	NoVictim,
 	DirtyFlush,
+	WalPending,
 	RemovingPinnedPage
 };
 

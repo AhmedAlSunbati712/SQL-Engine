@@ -189,6 +189,23 @@ TEST(PCacheTest, PutReturnsDirtyFlushWhenOnlyVictimIsDirtyAndNeedsFlushing) {
     delete new_page;
 }
 
+TEST(PCacheTest, PutRejectsWalPendingVictim) {
+    PCache cache(1);
+    PageV2 *page = make_page(1, 0, true, true);
+    page->wal_pending = true;
+    PageV2 *new_page = make_page(2);
+
+    EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
+
+    PCachePutResult put_result = cache.put(new_page);
+
+    EXPECT_EQ(put_result.status, PCacheResult::WalPending);
+    EXPECT_EQ(cache.get(1), page);
+    EXPECT_EQ(cache.get(2), nullptr);
+
+    delete new_page;
+}
+
 TEST(PCacheTest, PutEvictsDirtyPageWhenVictimDoesNotNeedFlushing) {
     PCache cache(1);
     PageV2 *page = make_page(1, 0, true, false);

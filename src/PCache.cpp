@@ -58,8 +58,14 @@ PCachePutResult PCache::put(PageV2 *page) {
         it_head--; // This is now an iterator that starts at head
 
         PageV2 *victim_page = nullptr;
+        bool found_pending_page = false;
         while (it != it_head) {
             PageV2 *candidate_page = *it;
+            if (candidate_page->wal_pending) {
+                found_pending_page = true;
+                it--;
+                continue;
+            }
             if (!candidate_page->is_dirty) {
                 victim_page = candidate_page;
                 break;
@@ -69,7 +75,12 @@ PCachePutResult PCache::put(PageV2 *page) {
         }
 
         // If a victim page page is dirty, we need to do some cleanup
-        assert(victim_page != nullptr);
+        if (!victim_page) {
+            result.status = found_pending_page
+                ? PCacheResult::WalPending
+                : PCacheResult::NoVictim;
+            return result;
+        }
         // Since we added the flag need_flush, what should be the condition we check here?
         // if victim_page->is_dirty + need_flush, we definitely need a cache spillover
         // if need_flush is false, then that means there's a copy of the page on disk in both the

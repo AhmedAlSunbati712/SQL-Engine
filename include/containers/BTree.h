@@ -145,4 +145,5 @@ class BTree {
         // Writes, transaction boundaries, and close are rejected while this is nonzero.
         std::size_t active_cursor_count = 0;
         bool pager_open = false;
+        bool storage_poisoned = false;
 };

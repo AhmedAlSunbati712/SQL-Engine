@@ -178,6 +178,7 @@ TEST_F(BTreeIntegrationTest, TransactionalInsertAppendsWalAndInstallsAssignedLsn
     // The legacy pager commit remains in place during this integration slice.
     // Flush it so the test can inspect the installed LSNs on disk.
     ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
+    EXPECT_GE(log.durable_lsn(), action_lsn);
     const auto header = read_page(db_path, 0);
     const auto root = read_page(db_path, 1);
     EXPECT_EQ(V2PageCodec::page_lsn(header), action_lsn);

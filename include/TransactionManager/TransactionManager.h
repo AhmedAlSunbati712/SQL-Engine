@@ -88,6 +88,8 @@ public:
         const Key& key,
         LockMode mode);
 
+    Log& log() noexcept { return log_; }
+
 private:
     Log& log_;
     LockManager& lock_manager_;

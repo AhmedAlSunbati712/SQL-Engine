@@ -11,6 +11,7 @@
 #include <LockMgr.h>
 
 class BTreeOperation;
+class Log;
 
 enum class PagerResult : std::uint8_t {
     Success = 0,
@@ -85,6 +86,10 @@ class Pager {
             BTreeOperation& operation,
             std::uint32_t page_num,
             Lsn lsn);
+        PagerResult mark_wal_pending(
+            BTreeOperation& operation,
+            std::uint32_t page_num);
+        void attach_log(Log& log) noexcept { log_ = &log; }
         PageLatchManager& page_latch_manager() noexcept { return page_latch_manager_; }
 	private:
 		struct PagerReadPageResult {
@@ -108,6 +113,7 @@ class Pager {
 		PCache *pCache = nullptr;
         LockMgr *lock_manager = nullptr;
 		PageLatchManager page_latch_manager_;
+		Log *log_ = nullptr;
 		bool is_open = false;
 		WriteTxnState write_txn_state = WriteTxnState::None;
         DBHeader db_header{};
