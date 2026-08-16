@@ -6,6 +6,7 @@
 #include <Log/WalPayload.h>
 #include <unordered_set>
 #include <vector>
+#include <mutex>
 #include <PCache.h>
 #include <Journal.h>
 #include <LockMgr.h>
@@ -114,6 +115,7 @@ class Pager {
         LockMgr *lock_manager = nullptr;
 		PageLatchManager page_latch_manager_;
 		Log *log_ = nullptr;
+		mutable std::recursive_mutex mutex_;
 		bool is_open = false;
 		WriteTxnState write_txn_state = WriteTxnState::None;
         DBHeader db_header{};

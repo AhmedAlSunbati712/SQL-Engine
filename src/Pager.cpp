@@ -82,6 +82,7 @@ Pager::~Pager() {
 }
 
 PagerResult Pager::open(std::string db_file) {
+    std::lock_guard lock(mutex_);
     assert(!is_open);
     if (is_open) return PagerResult::OpenDbFailed;
 
@@ -183,6 +184,7 @@ PagerResult Pager::open(std::string db_file) {
 }
 
 PagerGetResult Pager::get(int page_num) {
+    std::lock_guard lock(mutex_);
     /**
      * Check in the cache. if it returns the page. return it
      * if it's not, read from disk, and put in the cache
@@ -312,6 +314,7 @@ PagerAllocateResult Pager::allocate_page(
 }
 
 PagerAllocateResult Pager::allocate_page(V2PageKind kind) {
+    std::lock_guard lock(mutex_);
     /**
      * Description: Used to allocate a new page for a write (or resuing a page from the freelist)
      */
@@ -515,6 +518,7 @@ PagerMutationResult Pager::free_page(
 }
 
 PagerResult Pager::free_page(int page_num) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     // Boundary check for anything below the first real payload page.
@@ -598,6 +602,7 @@ PagerResult Pager::free_page(int page_num) {
 }
 
 PagerResult Pager::begin_write(int page_num) {
+    std::lock_guard lock(mutex_);
     /**
     * V1 for begin write: read page through get, ignore lock permissions, mark it as dirty
     * add to dirty pages disk and add to journal.
@@ -643,6 +648,7 @@ PagerResult Pager::begin_write(int page_num) {
 }
 
 PagerResult Pager::ref_page(int page_num) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     assert(page_num > DB_HEADER_PAGE_NUM);
@@ -672,6 +678,7 @@ PagerResult Pager::ref_page(int page_num) {
 }
 
 PagerResult Pager::unref_page(int page_num) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     PageV2 *page = pCache->get(page_num);
@@ -690,6 +697,7 @@ PagerResult Pager::unref_page(int page_num) {
 }
 
 PagerGetRootResult Pager::get_btree_root() {
+    std::lock_guard lock(mutex_);
     PagerGetRootResult result{};
     if (!is_open) {
         result.status = PagerResult::DatabaseNotOpen;
@@ -733,6 +741,7 @@ PagerMutationResult Pager::set_btree_root(
 }
 
 PagerResult Pager::set_btree_root(std::uint32_t root_page_num) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     PagerResult header_result = mark_header_dirty_for_mutation();
@@ -748,6 +757,7 @@ PagerResult Pager::install_page_lsn(
     std::uint32_t page_num,
     Lsn lsn
 ) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
     if (lsn == 0) return PagerResult::PageCorrupt;
 
@@ -786,6 +796,7 @@ PagerResult Pager::mark_wal_pending(
     BTreeOperation& operation,
     std::uint32_t page_num
 ) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     // A frame may become non-evictable only while the operation still owns
@@ -818,6 +829,7 @@ PagerResult Pager::mark_wal_pending(
 
 
 PagerResult Pager::commit_phase_one() {
+    std::lock_guard lock(mutex_);
     /**
      * Phase 1:
      * write the original images of the dirty pages to the journal
@@ -1035,6 +1047,7 @@ PagerResult Pager::commit_phase_one() {
 }
 
 PagerResult Pager::commit_phase_two() {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
     assert(write_txn_state == WriteTxnState::JournalDurable);
     assert(lock_manager->get_curr_lock() == Lock::EXCLUSIVE);
@@ -1077,6 +1090,7 @@ PagerResult Pager::commit_phase_two() {
 }
 
 PagerResult Pager::rollback_transaction() {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     // No active write transaction. nothing to rollback.
@@ -1103,6 +1117,7 @@ PagerResult Pager::rollback_transaction() {
 }
 
 PagerResult Pager::rollback_hot_journal() {
+    std::lock_guard lock(mutex_);
     /**
      * TODO: since we have multiple headers now, what we probably need to do is the following:
      * while the current the current offset is not at the end of the journal file, read a number of bytes
