@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 /**
@@ -200,6 +201,21 @@ void KeyStore::attach_transaction_manager(
 ) noexcept {
     transaction_manager = &manager;
     tree.attach_transaction_manager(manager);
+}
+
+void KeyStore::undo(
+    Transaction &transaction,
+    const UndoDescriptor &undo,
+    CompensationAppender append_compensation
+) {
+    // BTree invokes the callback before its operation object releases the
+    // logical page latches protecting the inverse and its physical effects.
+    if (!tree.apply_undo(
+            transaction,
+            undo,
+            std::move(append_compensation))) {
+        throw std::runtime_error("Failed to apply logical transaction undo");
+    }
 }
 
 KeyStore::~KeyStore() {

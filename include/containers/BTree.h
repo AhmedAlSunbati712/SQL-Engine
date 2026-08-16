@@ -96,6 +96,10 @@ class BTree {
             const Key &key,
             PendingBTreeAction &action);
         void attach_transaction_manager(TransactionManager &transaction_manager) noexcept;
+        bool apply_undo(
+            Transaction &transaction,
+            const UndoDescriptor &undo,
+            TransactionUndoExecutor::CompensationAppender append_compensation);
         // The database must already be open. The returned cursor starts unpositioned.
         BTreeCursor open_cursor();
         bool cursor_active() const;
@@ -116,9 +120,10 @@ class BTree {
             std::optional<std::uint32_t> left_sibling_page_num;
         };
 
-        BTreeStatus insert_impl(const Key &key, Value &value, PendingBTreeAction *action, const TransactionHandle *transaction);
-        BTreeRemoveStatus remove_impl(const Key &key, PendingBTreeAction *action, const TransactionHandle *transaction);
+        BTreeStatus insert_impl(const Key &key, Value &value, PendingBTreeAction *action, const TransactionHandle *transaction, Transaction *undo_transaction = nullptr, TransactionUndoExecutor::CompensationAppender *append_compensation = nullptr);
+        BTreeRemoveStatus remove_impl(const Key &key, PendingBTreeAction *action, const TransactionHandle *transaction, Transaction *undo_transaction = nullptr, TransactionUndoExecutor::CompensationAppender *append_compensation = nullptr);
         bool finalize_action(BTreeOperation &operation, const TransactionHandle &transaction, PendingBTreeAction &action);
+        bool finalize_compensation(BTreeOperation &operation, PendingBTreeAction &action, TransactionUndoExecutor::CompensationAppender &append_compensation);
         BTreeStatus propagate_separator_change_upward(const std::vector<TraversalPathEntry> &path, const Key &new_subtree_min, BTreeOperation &operation, PendingBTreeAction *action);
         BTreeStatus propagate_splitting(std::uint32_t split_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);
         BTreeStatus propagate_merging(std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);

@@ -23,10 +23,10 @@ namespace {
 
 class KeyStoreNoopUndoExecutor final : public TransactionUndoExecutor {
 public:
-    std::vector<PageEffect> undo(
+    void undo(
         Transaction&,
-        const UndoDescriptor&) override {
-        return {};
+        const UndoDescriptor&,
+        CompensationAppender) override {
     }
 };
 
@@ -211,6 +211,38 @@ TEST_F(KeyStoreIntegrationTest, TransactionAwareOperationsLockAndAppendWal) {
     EXPECT_EQ(
         transaction_manager.commit(transaction),
         CommitStatus::Success);
+}
+
+TEST_F(KeyStoreIntegrationTest, AbortAppendsClrBeforeUndoReleasesPageLatches) {
+    KeyStore store;
+    Log log(key_store_wal_config());
+    log.open((temp_dir / "wal").string());
+    LockManager lock_manager;
+    TransactionManager transaction_manager(log, lock_manager, store);
+    store.attach_transaction_manager(transaction_manager);
+    ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
+
+    const Key key = encode_key(KeyInput{std::uint64_t{17}});
+    const Value value = encode_value(ValueInput{std::string{"temporary"}});
+    const TransactionHandle writer = transaction_manager.begin();
+    ASSERT_EQ(store.put(writer, key, value), KeyStoreStatus::Success);
+
+    ASSERT_EQ(
+        transaction_manager.abort(writer, AbortReason::ClientRequest),
+        AbortStatus::Success);
+    const std::vector<WalRecord> records = log.scan();
+    ASSERT_EQ(records.size(), 5U);
+    EXPECT_EQ(records[0].type, WalRecordType::TxnBegin);
+    EXPECT_EQ(records[1].type, WalRecordType::BTreeAction);
+    EXPECT_EQ(records[2].type, WalRecordType::TxnAbort);
+    EXPECT_EQ(records[3].type, WalRecordType::Compensation);
+    EXPECT_EQ(records[4].type, WalRecordType::TxnEnd);
+
+    const TransactionHandle reader = transaction_manager.begin();
+    EXPECT_EQ(store.get(reader, key).status, KeyStoreStatus::KeyNotFound);
+    EXPECT_EQ(
+        transaction_manager.abort(reader, AbortReason::ClientRequest),
+        AbortStatus::Success);
 }
 
 TEST_F(KeyStoreIntegrationTest, TypedValuesRoundTripAndRemoveAcrossReopen) {

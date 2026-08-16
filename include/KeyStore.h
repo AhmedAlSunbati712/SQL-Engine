@@ -113,7 +113,7 @@ struct KeyStoreScanResult {
     std::optional<KeyStoreCursor> cursor;
 };
 
-class KeyStore {
+class KeyStore : public TransactionUndoExecutor {
     public:
         explicit KeyStore(KeyStoreOptions options = {});
         ~KeyStore();
@@ -145,6 +145,11 @@ class KeyStore {
             const Key &key);
 
         void attach_transaction_manager(TransactionManager &manager) noexcept;
+
+        void undo(
+            Transaction &transaction,
+            const UndoDescriptor &undo,
+            CompensationAppender append_compensation) override;
 
         KeyStoreStatus begin_write_transaction();
         KeyStoreStatus commit();

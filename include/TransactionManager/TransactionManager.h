@@ -5,6 +5,7 @@
 #include <TransactionManager/WaitForGraph.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -41,11 +42,15 @@ enum class WaitRegistrationStatus : std::uint8_t {
 // returned effects to append the corresponding compensation record.
 class TransactionUndoExecutor {
 public:
+    using CompensationAppender =
+        std::function<Lsn(std::vector<PageEffect>)>;
+
     virtual ~TransactionUndoExecutor() = default;
 
-    virtual std::vector<PageEffect> undo(
+    virtual void undo(
         Transaction& transaction,
-        const UndoDescriptor& undo) = 0;
+        const UndoDescriptor& undo,
+        CompensationAppender append_compensation) = 0;
 };
 
 class TransactionManager {

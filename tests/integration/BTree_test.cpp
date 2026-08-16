@@ -32,10 +32,10 @@ Key make_key(std::uint64_t key) {
 
 class NoopUndoExecutor final : public TransactionUndoExecutor {
 public:
-    std::vector<PageEffect> undo(
+    void undo(
         Transaction&,
-        const UndoDescriptor&) override {
-        return {};
+        const UndoDescriptor&,
+        CompensationAppender) override {
     }
 };
 

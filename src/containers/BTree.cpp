@@ -259,7 +259,9 @@ BTreeStatus BTree::insert_impl(
     const Key &key,
     Value &value,
     PendingBTreeAction *action,
-    const TransactionHandle *transaction
+    const TransactionHandle *transaction,
+    Transaction *undo_transaction,
+    TransactionUndoExecutor::CompensationAppender *append_compensation
 ) {
     /**
      * descent <- descend_from_root_to_leaf(key)
@@ -312,11 +314,19 @@ BTreeStatus BTree::insert_impl(
     // Descend from the root to the target leaf.
     // We need the path this time in case the insert changes separators or causes a split.
     BTreeOperation operation(
-        transaction && *transaction ? (*transaction)->id() : 0,
+        transaction && *transaction
+            ? (*transaction)->id()
+            : (undo_transaction ? undo_transaction->id() : 0),
         pager->page_latch_manager());
     auto finish = [&](BTreeStatus status) {
-        if (status != BTreeStatus::Success || !transaction || !action) return status;
-        if (!finalize_action(operation, *transaction, *action)) {
+        if (status != BTreeStatus::Success || !action) return status;
+        bool finalized = true;
+        if (transaction) {
+            finalized = finalize_action(operation, *transaction, *action);
+        } else if (append_compensation) {
+            finalized = finalize_compensation(operation, *action, *append_compensation);
+        }
+        if (!finalized) {
             return BTreeStatus::FailedToInsert;
         }
         return BTreeStatus::Success;
@@ -439,7 +449,9 @@ BTreeRemoveStatus BTree::remove(
 BTreeRemoveStatus BTree::remove_impl(
     const Key &key,
     PendingBTreeAction *action,
-    const TransactionHandle *transaction
+    const TransactionHandle *transaction,
+    Transaction *undo_transaction,
+    TransactionUndoExecutor::CompensationAppender *append_compensation
 ) {
     /**
      * descent <- descend_from_root_to_leaf(key)
@@ -490,11 +502,19 @@ BTreeRemoveStatus BTree::remove_impl(
     }
 
     BTreeOperation operation(
-        transaction && *transaction ? (*transaction)->id() : 0,
+        transaction && *transaction
+            ? (*transaction)->id()
+            : (undo_transaction ? undo_transaction->id() : 0),
         pager->page_latch_manager());
     auto finish = [&](BTreeRemoveStatus status) {
-        if (status.status != BTreeStatus::Success || !transaction || !action) return status;
-        if (!finalize_action(operation, *transaction, *action)) {
+        if (status.status != BTreeStatus::Success || !action) return status;
+        bool finalized = true;
+        if (transaction) {
+            finalized = finalize_action(operation, *transaction, *action);
+        } else if (append_compensation) {
+            finalized = finalize_compensation(operation, *action, *append_compensation);
+        }
+        if (!finalized) {
             status.status = BTreeStatus::FailedToRemove;
         }
         return status;
@@ -637,6 +657,71 @@ bool BTree::finalize_action(
         }
     }
     return true;
+}
+
+bool BTree::finalize_compensation(
+    BTreeOperation &operation,
+    PendingBTreeAction &action,
+    TransactionUndoExecutor::CompensationAppender &append_compensation
+) {
+    for (const PageEffect &effect : action.effects()) {
+        if (pager->mark_wal_pending(operation, effect.page_num) != PagerResult::Success) {
+            storage_poisoned = true;
+            return false;
+        }
+    }
+
+    Lsn lsn = 0;
+    try {
+        lsn = append_compensation(action.effects());
+    } catch (...) {
+        storage_poisoned = true;
+        throw;
+    }
+
+    for (const PageEffect &effect : action.effects()) {
+        if (pager->install_page_lsn(operation, effect.page_num, lsn) != PagerResult::Success) {
+            storage_poisoned = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool BTree::apply_undo(
+    Transaction &transaction,
+    const UndoDescriptor &undo,
+    TransactionUndoExecutor::CompensationAppender append_compensation
+) {
+    PendingBTreeAction action(transaction.id(), transaction.last_lsn());
+    action.set_undo(undo);
+
+    if (const auto *insert = std::get_if<InsertUndo>(&undo)) {
+        return remove_impl(
+            insert->key,
+            &action,
+            nullptr,
+            &transaction,
+            &append_compensation).status == BTreeStatus::Success;
+    }
+
+    Key key{};
+    Value value{};
+    if (const auto *update = std::get_if<UpdateUndo>(&undo)) {
+        key = update->key;
+        value = update->old_value;
+    } else {
+        const auto &deletion = std::get<DeleteUndo>(undo);
+        key = deletion.key;
+        value = deletion.old_value;
+    }
+    return insert_impl(
+        key,
+        value,
+        &action,
+        nullptr,
+        &transaction,
+        &append_compensation) == BTreeStatus::Success;
 }
 
 
