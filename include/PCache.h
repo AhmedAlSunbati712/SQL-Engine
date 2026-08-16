@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <mutex>
 #include <unordered_map>
 #include <DLList.h>
 #include <PageV2.h>
@@ -39,6 +40,7 @@ class PCache {
 		static const int DEFAULT_CAPACITY = 64;
 		int capacity = DEFAULT_CAPACITY;
 		int length = 0; // Total number of pages in the cache. Pinned or unpinned
+		mutable std::recursive_mutex mutex_;
 		std::unordered_map<int, PageV2 *> cache_map;
 		DLList *unpinned_pages = new DLList();
 };
