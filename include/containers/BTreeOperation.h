@@ -1,28 +1,18 @@
 #pragma once
 
-#include <PageV2.h>
+#include <PageLatchManager.h>
 #include <TransactionManager/Transaction.h>
 
 #include <cstdint>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <unordered_map>
 #include <variant>
-#include <vector>
 
-class Pager;
-
-enum class PageLatchMode : std::uint8_t {
-    Shared = 0,
-    Exclusive,
-};
-
-// Owns every page latch and pager reference retained by one B+ tree call.
-// Releasing a held page always unlocks its latch before unreferencing it.
+// Owns every logical page latch retained by one B+ tree call. Pager references
+// remain the caller's responsibility and may be released while a latch stays held.
 class BTreeOperation {
 public:
-    BTreeOperation(TransactionId txn_id, Pager& pager);
+    BTreeOperation(TransactionId txn_id, PageLatchManager& latch_manager);
     ~BTreeOperation() noexcept;
 
     BTreeOperation(const BTreeOperation&) = delete;
@@ -30,9 +20,8 @@ public:
     BTreeOperation(BTreeOperation&&) = delete;
     BTreeOperation& operator=(BTreeOperation&&) = delete;
 
-    // Takes ownership of the caller's existing pager reference.
-    PageV2* lock_shared(PageV2* pinned_page);
-    PageV2* lock_exclusive(PageV2* pinned_page);
+    void lock_shared(std::uint32_t page_num);
+    void lock_exclusive(std::uint32_t page_num);
 
     void release(std::uint32_t page_num) noexcept;
     void release_all() noexcept;
@@ -41,17 +30,12 @@ public:
     TransactionId transaction_id() const noexcept { return txn_id_; }
 
 private:
-    using SharedLatch = std::shared_lock<std::shared_mutex>;
-    using ExclusiveLatch = std::unique_lock<std::shared_mutex>;
-
-    struct HeldPage {
-        PageV2* page = nullptr;
+    struct HeldPageLatch {
         PageLatchMode mode = PageLatchMode::Shared;
-        std::variant<SharedLatch, ExclusiveLatch> lock;
+        std::variant<PageReadLatch, PageWriteLatch> lock;
     };
 
     TransactionId txn_id_;
-    Pager& pager_;
-    std::vector<HeldPage> held_pages_;
-    std::unordered_map<std::uint32_t, PageLatchMode> held_modes_;
+    PageLatchManager& latch_manager_;
+    std::unordered_map<std::uint32_t, HeldPageLatch> held_latches_;
 };

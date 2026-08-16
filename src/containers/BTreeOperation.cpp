@@ -1,122 +1,65 @@
 #include <containers/BTreeOperation.h>
 
-#include <Pager.h>
-
-#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
-BTreeOperation::BTreeOperation(TransactionId txn_id, Pager& pager)
-    : txn_id_(txn_id),
-      pager_(pager) {}
+BTreeOperation::BTreeOperation(
+    TransactionId txn_id,
+    PageLatchManager& latch_manager
+) : txn_id_(txn_id),
+    latch_manager_(latch_manager) {}
 
 BTreeOperation::~BTreeOperation() noexcept {
     release_all();
 }
 
-PageV2* BTreeOperation::lock_shared(PageV2* pinned_page) {
-    if (!pinned_page) {
-        throw std::invalid_argument("Cannot latch a null page");
+void BTreeOperation::lock_shared(std::uint32_t page_num) {
+    auto held = held_latches_.find(page_num);
+    if (held != held_latches_.end()) {
+        // An exclusive latch already permits reads, while acquiring the same
+        // shared latch again would only attempt to recursively lock the page.
+        return;
     }
 
-    // Acquiring the same page twice could make this thread wait on a latch it
-    // already owns. Reject the request before attempting another acquisition.
-    if (held_modes_.contains(pinned_page->page_num)) {
-        (void)pager_.unref_page(static_cast<int>(pinned_page->page_num));
-        throw std::logic_error("BTree operation already holds this page");
-    }
-
-    // The operation owns the caller's pager reference as soon as this method
-    // is called, so every failed acquisition must release that reference.
-    try {
-        SharedLatch lock(pinned_page->latch);
-        held_pages_.push_back({
-            .page = pinned_page,
+    PageReadLatch latch = latch_manager_.lock_shared(page_num);
+    held_latches_.emplace(
+        page_num,
+        HeldPageLatch{
             .mode = PageLatchMode::Shared,
-            .lock = std::move(lock),
+            .lock = std::move(latch),
         });
-        try {
-            held_modes_.emplace(pinned_page->page_num, PageLatchMode::Shared);
-        } catch (...) {
-            held_pages_.pop_back();
-            throw;
-        }
-    } catch (...) {
-        (void)pager_.unref_page(static_cast<int>(pinned_page->page_num));
-        throw;
-    }
-
-    return pinned_page;
 }
 
-PageV2* BTreeOperation::lock_exclusive(PageV2* pinned_page) {
-    if (!pinned_page) {
-        throw std::invalid_argument("Cannot latch a null page");
+void BTreeOperation::lock_exclusive(std::uint32_t page_num) {
+    auto held = held_latches_.find(page_num);
+    if (held != held_latches_.end()) {
+        // Exclusive reacquisition is harmless, but std::shared_mutex cannot
+        // atomically promote a shared owner without risking self-deadlock.
+        if (held->second.mode == PageLatchMode::Exclusive) return;
+        throw std::logic_error("Cannot promote a held shared page latch");
     }
 
-    // Page latches are not recursive and are never promoted in place.
-    if (held_modes_.contains(pinned_page->page_num)) {
-        (void)pager_.unref_page(static_cast<int>(pinned_page->page_num));
-        throw std::logic_error("BTree operation already holds this page");
-    }
-
-    try {
-        ExclusiveLatch lock(pinned_page->latch);
-        held_pages_.push_back({
-            .page = pinned_page,
+    PageWriteLatch latch = latch_manager_.lock_exclusive(page_num);
+    held_latches_.emplace(
+        page_num,
+        HeldPageLatch{
             .mode = PageLatchMode::Exclusive,
-            .lock = std::move(lock),
+            .lock = std::move(latch),
         });
-        try {
-            held_modes_.emplace(pinned_page->page_num, PageLatchMode::Exclusive);
-        } catch (...) {
-            held_pages_.pop_back();
-            throw;
-        }
-    } catch (...) {
-        (void)pager_.unref_page(static_cast<int>(pinned_page->page_num));
-        throw;
-    }
-
-    return pinned_page;
 }
 
 void BTreeOperation::release(std::uint32_t page_num) noexcept {
-    auto held = std::find_if(
-        held_pages_.begin(),
-        held_pages_.end(),
-        [&](const HeldPage& page) {
-            return page.page->page_num == page_num;
-        });
-    if (held == held_pages_.end()) return;
-
-    // Unlock before erasing the guard and dropping the pager reference.
-    std::visit([](auto& lock) {
-        if (lock.owns_lock()) lock.unlock();
-    }, held->lock);
-    held_pages_.erase(held);
-    held_modes_.erase(page_num);
-    (void)pager_.unref_page(static_cast<int>(page_num));
+    held_latches_.erase(page_num);
 }
 
 void BTreeOperation::release_all() noexcept {
-    // Release descendants before ancestors by unwinding acquisition order.
-    while (!held_pages_.empty()) {
-        HeldPage& held = held_pages_.back();
-        const std::uint32_t page_num = held.page->page_num;
-
-        std::visit([](auto& lock) {
-            if (lock.owns_lock()) lock.unlock();
-        }, held.lock);
-        held_pages_.pop_back();
-        held_modes_.erase(page_num);
-        (void)pager_.unref_page(static_cast<int>(page_num));
-    }
+    held_latches_.clear();
 }
 
 std::optional<PageLatchMode> BTreeOperation::latch_mode(
-    std::uint32_t page_num) const noexcept {
-    auto mode = held_modes_.find(page_num);
-    if (mode == held_modes_.end()) return std::nullopt;
-    return mode->second;
+    std::uint32_t page_num
+) const noexcept {
+    auto held = held_latches_.find(page_num);
+    if (held == held_latches_.end()) return std::nullopt;
+    return held->second.mode;
 }
