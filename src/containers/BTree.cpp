@@ -335,7 +335,8 @@ BTreeStatus BTree::insert_impl(
         key,
         true,
         &operation,
-        PageLatchMode::Exclusive);
+        PageLatchMode::Exclusive,
+        BTreeMutationType::Insert);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         PagerAllocateResult allocation_result = pager->allocate_page(
             operation,
@@ -730,7 +731,8 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
     const Key &key,
     bool include_path,
     BTreeOperation *operation,
-    PageLatchMode latch_mode
+    PageLatchMode latch_mode,
+    BTreeMutationType mutation_type
 ) {
     LeafDescentResult descent_result{};
 
@@ -746,7 +748,18 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
     PagerGetRootResult root_get_result = pager->get_btree_root();
 
     if (root_get_result.status == PagerResult::EmptyBTree) {
-        if (operation) operation->release(0);
+        // The first inserter must retain page zero until it installs the root.
+        // Releasing and reacquiring it would let another inserter observe the
+        // same empty tree and create a competing root page.
+        if (
+            operation &&
+            !(
+                latch_mode == PageLatchMode::Exclusive &&
+                mutation_type == BTreeMutationType::Insert
+            )
+        ) {
+            operation->release(0);
+        }
         descent_result.status = BTreeStatus::EmptyTree;
         return descent_result;
     }
@@ -770,6 +783,19 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
     // If the root is already a leaf, return the root
     PageType root_page_type = BTreePage::peek_page_type(root_get_result.page->data.data());
     if (root_page_type == PageType::Leaf) {
+        // A root leaf that can absorb this insert cannot split, so page zero
+        // cannot change and no longer needs to remain exclusively latched.
+        if (
+            operation &&
+            latch_mode == PageLatchMode::Exclusive &&
+            mutation_type == BTreeMutationType::Insert
+        ) {
+            BLeafPage root_page(root_get_result.page->data.data());
+            if (root_page.get_key_count() < MAX_KEYS(BTREE_ORDER)) {
+                operation->release_all_exclusive_except(
+                    root_get_result.root_page_num);
+            }
+        }
         descent_result.leaf_page = root_get_result.page->data.data();
         descent_result.leaf_page_num = root_get_result.root_page_num;
         return descent_result;
@@ -811,16 +837,48 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
 
         // Get the computed child page number. That's the next page in our traversal
         PagerGetResult pager_get_result = pager->get(*target_child_page_num);
-        pager->unref_page(curr_page_num); // Make sure to unref the parent page since we don't need it anymore.
-        if (operation && latch_mode == PageLatchMode::Shared) {
-            operation->release(curr_page_num);
-        }
 
-        // Handle failure of reading
+        // Handle failure of reading before inspecting the child frame.
         if (pager_get_result.status != PagerResult::Success) {
+            pager->unref_page(curr_page_num);
+            if (operation && latch_mode == PageLatchMode::Shared) {
+                operation->release(curr_page_num);
+            }
             if (operation) operation->release(*target_child_page_num);
             descent_result.status = BTreeStatus::FailedToRead;
             return descent_result;
+        }
+
+        PageType child_page_type = BTreePage::peek_page_type(
+            pager_get_result.page->data.data());
+
+        // A child with room for one more key cannot propagate an insertion
+        // upward. Retain only that child and let unrelated paths proceed.
+        if (
+            operation &&
+            latch_mode == PageLatchMode::Exclusive &&
+            mutation_type == BTreeMutationType::Insert
+        ) {
+            std::uint16_t child_key_count = 0;
+            if (child_page_type == PageType::Leaf) {
+                BLeafPage child_page(pager_get_result.page->data.data());
+                child_key_count = child_page.get_key_count();
+            } else {
+                BInternalPage child_page(pager_get_result.page->data.data());
+                child_key_count = child_page.get_key_count();
+            }
+
+            if (child_key_count < MAX_KEYS(BTREE_ORDER)) {
+                operation->release_all_exclusive_except(
+                    *target_child_page_num);
+            }
+        }
+
+        // The logical latch may be retained for propagation even though the
+        // cache frame itself is no longer needed during downward traversal.
+        pager->unref_page(curr_page_num);
+        if (operation && latch_mode == PageLatchMode::Shared) {
+            operation->release(curr_page_num);
         }
 
         // If the caller wants us to record our path to the target leaf, record the page num 
@@ -836,7 +894,6 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
         curr_data = pager_get_result.page->data.data();
 
         // If the next page is a leaf, terminate the search here
-        PageType child_page_type = BTreePage::peek_page_type(pager_get_result.page->data.data());
         if (child_page_type == PageType::Leaf) break;
     }
 

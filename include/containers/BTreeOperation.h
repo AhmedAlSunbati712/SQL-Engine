@@ -24,6 +24,7 @@ public:
     void lock_exclusive(std::uint32_t page_num);
 
     void release(std::uint32_t page_num) noexcept;
+    void release_all_exclusive_except(std::uint32_t page_num) noexcept;
     void release_all() noexcept;
 
     std::optional<PageLatchMode> latch_mode(std::uint32_t page_num) const noexcept;

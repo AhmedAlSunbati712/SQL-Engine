@@ -7,11 +7,14 @@
 #include <ValueCodec.h>
 
 #include <chrono>
+#include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -211,6 +214,55 @@ TEST_F(KeyStoreIntegrationTest, TransactionAwareOperationsLockAndAppendWal) {
     EXPECT_EQ(
         transaction_manager.commit(transaction),
         CommitStatus::Success);
+}
+
+TEST_F(KeyStoreIntegrationTest, ConcurrentFirstInsertsShareOneInstalledRoot) {
+    Log log(Config{
+        .max_index_bytes = 1000 * Index::ENTRY_SIZE,
+        .max_store_bytes = 16 * 1024 * 1024,
+        .initial_lsn = 1,
+    });
+    log.open((temp_dir / "wal").string());
+    LockManager lock_manager;
+    KeyStore store;
+    TransactionManager transaction_manager(log, lock_manager, store);
+    store.attach_transaction_manager(transaction_manager);
+    ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
+
+    constexpr unsigned THREAD_COUNT = 4;
+    constexpr unsigned INSERTS_PER_THREAD = 50;
+    std::barrier start(THREAD_COUNT);
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+
+    for (unsigned thread = 0; thread < THREAD_COUNT; ++thread) {
+        threads.emplace_back([&, thread] {
+            start.arrive_and_wait();
+            for (unsigned i = 0; i < INSERTS_PER_THREAD && !failed; ++i) {
+                const std::uint64_t number =
+                    static_cast<std::uint64_t>(i) * THREAD_COUNT + thread;
+                TransactionHandle transaction = transaction_manager.begin();
+                if (
+                    store.put(
+                        transaction,
+                        KeyCodec::make_uint64(number),
+                        ValueCodec::make_varuint(number)) != KeyStoreStatus::Success ||
+                    transaction_manager.commit(transaction) != CommitStatus::Success
+                ) {
+                    failed = true;
+                }
+            }
+        });
+    }
+
+    for (std::thread& thread : threads) thread.join();
+    ASSERT_FALSE(failed);
+
+    for (std::uint64_t number = 0; number < THREAD_COUNT * INSERTS_PER_THREAD; ++number) {
+        EXPECT_EQ(
+            store.get(KeyCodec::make_uint64(number)).status,
+            KeyStoreStatus::Success);
+    }
 }
 
 TEST_F(KeyStoreIntegrationTest, AbortAppendsClrBeforeUndoReleasesPageLatches) {

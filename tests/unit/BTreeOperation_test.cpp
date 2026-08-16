@@ -70,3 +70,22 @@ TEST(BTreeOperationTest, DuplicateRequestsAreIdempotentAndUpgradeIsRejected) {
     EXPECT_NO_THROW(operation.lock_shared(12));
     EXPECT_EQ(*operation.latch_mode(12), PageLatchMode::Exclusive);
 }
+
+TEST(BTreeOperationTest, ReleasesExclusiveAncestorsButKeepsRequestedPage) {
+    PageLatchManager manager;
+    BTreeOperation operation(1, manager);
+
+    operation.lock_exclusive(0);
+    operation.lock_exclusive(4);
+    operation.lock_shared(8);
+    operation.lock_exclusive(12);
+
+    operation.release_all_exclusive_except(12);
+
+    EXPECT_FALSE(operation.latch_mode(0).has_value());
+    EXPECT_FALSE(operation.latch_mode(4).has_value());
+    ASSERT_TRUE(operation.latch_mode(8).has_value());
+    EXPECT_EQ(*operation.latch_mode(8), PageLatchMode::Shared);
+    ASSERT_TRUE(operation.latch_mode(12).has_value());
+    EXPECT_EQ(*operation.latch_mode(12), PageLatchMode::Exclusive);
+}

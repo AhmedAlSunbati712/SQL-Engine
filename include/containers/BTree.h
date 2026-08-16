@@ -43,6 +43,11 @@ enum class ChildDirection : std::uint8_t {
     Left
 };
 
+enum class BTreeMutationType : std::uint8_t {
+    None = 0,
+    Insert,
+};
+
 struct BTreeGetStatus {
     BTreeStatus status;
     Value value;
@@ -112,7 +117,8 @@ class BTree {
             const Key &key,
             bool include_path,
             BTreeOperation *operation = nullptr,
-            PageLatchMode latch_mode = PageLatchMode::Shared);
+            PageLatchMode latch_mode = PageLatchMode::Shared,
+            BTreeMutationType mutation_type = BTreeMutationType::None);
         struct MergeParentContext {
             std::uint32_t parent_page_num;
             std::size_t child_idx;

@@ -52,6 +52,23 @@ void BTreeOperation::release(std::uint32_t page_num) noexcept {
     held_latches_.erase(page_num);
 }
 
+void BTreeOperation::release_all_exclusive_except(
+    std::uint32_t page_num
+) noexcept {
+    // Once a child is known to be safe, changes cannot propagate into its
+    // ancestors. Keep the child protected and release every older write latch.
+    for (auto held = held_latches_.begin(); held != held_latches_.end();) {
+        if (
+            held->first != page_num &&
+            held->second.mode == PageLatchMode::Exclusive
+        ) {
+            held = held_latches_.erase(held);
+        } else {
+            ++held;
+        }
+    }
+}
+
 void BTreeOperation::release_all() noexcept {
     held_latches_.clear();
 }
