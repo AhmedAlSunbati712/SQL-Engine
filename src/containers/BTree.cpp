@@ -524,7 +524,8 @@ BTreeRemoveStatus BTree::remove_impl(
         key,
         true,
         &operation,
-        PageLatchMode::Exclusive);
+        PageLatchMode::Exclusive,
+        BTreeMutationType::Remove);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         remove_result.status = BTreeStatus::KeyNotInTree;
         return finish(remove_result);
@@ -795,6 +796,23 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
                 operation->release_all_exclusive_except(
                     root_get_result.root_page_num);
             }
+        } else if (
+            operation &&
+            latch_mode == PageLatchMode::Exclusive &&
+            mutation_type == BTreeMutationType::Remove
+        ) {
+            BLeafPage root_page(root_get_result.page->data.data());
+            const std::size_t key_idx = root_page.lower_bound_key(key);
+            const std::optional<Key> existing_key = root_page.key_at(key_idx);
+            const bool key_exists =
+                existing_key && KeyCodec::equal(*existing_key, key);
+
+            // A missing key makes no change. An existing key is safe when the
+            // root leaf will remain nonempty and page zero cannot change.
+            if (!key_exists || root_page.get_key_count() > 1) {
+                operation->release_all_exclusive_except(
+                    root_get_result.root_page_num);
+            }
         }
         descent_result.leaf_page = root_get_result.page->data.data();
         descent_result.leaf_page_num = root_get_result.root_page_num;
@@ -852,23 +870,42 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
         PageType child_page_type = BTreePage::peek_page_type(
             pager_get_result.page->data.data());
 
-        // A child with room for one more key cannot propagate an insertion
-        // upward. Retain only that child and let unrelated paths proceed.
+        // At a leaf we can prove that this insert cannot split anywhere, so
+        // neither tree ancestors nor page-zero allocation metadata are needed.
         if (
             operation &&
             latch_mode == PageLatchMode::Exclusive &&
-            mutation_type == BTreeMutationType::Insert
+            mutation_type == BTreeMutationType::Insert &&
+            child_page_type == PageType::Leaf
         ) {
-            std::uint16_t child_key_count = 0;
-            if (child_page_type == PageType::Leaf) {
-                BLeafPage child_page(pager_get_result.page->data.data());
-                child_key_count = child_page.get_key_count();
-            } else {
-                BInternalPage child_page(pager_get_result.page->data.data());
-                child_key_count = child_page.get_key_count();
+            BLeafPage child_page(pager_get_result.page->data.data());
+            if (child_page.get_key_count() < MAX_KEYS(BTREE_ORDER)) {
+                operation->release_all_exclusive_except(
+                    *target_child_page_num);
             }
+        }
 
-            if (child_key_count < MAX_KEYS(BTREE_ORDER)) {
+        // A leaf deletion is safe only when it cannot underflow and cannot
+        // change the separator that represents the leaf in its parent.
+        if (
+            operation &&
+            latch_mode == PageLatchMode::Exclusive &&
+            mutation_type == BTreeMutationType::Remove &&
+            child_page_type == PageType::Leaf
+        ) {
+            BLeafPage child_page(pager_get_result.page->data.data());
+            const std::size_t key_idx = child_page.lower_bound_key(key);
+            const std::optional<Key> existing_key = child_page.key_at(key_idx);
+            const bool key_exists =
+                existing_key && KeyCodec::equal(*existing_key, key);
+            const bool child_is_safe =
+                !key_exists ||
+                (
+                    key_idx != 0 &&
+                    child_page.get_key_count() > MIN_KEYS(BTREE_ORDER)
+                );
+
+            if (child_is_safe) {
                 operation->release_all_exclusive_except(
                     *target_child_page_num);
             }

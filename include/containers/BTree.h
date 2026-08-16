@@ -46,6 +46,7 @@ enum class ChildDirection : std::uint8_t {
 enum class BTreeMutationType : std::uint8_t {
     None = 0,
     Insert,
+    Remove,
 };
 
 struct BTreeGetStatus {
