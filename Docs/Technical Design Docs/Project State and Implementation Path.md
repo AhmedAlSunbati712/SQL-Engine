@@ -648,11 +648,15 @@ the first complete architecture.
 
 ## Immediate Restart Point
 
-The standalone typed WAL is complete. Store, Index, Segment, and Log now own
+The standalone typed WAL and the active V2 page cutover are complete. Store,
+Index, Segment, and Log now own
 segment discovery, recovery, dense LSN assignment, rollover, lookup,
 synchronization, and durability tracking. WAL records use the checksummed
 40-byte typed envelope, and the higher layer has typed payload codecs,
-factories, and `PendingBTreeAction`. V2 checksums cover the complete page.
+factories, and `PendingBTreeAction`. PCache and Pager now own `PageV2` frames,
+validate full-page checksums and encoded page numbers on reads, assign page
+kinds, and expose pinned frames to B+ tree callers. B+ tree layouts use the
+4072-byte page-kind payload while the rollback journal remains authoritative.
 
 The next implementation task is to thread `PendingBTreeAction` through
 KeyStore, B+ tree propagation, and every Pager mutation path.

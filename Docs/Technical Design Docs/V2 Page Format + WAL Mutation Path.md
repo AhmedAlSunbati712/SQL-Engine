@@ -7,11 +7,10 @@ journal to a physical write-ahead log. It is authoritative for the V2 page
 header, the pager-to-B+ tree boundary, page mutation capture, the first logger,
 the rollback-journal transition, and startup recovery sequencing.
 
-The implementation remains on the current rollback journal today. The
-standalone V2 page representation, whole-page checksum codec, typed WAL, and
-Log coordinator are implemented and tested, but they are not integrated into
-the pager or B+ tree. The mutation boundary, WAL cutover, and WAL recovery
-executor remain future work.
+The implementation remains on the rollback journal today. The V2 page
+representation is now active in PCache, Pager, and B+ tree page codecs, while
+the typed WAL and Log coordinator remain standalone. The mutation boundary,
+WAL cutover, and WAL recovery executor remain future work.
 
 `V2` is the name of this migration path and its new source files. It is not a
 version number stored in the page bytes.
@@ -866,11 +865,15 @@ The practical conversion order is:
 
 ## Incremental Rollback-Journal-to-WAL Transition
 
-### Stage 1: V2 Page Format — Complete
+### Stage 1: V2 Page Format and Pager Cutover — Complete
 
 V2-named page types, the common page codec, whole-page CRC32C, corruption
-tests, and raw full-page views are implemented without changing the legacy
-pager or B+ tree.
+tests, and raw full-page views are implemented. PCache and Pager now own
+`PageV2` frames, Pager results expose pinned `PageV2*` values, page zero uses
+the database-metadata kind, allocation assigns the requested B+ tree kind,
+freeing assigns the freelist kind, and disk reads validate checksum, kind, and
+encoded page number. B+ tree codecs interpret bytes 24 through 4095 while the
+rollback journal continues to capture complete 4096-byte images.
 
 ### Stage 2: Standalone Logger — Complete
 
@@ -983,8 +986,8 @@ checkpoint metadata, and safe segment reclamation are a later milestone.
 
 ## Immediate Implementation Order
 
-Stages 1 and 2 are complete and remain standalone: V2 CRC32C covers the whole
-page with the checksum field zeroed, and the typed Log stack is implemented
-without modifying the legacy pager, B+ tree, rollback journal, or transaction
-flow. The next bounded task is operation-scoped mutation integration using
+Stages 1 and 2 are complete: V2 CRC32C covers the whole page with the checksum
+field zeroed, PCache/Pager/B+ tree use V2 frames and payload boundaries, and
+the typed Log stack is implemented. The rollback journal still owns commit
+and crash recovery. The next bounded task is operation-scoped mutation integration using
 `PendingBTreeAction`; WAL cutover remains a later, separately tested task.
