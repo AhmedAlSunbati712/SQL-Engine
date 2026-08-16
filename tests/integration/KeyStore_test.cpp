@@ -216,7 +216,7 @@ TEST_F(KeyStoreIntegrationTest, TransactionAwareOperationsLockAndAppendWal) {
         CommitStatus::Success);
 }
 
-TEST_F(KeyStoreIntegrationTest, ConcurrentFirstInsertsShareOneInstalledRoot) {
+TEST_F(KeyStoreIntegrationTest, ConcurrentInsertsShareOneRootAndCrossFirstSplit) {
     Log log(Config{
         .max_index_bytes = 1000 * Index::ENTRY_SIZE,
         .max_store_bytes = 16 * 1024 * 1024,
@@ -261,6 +261,77 @@ TEST_F(KeyStoreIntegrationTest, ConcurrentFirstInsertsShareOneInstalledRoot) {
     for (std::uint64_t number = 0; number < THREAD_COUNT * INSERTS_PER_THREAD; ++number) {
         EXPECT_EQ(
             store.get(KeyCodec::make_uint64(number)).status,
+            KeyStoreStatus::Success);
+    }
+}
+
+TEST_F(KeyStoreIntegrationTest, ConcurrentDeletesRemainSafeDuringStructuralRepair) {
+    Log log(Config{
+        .max_index_bytes = 1000 * Index::ENTRY_SIZE,
+        .max_store_bytes = 16 * 1024 * 1024,
+        .initial_lsn = 1,
+    });
+    log.open((temp_dir / "wal").string());
+    LockManager lock_manager;
+    KeyStore store;
+    TransactionManager transaction_manager(log, lock_manager, store);
+    store.attach_transaction_manager(transaction_manager);
+    ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
+
+    constexpr std::uint64_t KEY_COUNT = 300;
+    TransactionHandle seed_transaction = transaction_manager.begin();
+    for (std::uint64_t key = 0; key < KEY_COUNT; ++key) {
+        ASSERT_EQ(
+            store.put(
+                seed_transaction,
+                KeyCodec::make_uint64(key),
+                ValueCodec::make_varuint(key)),
+            KeyStoreStatus::Success);
+    }
+    ASSERT_EQ(
+        transaction_manager.commit(seed_transaction),
+        CommitStatus::Success);
+
+    constexpr unsigned THREAD_COUNT = 4;
+    constexpr unsigned DELETES_PER_THREAD = 25;
+    std::barrier start(THREAD_COUNT);
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+
+    for (unsigned thread = 0; thread < THREAD_COUNT; ++thread) {
+        threads.emplace_back([&, thread] {
+            start.arrive_and_wait();
+            for (unsigned i = 0; i < DELETES_PER_THREAD && !failed; ++i) {
+                const std::uint64_t key =
+                    static_cast<std::uint64_t>(i) * THREAD_COUNT + thread;
+                TransactionHandle transaction = transaction_manager.begin();
+                if (
+                    store.remove(
+                        transaction,
+                        KeyCodec::make_uint64(key)).status != KeyStoreStatus::Success ||
+                    transaction_manager.commit(transaction) != CommitStatus::Success
+                ) {
+                    failed = true;
+                }
+            }
+        });
+    }
+
+    for (std::thread& thread : threads) thread.join();
+    ASSERT_FALSE(failed);
+
+    for (std::uint64_t key = 0; key < THREAD_COUNT * DELETES_PER_THREAD; ++key) {
+        EXPECT_EQ(
+            store.get(KeyCodec::make_uint64(key)).status,
+            KeyStoreStatus::KeyNotFound);
+    }
+    for (
+        std::uint64_t key = THREAD_COUNT * DELETES_PER_THREAD;
+        key < KEY_COUNT;
+        ++key
+    ) {
+        EXPECT_EQ(
+            store.get(KeyCodec::make_uint64(key)).status,
             KeyStoreStatus::Success);
     }
 }
