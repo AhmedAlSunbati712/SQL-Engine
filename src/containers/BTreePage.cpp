@@ -2,6 +2,8 @@
 
 #include <Endian.h>
 #include <KeyCodec.h>
+#include <PageV2.h>
+#include <V2PageCodec.h>
 #include <Value.h>
 #include <ValueCodec.h>
 
@@ -10,7 +12,8 @@
 
 namespace {
 
-constexpr std::uint16_t PAGE_SIZE = 4096;
+constexpr std::uint16_t BTREE_PAYLOAD_SIZE =
+    static_cast<std::uint16_t>(V2_PAGE_PAYLOAD_SIZE);
 constexpr std::uint16_t INTERNAL_HEADER_SIZE = 11;
 constexpr std::uint16_t LEAF_HEADER_SIZE = 7;
 constexpr std::uint16_t CELL_DIR_ENTRY_SIZE = 2;
@@ -45,12 +48,15 @@ void parse_key_bytes(const char *in, Key *key) {
 
 } // namespace
 
-BTreePage::BTreePage(char *page) : page(page) {}
+BTreePage::BTreePage(char *page)
+    : page(page + V2_PAGE_HEADER_SIZE) {}
 
 PageType BTreePage::peek_page_type(const char *page) {
-    std::uint8_t page_type_int = get_u8_be(page);
-    if (page_type_int > 1) std::abort(); // TODO: REPLACE WITH SOMETHING ELSE LATER
-    return static_cast<PageType>(page_type_int);
+    const std::span<const char, V2_PAGE_SIZE> image(page, V2_PAGE_SIZE);
+    const V2PageKind kind = V2PageCodec::page_kind(image);
+    if (kind == V2PageKind::BTreeLeaf) return PageType::Leaf;
+    if (kind == V2PageKind::BTreeInternal) return PageType::Internal;
+    std::abort();
 }
 
 bool BTreePage::is_leaf() const {
@@ -94,6 +100,7 @@ void BTreePage::write_back() {
 // ========================================= Internal Pages ======================================
 
 BInternalPage::BInternalPage(char *page) : BTreePage(page) {
+    if (peek_page_type(page) != PageType::Internal) std::abort();
     decode();
 }
 
@@ -245,7 +252,7 @@ bool BInternalPage::remove(const Key &key) {
 
 void BInternalPage::flush() {
     // Clear the page first so any stale bytes from older layouts do not survive after flush.
-    std::memset(page, 0, PAGE_SIZE);
+    std::memset(page, 0, BTREE_PAYLOAD_SIZE);
 
     // Serialize the fixed-size header first.
     put_u8_be(page, static_cast<std::uint8_t>(page_type));
@@ -256,13 +263,13 @@ void BInternalPage::flush() {
     for (const Key &key : keys) {
         total_cell_bytes = static_cast<std::uint16_t>(total_cell_bytes + internal_cell_size(key));
     }
-    put_u16_be(&page[5], static_cast<std::uint16_t>(PAGE_SIZE - total_cell_bytes - 1));
+    put_u16_be(&page[5], static_cast<std::uint16_t>(BTREE_PAYLOAD_SIZE - total_cell_bytes - 1));
     put_u32_be(&page[7], child_page_nums[0]);
 
     // The directory is stored in key order. Each 2-byte entry points at the start of one
     // internal cell body somewhere in the packed cell-content region at the end of the page.
     std::uint16_t dir_ptr = INTERNAL_HEADER_SIZE;
-    std::uint16_t cell_ptr = PAGE_SIZE;
+    std::uint16_t cell_ptr = BTREE_PAYLOAD_SIZE;
 
     for (std::size_t i = 0; i < keys.size(); i++) {
         std::uint16_t cell_size = internal_cell_size(keys[i]);
@@ -287,17 +294,22 @@ void BInternalPage::parse_internal_cell(const char *in, Key *key, std::uint32_t 
 }
 
 void BInternalPage::fill_initial_layout(char *out) {
-    std::memset(out, 0, PAGE_SIZE);
+    V2PageCodec::set_page_kind(
+        std::span<char, V2_PAGE_SIZE>(out, V2_PAGE_SIZE),
+        V2PageKind::BTreeInternal);
+    out += V2_PAGE_HEADER_SIZE;
+    std::memset(out, 0, BTREE_PAYLOAD_SIZE);
     put_u8_be(out, static_cast<std::uint8_t>(PageType::Internal));
     put_u16_be(&out[1], 0);
     put_u16_be(&out[3], INTERNAL_HEADER_SIZE);
-    put_u16_be(&out[5], PAGE_SIZE - 1);
+    put_u16_be(&out[5], BTREE_PAYLOAD_SIZE - 1);
     put_u32_be(&out[7], 0);
 }
 
 // ====================================== Leaf Page =======================================
 
 BLeafPage::BLeafPage(char *page) : BTreePage(page) {
+    if (peek_page_type(page) != PageType::Leaf) std::abort();
     decode();
 }
 
@@ -432,7 +444,7 @@ bool BLeafPage::remove(const Key &key) {
 
 void BLeafPage::flush() {
     // Clear the page first so any stale bytes from older layouts do not survive after flush.
-    std::memset(page, 0, PAGE_SIZE);
+    std::memset(page, 0, BTREE_PAYLOAD_SIZE);
 
     // Serialize the fixed-size header first.
     put_u8_be(page, static_cast<std::uint8_t>(page_type));
@@ -446,12 +458,12 @@ void BLeafPage::flush() {
     for (std::size_t i = 0; i < keys.size(); i++) {
         total_cell_bytes = static_cast<std::uint16_t>(total_cell_bytes + leaf_cell_size(keys[i], values[i]));
     }
-    put_u16_be(&page[5], static_cast<std::uint16_t>(PAGE_SIZE - total_cell_bytes - 1));
+    put_u16_be(&page[5], static_cast<std::uint16_t>(BTREE_PAYLOAD_SIZE - total_cell_bytes - 1));
 
     // The directory is stored in key order. Each 2-byte entry points at the start of one
     // packed leaf cell body near the end of the page.
     std::uint16_t dir_ptr = LEAF_HEADER_SIZE;
-    std::uint16_t cell_ptr = PAGE_SIZE;
+    std::uint16_t cell_ptr = BTREE_PAYLOAD_SIZE;
 
     for (std::size_t i = 0; i < keys.size(); i++) {
         std::uint16_t cell_size = leaf_cell_size(keys[i], values[i]);
@@ -490,9 +502,13 @@ void BLeafPage::parse_leaf_cell(const char *in, Key *key, Value *value) {
 }
 
 void BLeafPage::fill_initial_layout(char *out) {
-    std::memset(out, 0, PAGE_SIZE);
+    V2PageCodec::set_page_kind(
+        std::span<char, V2_PAGE_SIZE>(out, V2_PAGE_SIZE),
+        V2PageKind::BTreeLeaf);
+    out += V2_PAGE_HEADER_SIZE;
+    std::memset(out, 0, BTREE_PAYLOAD_SIZE);
     put_u8_be(out, static_cast<std::uint8_t>(PageType::Leaf));
     put_u16_be(&out[1], 0);
     put_u16_be(&out[3], LEAF_HEADER_SIZE);
-    put_u16_be(&out[5], PAGE_SIZE - 1);
+    put_u16_be(&out[5], BTREE_PAYLOAD_SIZE - 1);
 }

@@ -87,9 +87,9 @@ BTreeCursorStatus BTreeCursor::seek_first() {
     }
 
     std::vector<TraversalPathEntry> new_path;
-    if (BTreePage::peek_page_type(root_result.data) == PageType::Leaf) {
+    if (BTreePage::peek_page_type(root_result.page->data.data()) == PageType::Leaf) {
         BTreeCursorStatus position_result = position_on_leaf(
-            root_result.data,
+            root_result.page->data.data(),
             root_result.root_page_num,
             0,
             std::move(new_path)
@@ -339,7 +339,7 @@ BTreeCursorStatus BTreeCursor::move_to_next_leaf() {
         }
 
         // Every page recorded in a traversal path must be an internal page.
-        if (BTreePage::peek_page_type(parent_result.data) != PageType::Internal) {
+        if (BTreePage::peek_page_type(parent_result.page->data.data()) != PageType::Internal) {
             PagerResult release_result = tree->pager->unref_page(entry.parent_page_num);
             if (release_result != PagerResult::Success) {
                 return BTreeCursorStatus::FailedToReleasePage;
@@ -347,7 +347,7 @@ BTreeCursorStatus BTreeCursor::move_to_next_leaf() {
             return BTreeCursorStatus::FailedToRead;
         }
 
-        BInternalPage parent(parent_result.data);
+        BInternalPage parent(parent_result.page->data.data());
         std::size_t child_idx = entry.separator_index_used;
         if (entry.child_dir == ChildDirection::Right) child_idx++;
 
@@ -416,8 +416,8 @@ BTreeCursorStatus BTreeCursor::descend_to_leftmost_leaf(
         return BTreeCursorStatus::FailedToRead;
     }
 
-    while (BTreePage::peek_page_type(current_result.data) == PageType::Internal) {
-        BInternalPage current_page(current_result.data);
+    while (BTreePage::peek_page_type(current_result.page->data.data()) == PageType::Internal) {
+        BInternalPage current_page(current_result.page->data.data());
         std::optional<std::uint32_t> leftmost_child = current_page.get_leftmost_child();
 
         if (leftmost_child == std::nullopt) {
@@ -459,7 +459,7 @@ BTreeCursorStatus BTreeCursor::descend_to_leftmost_leaf(
         current_result = child_result;
     }
 
-    BLeafPage leaf(current_result.data);
+    BLeafPage leaf(current_result.page->data.data());
     if (leaf.get_key_count() == 0) {
         PagerResult release_result = tree->pager->unref_page(current_page_num);
         new_path.resize(initial_path_size);
@@ -470,7 +470,7 @@ BTreeCursorStatus BTreeCursor::descend_to_leftmost_leaf(
     }
 
     return position_on_leaf(
-        current_result.data,
+        current_result.page->data.data(),
         current_page_num,
         0,
         std::move(new_path)

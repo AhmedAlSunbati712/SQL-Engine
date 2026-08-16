@@ -230,12 +230,12 @@ BTreeStatus BTree::insert(const Key &key, Value &value) {
     // We need the path this time in case the insert changes separators or causes a split.
     LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
     if (descent_result.status == BTreeStatus::EmptyTree) {
-        PagerAllocateResult allocation_result = pager->allocate_page();
+        PagerAllocateResult allocation_result = pager->allocate_page(V2PageKind::BTreeLeaf);
         if (allocation_result.status != PagerResult::Success) return BTreeStatus::FailedToInsert;
 
         std::uint32_t root_page_num = allocation_result.page_num;
-        BLeafPage::fill_initial_layout(allocation_result.data);
-        BLeafPage root_leaf(allocation_result.data);
+        BLeafPage::fill_initial_layout(allocation_result.page->data.data());
+        BLeafPage root_leaf(allocation_result.page->data.data());
 
         bool insert_result = root_leaf.insert_at(0, key, value);
         if (!insert_result) {
@@ -432,16 +432,16 @@ LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_
     }
 
     // If the root is already a leaf, return the root
-    PageType root_page_type = BTreePage::peek_page_type(root_get_result.data);
+    PageType root_page_type = BTreePage::peek_page_type(root_get_result.page->data.data());
     if (root_page_type == PageType::Leaf) {
-        descent_result.leaf_page = root_get_result.data;
+        descent_result.leaf_page = root_get_result.page->data.data();
         descent_result.leaf_page_num = root_get_result.root_page_num;
         return descent_result;
     }
 
     // Otherwise, keep on descending downwards until we hit a leaf
     std::uint32_t curr_page_num = root_get_result.root_page_num;
-    char *curr_data = root_get_result.data; 
+    char *curr_data = root_get_result.page->data.data();
     while (true) {
         // Decode the current node raw bytes into an in-memory internal page object
         BInternalPage curr(curr_data);
@@ -483,10 +483,10 @@ LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_
 
         // Set the new curr values
         curr_page_num = *target_child_page_num;
-        curr_data = pager_get_result.data;
+        curr_data = pager_get_result.page->data.data();
 
         // If the next page is a leaf, terminate the search here
-        PageType child_page_type = BTreePage::peek_page_type(pager_get_result.data);
+        PageType child_page_type = BTreePage::peek_page_type(pager_get_result.page->data.data());
         if (child_page_type == PageType::Leaf) break;
     }
 
@@ -528,20 +528,20 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
         return BTreeStatus::FailedToRead;
     }
 
-    PageType page_type = BTreePage::peek_page_type(get_split_page_result.data);
+    PageType page_type = BTreePage::peek_page_type(get_split_page_result.page->data.data());
     pager->begin_write(split_page_num);
     if (page_type == PageType::Leaf) {
-        BLeafPage split_page(get_split_page_result.data);
+        BLeafPage split_page(get_split_page_result.page->data.data());
 
-        PagerAllocateResult allocation_result = pager->allocate_page();
+        PagerAllocateResult allocation_result = pager->allocate_page(V2PageKind::BTreeLeaf);
         if (allocation_result.status != PagerResult::Success) {
             pager->unref_page(split_page_num);
             return BTreeStatus::FailedToAllocateNewPage;
         }
         
         std::uint32_t new_leaf_page_num = allocation_result.page_num;
-        BLeafPage::fill_initial_layout(allocation_result.data);
-        BLeafPage new_leaf_page(allocation_result.data);
+        BLeafPage::fill_initial_layout(allocation_result.page->data.data());
+        BLeafPage new_leaf_page(allocation_result.page->data.data());
 
         std::size_t median_separator_idx = split_page.get_key_count() / 2;
         BTree::migrate_leaf(split_page, new_leaf_page, median_separator_idx); // Assumes it does the write_back on both
@@ -569,7 +569,7 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
 
         // The parent page is surely definitely an internal page
         // Insert the new separator key at the idx after the parent separator_index_used
-        BInternalPage parent_page(get_parent_result.data);
+        BInternalPage parent_page(get_parent_result.page->data.data());
         Key key = *new_leaf_page.key_at(0);
         bool insert_separator_result = false;
         if (parent_path_entry.child_dir == ChildDirection::Right) {
@@ -601,19 +601,19 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
         pager->unref_page(parent_path_entry.parent_page_num);
         return BTreeStatus::Success;
     } else {
-        BInternalPage split_page(get_split_page_result.data);
+        BInternalPage split_page(get_split_page_result.page->data.data());
 
         // Allocate the new internal page that is going to hold everything to the right
         // of the promoted median separator.
-        PagerAllocateResult allocation_result = pager->allocate_page();
+        PagerAllocateResult allocation_result = pager->allocate_page(V2PageKind::BTreeInternal);
         if (allocation_result.status != PagerResult::Success) {
             pager->unref_page(split_page_num);
             return BTreeStatus::FailedToAllocateNewPage;
         }
 
         std::uint32_t new_internal_page_num = allocation_result.page_num;
-        BInternalPage::fill_initial_layout(allocation_result.data);
-        BInternalPage new_internal_page(allocation_result.data);
+        BInternalPage::fill_initial_layout(allocation_result.page->data.data());
+        BInternalPage new_internal_page(allocation_result.page->data.data());
 
         // Capture the median key before mutating the original page.
         // This is the key that gets promoted upward and does not stay in either child page.
@@ -655,7 +655,7 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
         }
         pager->begin_write(parent_path_entry.parent_page_num);
 
-        BInternalPage parent_page(get_parent_result.data);
+        BInternalPage parent_page(get_parent_result.page->data.data());
         bool insert_separator_result = false;
         if (parent_path_entry.child_dir == ChildDirection::Right) {
             insert_separator_result = parent_page.insert_separator_at(
@@ -760,12 +760,12 @@ BTreeStatus BTree::handle_splitting_root(
 ) {
     // A root split means we need to allocate a brand new internal root above the
     // two children that just came out of the split.
-    PagerAllocateResult allocation_result = pager->allocate_page();
+    PagerAllocateResult allocation_result = pager->allocate_page(V2PageKind::BTreeInternal);
     if (allocation_result.status != PagerResult::Success) return BTreeStatus::FailedToAllocateNewPage;
 
     std::uint32_t new_root_page_num = allocation_result.page_num;
-    BInternalPage::fill_initial_layout(allocation_result.data);
-    BInternalPage new_root_page(allocation_result.data);
+    BInternalPage::fill_initial_layout(allocation_result.page->data.data());
+    BInternalPage new_root_page(allocation_result.page->data.data());
 
     // The old root becomes the leftmost child, and the split-off page becomes the child
     // to the right of the one separator key stored in the new root.
@@ -824,7 +824,7 @@ BTreeStatus BTree::propagate_separator_change_upward(
                 return BTreeStatus::FailedToRemove;
             }
 
-            BInternalPage parent_page(get_parent_result.data);
+            BInternalPage parent_page(get_parent_result.page->data.data());
             bool set_result = parent_page.set_separator_key_at(entry.separator_index_used, new_subtree_min);
             if (!set_result) {
                 pager->unref_page(entry.parent_page_num);
@@ -853,7 +853,7 @@ BTreeStatus BTree::propagate_separator_change_upward(
             return BTreeStatus::FailedToRemove;
         }
 
-        BInternalPage parent_page(get_parent_result.data);
+        BInternalPage parent_page(get_parent_result.page->data.data());
         bool set_result = parent_page.set_separator_key_at(entry.separator_index_used - 1, new_subtree_min);
         if (!set_result) {
             pager->unref_page(entry.parent_page_num);
@@ -966,7 +966,7 @@ BTreeStatus BTree::borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage
         return BTreeStatus::FailedToRead;
     }
 
-    BLeafPage right_sibling(get_right_result.data);
+    BLeafPage right_sibling(get_right_result.page->data.data());
     if (right_sibling.get_key_count() <= MIN_KEYS(BTREE_ORDER)) {
         pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
         return BTreeStatus::FailedToRemove;
@@ -1024,7 +1024,7 @@ BTreeStatus BTree::borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage 
         return BTreeStatus::FailedToRead;
     }
 
-    BLeafPage left_sibling(get_left_result.data);
+    BLeafPage left_sibling(get_left_result.page->data.data());
     if (left_sibling.get_key_count() <= MIN_KEYS(BTREE_ORDER)) {
         pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
         return BTreeStatus::FailedToRemove;
@@ -1085,7 +1085,7 @@ BTreeStatus BTree::merge_with_right_leaf(BLeafPage &current_leaf, BInternalPage 
         return BTreeStatus::FailedToRead;
     }
 
-    BLeafPage right_sibling(get_right_result.data);
+    BLeafPage right_sibling(get_right_result.page->data.data());
     while (right_sibling.get_key_count() > 0) {
         std::optional<Key> move_key = right_sibling.key_at(0);
         std::optional<Value> move_value = right_sibling.get_at(0);
@@ -1143,7 +1143,7 @@ BTreeStatus BTree::merge_with_left_leaf(BLeafPage &current_leaf, BInternalPage &
         return BTreeStatus::FailedToRead;
     }
 
-    BLeafPage left_sibling(get_left_result.data);
+    BLeafPage left_sibling(get_left_result.page->data.data());
     while (current_leaf.get_key_count() > 0) {
         std::optional<Key> move_key = current_leaf.key_at(0);
         std::optional<Value> move_value = current_leaf.get_at(0);
@@ -1199,7 +1199,7 @@ BTreeStatus BTree::borrow_from_right_internal(BInternalPage &current_page, BInte
         return BTreeStatus::FailedToRead;
     }
 
-    BInternalPage right_sibling(get_right_result.data);
+    BInternalPage right_sibling(get_right_result.page->data.data());
     if (right_sibling.get_key_count() <= MIN_KEYS(BTREE_ORDER)) {
         pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
         return BTreeStatus::FailedToRemove;
@@ -1265,7 +1265,7 @@ BTreeStatus BTree::borrow_from_left_internal(BInternalPage &current_page, BInter
         return BTreeStatus::FailedToRead;
     }
 
-    BInternalPage left_sibling(get_left_result.data);
+    BInternalPage left_sibling(get_left_result.page->data.data());
     if (left_sibling.get_key_count() <= MIN_KEYS(BTREE_ORDER)) {
         pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
         return BTreeStatus::FailedToRemove;
@@ -1330,7 +1330,7 @@ BTreeStatus BTree::merge_with_right_internal(BInternalPage &current_page, BInter
         return BTreeStatus::FailedToRead;
     }
 
-    BInternalPage right_sibling(get_right_result.data);
+    BInternalPage right_sibling(get_right_result.page->data.data());
     std::optional<Key> parent_sep = parent_page.key_at(ctx.child_idx);
     std::optional<std::uint32_t> right_leftmost_child = right_sibling.get_leftmost_child();
     if (parent_sep == std::nullopt || right_leftmost_child == std::nullopt) {
@@ -1425,7 +1425,7 @@ BTreeStatus BTree::merge_with_left_internal(BInternalPage &current_page, BIntern
         return BTreeStatus::FailedToRead;
     }
 
-    BInternalPage left_sibling(get_left_result.data);
+    BInternalPage left_sibling(get_left_result.page->data.data());
     std::optional<Key> parent_sep = parent_page.key_at(ctx.child_idx - 1);
     std::optional<std::uint32_t> current_leftmost_child = current_page.get_leftmost_child();
     if (parent_sep == std::nullopt || current_leftmost_child == std::nullopt) {
@@ -1522,12 +1522,12 @@ BTreeStatus BTree::propagate_merging(std::uint32_t underflow_page_num, std::vect
     PagerGetResult get_underflow_result = pager->get(underflow_page_num);
     if (get_underflow_result.status != PagerResult::Success) return BTreeStatus::FailedToRead;
 
-    PageType underflow_page_type = BTreePage::peek_page_type(get_underflow_result.data);
+    PageType underflow_page_type = BTreePage::peek_page_type(get_underflow_result.page->data.data());
 
     // Roots are handled separately because they are allowed to break the normal
     // min-key invariant.
     if (path.empty()) {
-        return handle_root_underflow(underflow_page_num, underflow_page_type, get_underflow_result.data);
+        return handle_root_underflow(underflow_page_num, underflow_page_type, get_underflow_result.page->data.data());
     }
 
     // Load the parent and compute the sibling context around the underflowing page.
@@ -1545,11 +1545,11 @@ BTreeStatus BTree::propagate_merging(std::uint32_t underflow_page_num, std::vect
         return BTreeStatus::FailedToRemove;
     }
 
-    BInternalPage parent_page(get_parent_result.data);
+    BInternalPage parent_page(get_parent_result.page->data.data());
     MergeParentContext ctx = build_merge_parent_context(parent_path_entry, parent_page);
 
     if (underflow_page_type == PageType::Leaf) {
-        BLeafPage current_leaf(get_underflow_result.data);
+        BLeafPage current_leaf(get_underflow_result.page->data.data());
 
         // Try to repair the leaf by borrowing before we merge anything.
         if (ctx.right_sibling_page_num != std::nullopt) {
@@ -1571,7 +1571,7 @@ BTreeStatus BTree::propagate_merging(std::uint32_t underflow_page_num, std::vect
         return merge_with_left_leaf(current_leaf, parent_page, ctx, underflow_page_num, path);
     }
 
-    BInternalPage current_page(get_underflow_result.data);
+    BInternalPage current_page(get_underflow_result.page->data.data());
 
     // Same flow for internal pages: try borrowing first, then fall back to merging.
     if (ctx.right_sibling_page_num != std::nullopt) {

@@ -1,19 +1,19 @@
 #include <gtest/gtest.h>
 
 #include <DLList.h>
-#include <Page.h>
+#include <PageV2.h>
 
 namespace {
     TEST(DLListTest, StartsEmpty) {
         DLList list;
-        Page *page = list.get(4);
+        PageV2 *page = list.get(4);
         EXPECT_EQ(page, nullptr);
         EXPECT_EQ(list.len(), 0);
         EXPECT_EQ(list.exists(4), false);
     }
     TEST(DLListTest, AddSinglePage) {
         DLList list;
-        Page *page = new Page();
+        PageV2 *page = new PageV2();
         page->page_num = 4;
         list.add(page->page_num, page);
         EXPECT_EQ(list.len(), 1);
@@ -25,10 +25,10 @@ namespace {
 
     TEST(DLListTest, RemoveSinglePage) {
         DLList list;
-        Page *page = new Page();
+        PageV2 *page = new PageV2();
         page->page_num = 4;
         list.add(page->page_num, page);
-        Page *removed_page = list.remove(4);
+        PageV2 *removed_page = list.remove(4);
         EXPECT_EQ(removed_page, page);
         EXPECT_EQ(list.len(), 0);
         EXPECT_EQ(list.exists(4), false);
@@ -39,15 +39,15 @@ namespace {
     TEST(DLListTest, AddMultiplePages) {
         DLList list;
 
-        Page *page_one = new Page();
+        PageV2 *page_one = new PageV2();
         page_one->page_num = 1;
         list.add(page_one->page_num, page_one);
 
-        Page *page_two = new Page();
+        PageV2 *page_two = new PageV2();
         page_two->page_num = 2;
         list.add(page_two->page_num, page_two);
 
-        Page *page_three = new Page();
+        PageV2 *page_three = new PageV2();
         page_three->page_num = 3;
         list.add(page_three->page_num, page_three);
 
@@ -67,19 +67,19 @@ namespace {
     TEST(DLListTest, RemoveMiddlePage) {
         DLList list;
 
-        Page *page_one = new Page();
+        PageV2 *page_one = new PageV2();
         page_one->page_num = 1;
         list.add(page_one->page_num, page_one);
 
-        Page *page_two = new Page();
+        PageV2 *page_two = new PageV2();
         page_two->page_num = 2;
         list.add(page_two->page_num, page_two);
 
-        Page *page_three = new Page();
+        PageV2 *page_three = new PageV2();
         page_three->page_num = 3;
         list.add(page_three->page_num, page_three);
 
-        Page *removed_page = list.remove(2);
+        PageV2 *removed_page = list.remove(2);
         EXPECT_EQ(removed_page, page_two);
         EXPECT_EQ(list.len(), 2);
         EXPECT_EQ(list.exists(2), false);
@@ -95,15 +95,15 @@ namespace {
     TEST(DLListTest, RemoveNonexistentPage) {
         DLList list;
 
-        Page *page_one = new Page();
+        PageV2 *page_one = new PageV2();
         page_one->page_num = 1;
         list.add(page_one->page_num, page_one);
 
-        Page *page_two = new Page();
+        PageV2 *page_two = new PageV2();
         page_two->page_num = 2;
         list.add(page_two->page_num, page_two);
 
-        Page *removed_page = list.remove(9);
+        PageV2 *removed_page = list.remove(9);
         EXPECT_EQ(removed_page, nullptr);
         EXPECT_EQ(list.len(), 2);
         EXPECT_EQ(list.get(1), page_one);
@@ -119,17 +119,17 @@ namespace {
         DLList list;
         EXPECT_EQ(list.len(), 0);
 
-        Page *page_one = new Page();
+        PageV2 *page_one = new PageV2();
         page_one->page_num = 1;
         list.add(page_one->page_num, page_one);
         EXPECT_EQ(list.len(), 1);
 
-        Page *page_two = new Page();
+        PageV2 *page_two = new PageV2();
         page_two->page_num = 2;
         list.add(page_two->page_num, page_two);
         EXPECT_EQ(list.len(), 2);
 
-        Page *page_three = new Page();
+        PageV2 *page_three = new PageV2();
         page_three->page_num = 3;
         list.add(page_three->page_num, page_three);
         EXPECT_EQ(list.len(), 3);
@@ -147,17 +147,17 @@ namespace {
     TEST(DLListTest, CanReinsertPageNumberAfterRemoval) {
         DLList list;
 
-        Page *page_one = new Page();
+        PageV2 *page_one = new PageV2();
         page_one->page_num = 4;
         list.add(page_one->page_num, page_one);
 
-        Page *removed_page = list.remove(4);
+        PageV2 *removed_page = list.remove(4);
         EXPECT_EQ(removed_page, page_one);
         EXPECT_EQ(list.len(), 0);
         EXPECT_EQ(list.get(4), nullptr);
         delete removed_page;
 
-        Page *page_two = new Page();
+        PageV2 *page_two = new PageV2();
         page_two->page_num = 4;
         list.add(page_two->page_num, page_two);
 

@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <DLList.h>
-#include <Page.h>
+#include <PageV2.h>
 
 enum class PCacheResult : std::uint8_t {
 	Success = 0,
@@ -27,8 +27,8 @@ class PCache {
 		PCache();
         PCache(int capacity);
 		~PCache();
-		Page *get(int page_num);
-		PCachePutResult put(Page *page);
+		PageV2 *get(int page_num);
+		PCachePutResult put(PageV2 *page);
         PCacheResult remove(int page_num);
         void force_remove(int page_num);
 		void pin_page(int page_num); // Called after refs_num increments. On a 0 -> 1 transition, move out of unpinned pages
@@ -39,6 +39,6 @@ class PCache {
 		static const int DEFAULT_CAPACITY = 64;
 		int capacity = DEFAULT_CAPACITY;
 		int length = 0; // Total number of pages in the cache. Pinned or unpinned
-		std::unordered_map<int, Page *> cache_map;
+		std::unordered_map<int, PageV2 *> cache_map;
 		DLList *unpinned_pages = new DLList();
 };
