@@ -89,6 +89,7 @@ public:
         LockMode mode);
 
     Log& log() noexcept { return log_; }
+    LockManager& lock_manager() noexcept { return lock_manager_; }
 
 private:
     Log& log_;

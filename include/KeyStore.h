@@ -4,6 +4,7 @@
 #include <BTreeCursor.h>
 #include <Key.h>
 #include <Value.h>
+#include <TransactionManager/TransactionManager.h>
 
 #include <cstdint>
 #include <optional>
@@ -39,7 +40,9 @@ enum class KeyStoreStatus : std::uint8_t {
     NotOpen,
     AlreadyOpen,
     ReadFailed,
-    DecodeFailed
+    DecodeFailed,
+    Deadlock,
+    TransactionNotFound
 };
 
 enum class KeyStoreCursorStatus : std::uint8_t {
@@ -128,8 +131,20 @@ class KeyStore {
         KeyStoreStatus close();
 
         KeyStoreGetResult get(const Key &key);
+        KeyStoreGetResult get(
+            const TransactionHandle &transaction,
+            const Key &key);
         KeyStoreStatus put(const Key &key, const Value &value);
+        KeyStoreStatus put(
+            const TransactionHandle &transaction,
+            const Key &key,
+            const Value &value);
         KeyStoreRemoveResult remove(const Key &key);
+        KeyStoreRemoveResult remove(
+            const TransactionHandle &transaction,
+            const Key &key);
+
+        void attach_transaction_manager(TransactionManager &manager) noexcept;
 
         KeyStoreStatus begin_write_transaction();
         KeyStoreStatus commit();
@@ -166,4 +181,5 @@ class KeyStore {
         TransactionState transaction_state = TransactionState::None;
         bool transaction_has_writes = false;
         bool is_open = false;
+        TransactionManager *transaction_manager = nullptr;
 };

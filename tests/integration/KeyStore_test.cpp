@@ -2,6 +2,8 @@
 
 #include <KeyCodec.h>
 #include <KeyStore.h>
+#include <LockManager/LockManager.h>
+#include <Log/Log.h>
 #include <ValueCodec.h>
 
 #include <chrono>
@@ -18,6 +20,23 @@
 #include <unistd.h>
 
 namespace {
+
+class KeyStoreNoopUndoExecutor final : public TransactionUndoExecutor {
+public:
+    std::vector<PageEffect> undo(
+        Transaction&,
+        const UndoDescriptor&) override {
+        return {};
+    }
+};
+
+Config key_store_wal_config() {
+    return {
+        .max_index_bytes = 100 * Index::ENTRY_SIZE,
+        .max_store_bytes = 1024 * 1024,
+        .initial_lsn = 1,
+    };
+}
 
 Key encode_key(const KeyInput &input) {
     return KeyCodec::encode(input).value();
@@ -155,6 +174,43 @@ TEST_F(KeyStoreIntegrationTest, LifecycleAndRepresentationValidation) {
 
     EXPECT_EQ(store.close(), KeyStoreStatus::Success);
     EXPECT_EQ(store.close(), KeyStoreStatus::Success);
+}
+
+TEST_F(KeyStoreIntegrationTest, TransactionAwareOperationsLockAndAppendWal) {
+    Log log(key_store_wal_config());
+    log.open((temp_dir / "wal").string());
+    LockManager lock_manager;
+    KeyStoreNoopUndoExecutor undo_executor;
+    TransactionManager transaction_manager(log, lock_manager, undo_executor);
+
+    KeyStore store;
+    store.attach_transaction_manager(transaction_manager);
+    ASSERT_EQ(store.open(db_path.string()), KeyStoreStatus::Success);
+
+    const TransactionHandle transaction = transaction_manager.begin();
+    const Key key = encode_key(KeyInput{std::uint64_t{9}});
+    const Value value = encode_value(ValueInput{std::string{"nine"}});
+
+    EXPECT_EQ(
+        store.put(transaction, key, value),
+        KeyStoreStatus::Success);
+    EXPECT_EQ(transaction->last_lsn(), 2U);
+
+    KeyStoreGetResult get_result = store.get(transaction, key);
+    ASSERT_EQ(get_result.status, KeyStoreStatus::Success);
+    ASSERT_TRUE(get_result.value.has_value());
+    expect_value_input(*get_result.value, ValueInput{std::string{"nine"}});
+
+    KeyStoreRemoveResult remove_result = store.remove(transaction, key);
+    ASSERT_EQ(remove_result.status, KeyStoreStatus::Success);
+    ASSERT_TRUE(remove_result.value.has_value());
+    EXPECT_EQ(transaction->last_lsn(), 3U);
+    EXPECT_EQ(log.read(2).type, WalRecordType::BTreeAction);
+    EXPECT_EQ(log.read(3).type, WalRecordType::BTreeAction);
+
+    EXPECT_EQ(
+        transaction_manager.commit(transaction),
+        CommitStatus::Success);
 }
 
 TEST_F(KeyStoreIntegrationTest, TypedValuesRoundTripAndRemoveAcrossReopen) {
