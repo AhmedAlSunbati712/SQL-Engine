@@ -1,4 +1,7 @@
 #include <KeyStore.h>
+#include <LockManager/LockManager.h>
+#include <Log/Log.h>
+#include <TransactionManager/TransactionManager.h>
 #include <server/CommandServer.h>
 
 #include <arpa/inet.h>
@@ -56,6 +59,21 @@ int main(int argc, char *argv[]) {
     }
 
     KeyStore key_store;
+    Log log(Config{
+        .max_index_bytes = 1024 * Index::ENTRY_SIZE,
+        .max_store_bytes = 64 * 1024 * 1024,
+        .initial_lsn = 1,
+    });
+    LockManager lock_manager;
+    TransactionManager transaction_manager(log, lock_manager, key_store);
+    key_store.attach_transaction_manager(transaction_manager);
+
+    try {
+        log.open(std::string{argv[1]} + ".wal");
+    } catch (const std::exception &error) {
+        std::cerr << "[ERROR] Failed to open WAL: " << error.what() << std::endl;
+        return 1;
+    }
     if (key_store.open(std::string{argv[1]}) != KeyStoreStatus::Success) {
         std::cerr << "[ERROR] Failed to open database: " << argv[1] << std::endl;
         return 1;
@@ -82,7 +100,11 @@ int main(int argc, char *argv[]) {
         // The dispatcher owns the accepted descriptor. Its executor threads
         // remain joined, while this connection-level thread runs independently.
         try {
-            std::thread dispatcher(CommandServer::serve_connection, socket_fd, std::ref(key_store));
+            std::thread dispatcher(
+                CommandServer::serve_transactional_connection,
+                socket_fd,
+                std::ref(key_store),
+                std::ref(transaction_manager));
             dispatcher.detach();
         } catch (...) {
             ::close(socket_fd);

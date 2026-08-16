@@ -3,6 +3,8 @@
 #include <Command.h>
 #include <KeyCodec.h>
 #include <KeyStore.h>
+#include <LockManager/LockManager.h>
+#include <Log/Log.h>
 #include <Session.h>
 #include <ValueCodec.h>
 #include <server/CommandServer.h>
@@ -92,6 +94,37 @@ class RawConnection {
         std::thread dispatcher;
 };
 
+class TransactionalConnection {
+    public:
+        TransactionalConnection(
+            KeyStore &key_store,
+            TransactionManager &transaction_manager
+        ) {
+            int sockets[2] = {-1, -1};
+            if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+                throw std::runtime_error("Failed to create test socket pair");
+            }
+
+            session = std::make_unique<Session>(sockets[0], 0);
+            dispatcher = std::thread(
+                CommandServer::serve_transactional_connection,
+                sockets[1],
+                std::ref(key_store),
+                std::ref(transaction_manager));
+        }
+
+        ~TransactionalConnection() {
+            session->close();
+            if (dispatcher.joinable()) dispatcher.join();
+        }
+
+        Session &client() { return *session; }
+
+    private:
+        std::unique_ptr<Session> session;
+        std::thread dispatcher;
+};
+
 void send_bytes(int socket_fd, const std::uint8_t *buffer, std::size_t size) {
     std::size_t bytes_sent = 0;
 
@@ -143,6 +176,40 @@ TEST_F(CommandServerIntegrationTest, ExecutesPutGetAndRemoveCommands) {
 
     session.put(key, ValueInput{std::string{"still connected"}});
     EXPECT_TRUE(session.get(key).has_value());
+}
+
+TEST_F(CommandServerIntegrationTest, UsesConnectionLocalTransactionContext) {
+    KeyStore transactional_store;
+    Log log(Config{
+        .max_index_bytes = 100 * Index::ENTRY_SIZE,
+        .max_store_bytes = 1024 * 1024,
+        .initial_lsn = 1,
+    });
+    log.open((temp_dir / "transactional-wal").string());
+    LockManager lock_manager;
+    TransactionManager transaction_manager(log, lock_manager, transactional_store);
+    transactional_store.attach_transaction_manager(transaction_manager);
+    ASSERT_EQ(
+        transactional_store.open((temp_dir / "transactional.db").string()),
+        KeyStoreStatus::Success);
+
+    TransactionalConnection connection(transactional_store, transaction_manager);
+    Session &session = connection.client();
+    const KeyInput key = std::string{"session-key"};
+
+    // A standalone command receives an implicit transaction.
+    session.put(key, ValueInput{std::string{"committed"}});
+    EXPECT_EQ(
+        session.get(key),
+        std::optional<ValueInput>{ValueInput{std::string{"committed"}}});
+
+    // An explicit transaction is retained only in this connection context.
+    session.begin_transaction();
+    session.put(key, ValueInput{std::string{"temporary"}});
+    session.rollback();
+    EXPECT_EQ(
+        session.get(key),
+        std::optional<ValueInput>{ValueInput{std::string{"committed"}}});
 }
 
 TEST_F(CommandServerIntegrationTest, CommitsAndRollsBackExplicitTransactions) {

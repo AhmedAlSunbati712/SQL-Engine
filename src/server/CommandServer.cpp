@@ -175,6 +175,134 @@ void rollback_active_transaction(KeyStore &key_store, bool transaction_active) n
     }
 }
 
+TransactionHandle command_transaction(
+    SessionContext &context,
+    TransactionManager &transaction_manager,
+    bool &implicit
+) {
+    implicit = !context.active_transaction;
+    return implicit
+        ? transaction_manager.begin()
+        : context.active_transaction;
+}
+
+void finish_implicit_transaction(
+    const TransactionHandle &transaction,
+    TransactionManager &transaction_manager,
+    bool success
+) {
+    if (success) {
+        if (transaction_manager.commit(transaction) != CommitStatus::Success) {
+            throw std::runtime_error("[ERROR] Failed to commit implicit transaction");
+        }
+        return;
+    }
+
+    if (transaction_manager.abort(
+            transaction,
+            AbortReason::StatementFailure) != AbortStatus::Success) {
+        throw std::runtime_error("[ERROR] Failed to abort implicit transaction");
+    }
+}
+
+void execute_transactional_command(
+    int socket_fd,
+    KeyStore &key_store,
+    TransactionManager &transaction_manager,
+    SessionContext &context,
+    const Command &command
+) {
+    if (command.op == Operator::BEGIN_TXN) {
+        if (context.active_transaction) {
+            send_operation_response(socket_fd, KeyStoreStatus::TransactionAlreadyActive);
+            return;
+        }
+        context.active_transaction = transaction_manager.begin();
+        send_operation_response(socket_fd, KeyStoreStatus::Success);
+        return;
+    }
+
+    if (command.op == Operator::COMMIT) {
+        if (!context.active_transaction) {
+            send_operation_response(socket_fd, KeyStoreStatus::NoActiveTransaction);
+            return;
+        }
+        const CommitStatus status = transaction_manager.commit(context.active_transaction);
+        if (status == CommitStatus::Success) context.active_transaction.reset();
+        send_operation_response(
+            socket_fd,
+            status == CommitStatus::Success
+                ? KeyStoreStatus::Success
+                : KeyStoreStatus::CommitFailed);
+        return;
+    }
+
+    if (command.op == Operator::ROLLBACK) {
+        if (!context.active_transaction) {
+            send_operation_response(socket_fd, KeyStoreStatus::NoActiveTransaction);
+            return;
+        }
+        const AbortStatus status = transaction_manager.abort(
+            context.active_transaction,
+            AbortReason::ClientRequest);
+        if (status == AbortStatus::Success) context.active_transaction.reset();
+        send_operation_response(
+            socket_fd,
+            status == AbortStatus::Success
+                ? KeyStoreStatus::Success
+                : KeyStoreStatus::RollbackFailed);
+        return;
+    }
+
+    bool implicit = false;
+    const TransactionHandle transaction = command_transaction(
+        context,
+        transaction_manager,
+        implicit);
+
+    if (command.op == Operator::GET) {
+        KeyStoreGetResult result = key_store.get(transaction, *command.key);
+        const bool success = result.status == KeyStoreStatus::Success ||
+            result.status == KeyStoreStatus::KeyNotFound;
+        if (implicit) finish_implicit_transaction(transaction, transaction_manager, success);
+        if (!implicit && result.status == KeyStoreStatus::Deadlock) {
+            transaction_manager.abort(transaction, AbortReason::DeadlockVictim);
+            context.active_transaction.reset();
+        }
+        send_get_response(socket_fd, result);
+        return;
+    }
+
+    if (command.op == Operator::PUT) {
+        KeyStoreStatus result = key_store.put(
+            transaction,
+            *command.key,
+            *command.value);
+        if (implicit) {
+            finish_implicit_transaction(
+                transaction,
+                transaction_manager,
+                result == KeyStoreStatus::Success);
+        } else if (result == KeyStoreStatus::Deadlock) {
+            transaction_manager.abort(transaction, AbortReason::DeadlockVictim);
+            context.active_transaction.reset();
+        }
+        send_operation_response(socket_fd, result);
+        return;
+    }
+
+    KeyStoreRemoveResult result = key_store.remove(transaction, *command.key);
+    const bool success = result.status == KeyStoreStatus::Success ||
+        result.status == KeyStoreStatus::KeyNotFound;
+    if (implicit) {
+        finish_implicit_transaction(transaction, transaction_manager, success);
+    } else if (result.status == KeyStoreStatus::Deadlock) {
+        transaction_manager.abort(transaction, AbortReason::DeadlockVictim);
+        context.active_transaction.reset();
+    }
+    send_operation_response(socket_fd, result.status);
+}
+
 } // namespace
 
 void handle_get(KeyStore &key_store, KeyStoreGetResult &result, const Key &key) {
@@ -211,6 +339,36 @@ void serve_connection(int socket_fd, KeyStore &key_store) noexcept {
         }
     } catch (...) {
         rollback_active_transaction(key_store, transaction_active);
+        ::close(socket_fd);
+    }
+}
+
+void serve_transactional_connection(
+    int socket_fd,
+    KeyStore &key_store,
+    TransactionManager &transaction_manager
+) noexcept {
+    SessionContext context{};
+
+    try {
+        while (true) {
+            const Command command = read_command(socket_fd);
+            execute_transactional_command(
+                socket_fd,
+                key_store,
+                transaction_manager,
+                context,
+                command);
+        }
+    } catch (...) {
+        if (context.active_transaction) {
+            try {
+                transaction_manager.abort(
+                    context.active_transaction,
+                    AbortReason::ClientRequest);
+            } catch (...) {
+            }
+        }
         ::close(socket_fd);
     }
 }
