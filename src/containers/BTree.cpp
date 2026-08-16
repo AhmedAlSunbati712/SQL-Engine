@@ -229,7 +229,7 @@ BTreeGetStatus BTree::get(const Key &key) {
 }
 
 BTreeStatus BTree::insert(const Key &key, Value &value) {
-    return insert_impl(key, value, nullptr);
+    return insert_impl(key, value, nullptr, nullptr);
 }
 
 BTreeStatus BTree::insert(
@@ -237,13 +237,23 @@ BTreeStatus BTree::insert(
     Value &value,
     PendingBTreeAction &action
 ) {
-    return insert_impl(key, value, &action);
+    return insert_impl(key, value, &action, nullptr);
+}
+
+BTreeStatus BTree::insert(
+    const TransactionHandle &transaction,
+    const Key &key,
+    Value &value,
+    PendingBTreeAction &action
+) {
+    return insert_impl(key, value, &action, &transaction);
 }
 
 BTreeStatus BTree::insert_impl(
     const Key &key,
     Value &value,
-    PendingBTreeAction *action
+    PendingBTreeAction *action,
+    const TransactionHandle *transaction
 ) {
     /**
      * descent <- descend_from_root_to_leaf(key)
@@ -294,7 +304,16 @@ BTreeStatus BTree::insert_impl(
 
     // Descend from the root to the target leaf.
     // We need the path this time in case the insert changes separators or causes a split.
-    BTreeOperation operation(0, pager->page_latch_manager());
+    BTreeOperation operation(
+        transaction && *transaction ? (*transaction)->id() : 0,
+        pager->page_latch_manager());
+    auto finish = [&](BTreeStatus status) {
+        if (status != BTreeStatus::Success || !transaction || !action) return status;
+        if (!finalize_action(operation, *transaction, *action)) {
+            return BTreeStatus::FailedToInsert;
+        }
+        return BTreeStatus::Success;
+    };
     LeafDescentResult descent_result = descend_from_root_to_leaf(
         key,
         true,
@@ -325,7 +344,7 @@ BTreeStatus BTree::insert_impl(
         pager->unref_page(root_page_num);
         if (set_root_result.status != PagerResult::Success) return BTreeStatus::FailedToInsert;
         record_pager_effects(action, std::move(set_root_result.effects));
-        return BTreeStatus::Success;
+        return finish(BTreeStatus::Success);
     }
     if (descent_result.status != BTreeStatus::Success) return descent_result.status;
 
@@ -356,7 +375,7 @@ BTreeStatus BTree::insert_impl(
             descent_result.leaf_page_num,
             descent_result.leaf_page);
         pager->unref_page(descent_result.leaf_page_num);
-        return BTreeStatus::Success;
+        return finish(BTreeStatus::Success);
     }
 
     bool insert_result = target_leaf.insert_at(idx, key, value);
@@ -384,27 +403,36 @@ BTreeStatus BTree::insert_impl(
             action
         );
         pager->unref_page(descent_result.leaf_page_num);
-        return split_result;
+        return finish(split_result);
     }
 
     pager->unref_page(descent_result.leaf_page_num);
-    return BTreeStatus::Success;
+    return finish(BTreeStatus::Success);
 }
 
 BTreeRemoveStatus BTree::remove(const Key &key) {
-    return remove_impl(key, nullptr);
+    return remove_impl(key, nullptr, nullptr);
 }
 
 BTreeRemoveStatus BTree::remove(
     const Key &key,
     PendingBTreeAction &action
 ) {
-    return remove_impl(key, &action);
+    return remove_impl(key, &action, nullptr);
+}
+
+BTreeRemoveStatus BTree::remove(
+    const TransactionHandle &transaction,
+    const Key &key,
+    PendingBTreeAction &action
+) {
+    return remove_impl(key, &action, &transaction);
 }
 
 BTreeRemoveStatus BTree::remove_impl(
     const Key &key,
-    PendingBTreeAction *action
+    PendingBTreeAction *action,
+    const TransactionHandle *transaction
 ) {
     /**
      * descent <- descend_from_root_to_leaf(key)
@@ -450,7 +478,16 @@ BTreeRemoveStatus BTree::remove_impl(
         return remove_result;
     }
 
-    BTreeOperation operation(0, pager->page_latch_manager());
+    BTreeOperation operation(
+        transaction && *transaction ? (*transaction)->id() : 0,
+        pager->page_latch_manager());
+    auto finish = [&](BTreeRemoveStatus status) {
+        if (status.status != BTreeStatus::Success || !transaction || !action) return status;
+        if (!finalize_action(operation, *transaction, *action)) {
+            status.status = BTreeStatus::FailedToRemove;
+        }
+        return status;
+    };
     LeafDescentResult descent_result = descend_from_root_to_leaf(
         key,
         true,
@@ -458,12 +495,12 @@ BTreeRemoveStatus BTree::remove_impl(
         PageLatchMode::Exclusive);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         remove_result.status = BTreeStatus::KeyNotInTree;
-        return remove_result;
+        return finish(remove_result);
     }
 
     if (descent_result.status != BTreeStatus::Success) {
         remove_result.status = descent_result.status;
-        return remove_result;
+        return finish(remove_result);
     }
 
     // Parse the leaf page and find the key
@@ -515,7 +552,7 @@ BTreeRemoveStatus BTree::remove_impl(
             action);
         pager->unref_page(leaf_page_num);
         remove_result.status = merging_status;
-        return remove_result;
+        return finish(remove_result);
     }
 
     // We are assuming in practice that deleting a key from a non-root leaf node will leave at least one key left in the node
@@ -530,12 +567,43 @@ BTreeRemoveStatus BTree::remove_impl(
             action);
         pager->unref_page(leaf_page_num);
         remove_result.status = separator_change_status;
-        return remove_result;
+        return finish(remove_result);
     }
 
     pager->unref_page(leaf_page_num);
 
-    return remove_result;
+    return finish(remove_result);
+}
+
+void BTree::attach_transaction_manager(
+    TransactionManager &manager
+) noexcept {
+    transaction_manager = &manager;
+}
+
+bool BTree::finalize_action(
+    BTreeOperation &operation,
+    const TransactionHandle &transaction,
+    PendingBTreeAction &action
+) {
+    if (!transaction_manager || !transaction) return false;
+
+    // Append the complete action before publishing its LSN into any page.
+    // The operation still owns every exclusive logical latch at this point.
+    const Lsn lsn = transaction_manager->append_action(
+        transaction,
+        action.build());
+
+    // Reload each affected frame by logical page number, install the assigned
+    // LSN, and recompute its checksum before allowing the latch to be released.
+    for (const PageEffect &effect : action.effects()) {
+        PagerResult install_result = pager->install_page_lsn(
+            operation,
+            effect.page_num,
+            lsn);
+        if (install_result != PagerResult::Success) return false;
+    }
+    return true;
 }
 
 

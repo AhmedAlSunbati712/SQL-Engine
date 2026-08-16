@@ -2,6 +2,7 @@
 #include <BTreePage.h>
 #include <Log/PendingBTreeAction.h>
 #include <Pager.h>
+#include <TransactionManager/TransactionManager.h>
 #include <containers/BTreeOperation.h>
 #include <cstddef>
 #include <string>
@@ -81,10 +82,20 @@ class BTree {
             const Key &key,
             Value &value,
             PendingBTreeAction &action);
+        BTreeStatus insert(
+            const TransactionHandle &transaction,
+            const Key &key,
+            Value &value,
+            PendingBTreeAction &action);
         BTreeRemoveStatus remove(const Key &key);
         BTreeRemoveStatus remove(
             const Key &key,
             PendingBTreeAction &action);
+        BTreeRemoveStatus remove(
+            const TransactionHandle &transaction,
+            const Key &key,
+            PendingBTreeAction &action);
+        void attach_transaction_manager(TransactionManager &transaction_manager) noexcept;
         // The database must already be open. The returned cursor starts unpositioned.
         BTreeCursor open_cursor();
         bool cursor_active() const;
@@ -105,8 +116,9 @@ class BTree {
             std::optional<std::uint32_t> left_sibling_page_num;
         };
 
-        BTreeStatus insert_impl(const Key &key, Value &value, PendingBTreeAction *action);
-        BTreeRemoveStatus remove_impl(const Key &key, PendingBTreeAction *action);
+        BTreeStatus insert_impl(const Key &key, Value &value, PendingBTreeAction *action, const TransactionHandle *transaction);
+        BTreeRemoveStatus remove_impl(const Key &key, PendingBTreeAction *action, const TransactionHandle *transaction);
+        bool finalize_action(BTreeOperation &operation, const TransactionHandle &transaction, PendingBTreeAction &action);
         BTreeStatus propagate_separator_change_upward(const std::vector<TraversalPathEntry> &path, const Key &new_subtree_min, BTreeOperation &operation, PendingBTreeAction *action);
         BTreeStatus propagate_splitting(std::uint32_t split_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);
         BTreeStatus propagate_merging(std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);
@@ -128,6 +140,7 @@ class BTree {
         static void migrate_leaf(BLeafPage &src, BLeafPage &dst, std::size_t separator_idx);
         static void migrate_internal(BInternalPage &src, BInternalPage &dst, std::size_t median_separator_idx);
         Pager *pager = nullptr;
+        TransactionManager *transaction_manager = nullptr;
         std::string currently_open_db_file;
         // Writes, transaction boundaries, and close are rejected while this is nonzero.
         std::size_t active_cursor_count = 0;

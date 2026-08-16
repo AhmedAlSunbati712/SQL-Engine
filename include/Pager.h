@@ -81,6 +81,10 @@ class Pager {
         PagerGetRootResult get_btree_root(); //  TODO: should also return root page nuumber. 
         PagerMutationResult set_btree_root(BTreeOperation& operation, std::uint32_t root_page_num);
         PagerResult set_btree_root(std::uint32_t root_page_num);
+        PagerResult install_page_lsn(
+            BTreeOperation& operation,
+            std::uint32_t page_num,
+            Lsn lsn);
         PageLatchManager& page_latch_manager() noexcept { return page_latch_manager_; }
 	private:
 		struct PagerReadPageResult {

@@ -742,6 +742,44 @@ PagerResult Pager::set_btree_root(std::uint32_t root_page_num) {
     return PagerResult::Success;
 }
 
+PagerResult Pager::install_page_lsn(
+    BTreeOperation& operation,
+    std::uint32_t page_num,
+    Lsn lsn
+) {
+    if (!is_open) return PagerResult::DatabaseNotOpen;
+    if (lsn == 0) return PagerResult::PageCorrupt;
+
+    // The page image cannot be published under an LSN unless this operation
+    // still owns the exclusive logical latch that protected its modification.
+    const std::optional<PageLatchMode> mode = operation.latch_mode(page_num);
+    if (!mode || *mode != PageLatchMode::Exclusive) {
+        return PagerResult::Busy;
+    }
+
+    PageV2 *page = nullptr;
+    bool must_unref = false;
+    if (page_num == DB_HEADER_PAGE_NUM) {
+        PagerResult load_result = ensure_header_page_loaded(page);
+        if (load_result != PagerResult::Success) return load_result;
+    } else {
+        PagerGetResult get_result = get(static_cast<int>(page_num));
+        if (get_result.status != PagerResult::Success) return get_result.status;
+        page = get_result.page;
+        must_unref = true;
+    }
+
+    V2PageCodec::set_page_lsn(page->data, lsn);
+    V2PageCodec::update_checksum(page->data);
+    page->is_dirty = true;
+
+    if (must_unref) {
+        PagerResult unref_result = unref_page(static_cast<int>(page_num));
+        if (unref_result != PagerResult::Success) return unref_result;
+    }
+    return PagerResult::Success;
+}
+
 
 PagerResult Pager::commit_phase_one() {
     /**
