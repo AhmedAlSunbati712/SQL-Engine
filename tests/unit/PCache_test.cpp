@@ -3,8 +3,8 @@
 
 namespace {
 
-Page *make_page(int page_num, int refs_num = 0, bool is_dirty = false, bool need_flushing = false) {
-    Page *page = new Page();
+PageV2 *make_page(int page_num, int refs_num = 0, bool is_dirty = false, bool need_flushing = false) {
+    PageV2 *page = new PageV2();
     page->page_num = page_num;
     page->refs_num = refs_num;
     page->is_dirty = is_dirty;
@@ -19,13 +19,13 @@ TEST(PCacheTest, StartsEmpty) {
 
 TEST(PCacheTest, GetMissingPageReturnsNull) {
     PCache cache;
-    Page *page = cache.get(3);
+    PageV2 *page = cache.get(3);
     EXPECT_EQ(page, nullptr);
 }
 
 TEST(PCacheTest, PutAddsPageToCache) {
     PCache cache;
-    Page *page = make_page(4);
+    PageV2 *page = make_page(4);
 
     PCachePutResult put_res = cache.put(page);
 
@@ -50,7 +50,7 @@ TEST(PCacheTest, RemoveMissingPageIsSuccess) {
 
 TEST(PCacheTest, PutZeroRefPageMakesItImmediatelyRemovable) {
     PCache cache;
-    Page *page = make_page(4);
+    PageV2 *page = make_page(4);
 
     PCachePutResult put_res = cache.put(page);
     PCacheResult remove_res = cache.remove(4);
@@ -63,7 +63,7 @@ TEST(PCacheTest, PutZeroRefPageMakesItImmediatelyRemovable) {
 
 TEST(PCacheTest, RemoveExistingUnpinnedPage) {
     PCache cache;
-    Page *page = make_page(4);
+    PageV2 *page = make_page(4);
 
     PCachePutResult put_res = cache.put(page);
     PCacheResult remove_res = cache.remove(4);
@@ -75,7 +75,7 @@ TEST(PCacheTest, RemoveExistingUnpinnedPage) {
 
 TEST(PCacheTest, RemovePinnedPageReturnsRemovingPinnedPage) {
     PCache cache;
-    Page *page = make_page(4, 1);
+    PageV2 *page = make_page(4, 1);
 
     PCachePutResult put_res = cache.put(page);
     PCacheResult remove_res = cache.remove(4);
@@ -88,7 +88,7 @@ TEST(PCacheTest, RemovePinnedPageReturnsRemovingPinnedPage) {
 
 TEST(PCacheTest, ForceRemovePinnedPageDropsItFromCache) {
     PCache cache;
-    Page *page = make_page(4, 1);
+    PageV2 *page = make_page(4, 1);
 
     EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
 
@@ -100,8 +100,8 @@ TEST(PCacheTest, ForceRemovePinnedPageDropsItFromCache) {
 
 TEST(PCacheTest, PinPageRemovesZeroRefPageFromEvictableSet) {
     PCache cache(1);
-    Page *page = make_page(1);
-    Page *new_page = make_page(2);
+    PageV2 *page = make_page(1);
+    PageV2 *new_page = make_page(2);
 
     EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
 
@@ -119,8 +119,8 @@ TEST(PCacheTest, PinPageRemovesZeroRefPageFromEvictableSet) {
 
 TEST(PCacheTest, UnpinPageMakesPinnedPageEvictableAgain) {
     PCache cache(1);
-    Page *page = make_page(1, 1);
-    Page *new_page = make_page(2);
+    PageV2 *page = make_page(1, 1);
+    PageV2 *new_page = make_page(2);
 
     EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
 
@@ -139,8 +139,8 @@ TEST(PCacheTest, UnpinPageMakesPinnedPageEvictableAgain) {
 
 TEST(PCacheTest, PutReturnsNoVictimWhenFullAndOnlyPageIsPinned) {
     PCache cache(1);
-    Page *page = make_page(1, 1);
-    Page *new_page = make_page(2);
+    PageV2 *page = make_page(1, 1);
+    PageV2 *new_page = make_page(2);
 
     EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
 
@@ -155,8 +155,8 @@ TEST(PCacheTest, PutReturnsNoVictimWhenFullAndOnlyPageIsPinned) {
 
 TEST(PCacheTest, PutEvictsCleanZeroRefPageWhenFull) {
     PCache cache(1);
-    Page *page = make_page(1);
-    Page *new_page = make_page(2);
+    PageV2 *page = make_page(1);
+    PageV2 *new_page = make_page(2);
 
     EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
 
@@ -172,8 +172,8 @@ TEST(PCacheTest, PutEvictsCleanZeroRefPageWhenFull) {
 
 TEST(PCacheTest, PutReturnsDirtyFlushWhenOnlyVictimIsDirtyAndNeedsFlushing) {
     PCache cache(1);
-    Page *page = make_page(1, 0, true, true);
-    Page *new_page = make_page(2);
+    PageV2 *page = make_page(1, 0, true, true);
+    PageV2 *new_page = make_page(2);
 
     EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
 
@@ -188,8 +188,8 @@ TEST(PCacheTest, PutReturnsDirtyFlushWhenOnlyVictimIsDirtyAndNeedsFlushing) {
 
 TEST(PCacheTest, PutEvictsDirtyPageWhenVictimDoesNotNeedFlushing) {
     PCache cache(1);
-    Page *page = make_page(1, 0, true, false);
-    Page *new_page = make_page(2);
+    PageV2 *page = make_page(1, 0, true, false);
+    PageV2 *new_page = make_page(2);
 
     EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
 
@@ -205,9 +205,9 @@ TEST(PCacheTest, PutEvictsDirtyPageWhenVictimDoesNotNeedFlushing) {
 
 TEST(PCacheTest, PutPrefersCleanVictimOverDirtyVictim) {
     PCache cache(2);
-    Page *dirty_page = make_page(1, 0, true, false);
-    Page *clean_page = make_page(2);
-    Page *new_page = make_page(3);
+    PageV2 *dirty_page = make_page(1, 0, true, false);
+    PageV2 *clean_page = make_page(2);
+    PageV2 *new_page = make_page(3);
 
     EXPECT_EQ(cache.put(dirty_page).status, PCacheResult::Success);
     EXPECT_EQ(cache.put(clean_page).status, PCacheResult::Success);

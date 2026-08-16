@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <Page.h>
+#include <PageV2.h>
 #include <unordered_set>
 #include <PCache.h>
 #include <Journal.h>
@@ -11,6 +12,8 @@ enum class PagerResult : std::uint8_t {
     DatabaseNotOpen,
     OpenDbFailed,
     DbReadFailed,
+    PageCorrupt,
+    InvalidPageKind,
     PageOutOfRange,
     DbHeaderCorrupt,
     NoEvictablePage,
@@ -32,18 +35,18 @@ enum class PagerResult : std::uint8_t {
 
 struct PagerGetResult {
     PagerResult status = PagerResult::Success;
-    char *data = nullptr;
+    PageV2 *page = nullptr;
 };
 
 struct PagerAllocateResult {
     PagerResult status = PagerResult::Success;
     int page_num = -1;
-    char *data = nullptr;
+    PageV2 *page = nullptr;
 };
 
 struct PagerGetRootResult {
     PagerResult status = PagerResult::Success;
-    char *data = nullptr;
+    PageV2 *page = nullptr;
     std::uint64_t root_page_num;
 };
 
@@ -53,7 +56,7 @@ class Pager {
 		~Pager();
 		PagerResult open(std::string db_file); // TODO: Should also create a btree head page if it doesn't exist. Should configure a constant defining the default order
 		PagerGetResult get(int page_num);
-        PagerAllocateResult allocate_page();
+        PagerAllocateResult allocate_page(V2PageKind kind);
         PagerResult free_page(int page_num);
 		PagerResult begin_write(int page_num);
 		PagerResult ref_page(int page_num); // increment page ref nums. if page.num_refs == 1, call pcache.pin_page(page_num)
@@ -67,7 +70,7 @@ class Pager {
 	private:
 		struct PagerReadPageResult {
 			PagerResult status = PagerResult::Success;
-			Page *page = nullptr;
+			PageV2 *page = nullptr;
 		};
 
 		enum class WriteTxnState : std::uint8_t {
@@ -95,7 +98,7 @@ class Pager {
         static constexpr int BUSY_RETRIES = 32;
 
 		void handle_cache_eviction(const PCacheEviction &eviction);
-		PagerResult cache_put(Page *page);
+		PagerResult cache_put(PageV2 *page);
 		PagerResult journal_has_contents(bool &has_contents);
 		PagerResult maybe_recover_hot_journal();
         PagerResult enter_from_nolock(Lock target_lock);
@@ -106,13 +109,13 @@ class Pager {
         PagerResult purge_cache();
         PagerResult create_new_database_file();
         PagerResult load_db_header_from_disk();
-        PagerResult ensure_header_page_loaded(Page *&page);
-        PagerResult get_or_load_page(int page_num, Page *&page);
+        PagerResult ensure_header_page_loaded(PageV2 *&page);
+        PagerResult get_or_load_page(int page_num, PageV2 *&page);
         PagerResult ensure_transaction_started();
         PagerResult mark_header_dirty_for_mutation();
-        PagerResult mark_loaded_page_dirty(Page *page);
+        PagerResult mark_loaded_page_dirty(PageV2 *page);
         void sync_db_header_to_cached_header_page();
-        void read_freelist_links(Page *page, std::uint32_t &next_page_num, std::uint32_t &prev_page_num);
-        void write_freelist_links(Page *page, std::uint32_t next_page_num, std::uint32_t prev_page_num);
+        void read_freelist_links(PageV2 *page, std::uint32_t &next_page_num, std::uint32_t &prev_page_num);
+        void write_freelist_links(PageV2 *page, std::uint32_t next_page_num, std::uint32_t prev_page_num);
 		PagerReadPageResult read_page_from_disk(int page_num);
 };

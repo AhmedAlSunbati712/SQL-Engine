@@ -23,13 +23,13 @@ PCache::~PCache() {
  * @brief looksup a page by its number in our map. If it doesnt, we return a nullptr.
  *        Otherwse, we return a pointer to the page struct.
  */
-Page *PCache::get(int page_num) {
+PageV2 *PCache::get(int page_num) {
     auto iterator = cache_map.find(page_num);
     if (iterator == cache_map.end()) return nullptr;
     return iterator->second;
 }
 
-PCachePutResult PCache::put(Page *page) {
+PCachePutResult PCache::put(PageV2 *page) {
     assert(page != nullptr);
     int page_num = page->page_num;
 
@@ -55,9 +55,9 @@ PCachePutResult PCache::put(Page *page) {
         auto it_head = unpinned_pages->begin(); // this returns an iterator that starts at head->next
         it_head--; // This is now an iterator that starts at head
 
-        Page *victim_page = nullptr;
+        PageV2 *victim_page = nullptr;
         while (it != it_head) {
-            Page *candidate_page = *it;
+            PageV2 *candidate_page = *it;
             if (!candidate_page->is_dirty) {
                 victim_page = candidate_page;
                 break;
@@ -112,7 +112,7 @@ PCacheResult PCache::remove(int page_num) {
     auto it = cache_map.find(page_num);
     if (it == cache_map.end()) return PCacheResult::Success;
 
-    Page *page = it->second;
+    PageV2 *page = it->second;
     if (page->refs_num > 0) {
         return PCacheResult::RemovingPinnedPage;
     }
@@ -129,7 +129,7 @@ void PCache::force_remove(int page_num) {
     auto it = cache_map.find(page_num);
     if (it == cache_map.end()) return;
 
-    Page *page = it->second;
+    PageV2 *page = it->second;
     if (page->refs_num == 0) {
         assert(unpinned_pages->exists(page_num));
         unpinned_pages->remove(page_num);
@@ -148,7 +148,7 @@ void PCache::pin_page(int page_num) {
     assert(it != cache_map.end());
 
     // Pager increments refs_num before calling this helper.
-    Page *page = it->second;
+    PageV2 *page = it->second;
     assert(page->refs_num > 0);
 
     if (page->refs_num == 1 && unpinned_pages->exists(page_num)) {
@@ -166,7 +166,7 @@ void PCache::unpin_page(int page_num) {
     assert(it != cache_map.end());
 
     // Pager decrements refs_num before calling this helper.
-    Page *page = it->second;
+    PageV2 *page = it->second;
     assert(page->refs_num == 0);
 
     // add to the unpinned_pages

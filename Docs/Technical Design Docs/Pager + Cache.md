@@ -33,13 +33,13 @@ class PCache {
 		static const DEFAULT_CAPACITY = 64;
 		int capacity = DEFAULT_CAPACITY;
 		int length = 0;
-		std::unordered_map<int, Page *> cache_map;
+		std::unordered_map<int, PageV2 *> cache_map;
 		DLList *unpinned_pages = new DLList();
 	public:
 		PCache(): capacity(DEFAULT_CAPACITY) {};
 		~PCache() {/* Should we free the pages if we are destructing the cache? */}
-		Page *get(int page_num);
-		Page *put(Page *page);
+		PageV2 *get(int page_num);
+		PageV2 *put(PageV2 *page);
 		int len();
 }
 ```
@@ -51,7 +51,7 @@ class Pager {
 	public:
 		Pager();
 		PagerResult open(std::string db_file);
-		PagerGetResult get(int page_num);
+		PagerGetResult get(int page_num); // Returns a pinned PageV2*.
 		PagerResult begin_write(int page_num);
 		PagerResult commit_phase_one();
 		PagerResult commit_phase_two();
@@ -82,8 +82,8 @@ class DLList {
 	private:
 		struct Node {
 			Node() {};
-			Node(Page *page): page(page) {};
-			Page *page = nullptr;
+			Node(PageV2 *page): page(page) {};
+			PageV2 *page = nullptr;
 			Node *next = nullptr;
 			Node *prev = nullptr;
 		};
@@ -94,9 +94,9 @@ class DLList {
 	public:
 		DLList() {/*Fill in*/};
 		~DLList();
-		void add(int page_num, Page *page);
-		Page *get(int page_num);
-		Page *remove(int page_num);
+		void add(int page_num, PageV2 *page);
+		PageV2 *get(int page_num);
+		PageV2 *remove(int page_num);
 		bool exists(int page_num);
 		int len();
 }

@@ -2,8 +2,8 @@
 #include <unordered_map>
 #include <vector>
 
-// Forward-declaration of the page struct
-struct Page;
+// Forward-declaration of the cached page frame.
+struct PageV2;
 
 /**
  * Purpose: The usecase I'm targeting for this is in the PCache. It will hold a list of pages that
@@ -18,8 +18,8 @@ class DLList {
     private:
         struct Node {
             Node() {};
-            Node(Page *page): page(page) {};
-            Page *page = nullptr;
+            Node(PageV2 *page): page(page) {};
+            PageV2 *page = nullptr;
             Node *next = nullptr;
             Node *prev = nullptr;
         };
@@ -30,9 +30,9 @@ class DLList {
     public:
         DLList();
         ~DLList();
-        void add(int page_num, Page *page);
-        Page *get(int page_num);
-        Page *remove(int page_num);
+        void add(int page_num, PageV2 *page);
+        PageV2 *get(int page_num);
+        PageV2 *remove(int page_num);
         bool exists(int page_num);
         int len();
 
@@ -42,7 +42,7 @@ class DLList {
                 Node *current = nullptr;
             public:
                 Iterator(Node *current): current(current) {};
-                Page *operator*() const {
+                PageV2 *operator*() const {
                     return current->page;
                 }
                 

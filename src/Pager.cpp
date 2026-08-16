@@ -2,6 +2,7 @@
 #include <DBHeaderCodec.h>
 #include <DiskIO.h>
 #include <JournalCodec.h>
+#include <V2PageCodec.h>
 
 #include <cassert>
 #include <cstring>
@@ -16,15 +17,22 @@ constexpr std::uint32_t FREELIST_NULL_PAGE_NUM = 0;
 constexpr std::size_t FREELIST_NEXT_OFFSET = 0;
 constexpr std::size_t FREELIST_PREV_OFFSET = 4;
 
+char *page_payload(PageV2 *page) {
+    return page->data.data() + V2_PAGE_HEADER_SIZE;
+}
+
 void destroy_dirty_page_entry(DirtyPageEntry *entry) {
     delete[] entry->backup_image;
     delete entry;
 }
 
-Page *make_page(int page_num) {
-    Page *page = new Page();
-    std::memset(page->data, 0, PAGE_SIZE);
-    page->page_num = page_num;
+PageV2 *make_page(int page_num, V2PageKind kind) {
+    PageV2 *page = new PageV2();
+    V2PageCodec::initialize(
+        page->data,
+        static_cast<std::uint32_t>(page_num),
+        kind);
+    page->page_num = static_cast<std::uint32_t>(page_num);
     page->refs_num = 0;
     page->is_dirty = false;
     page->need_flushing = false;
@@ -207,7 +215,7 @@ PagerGetResult Pager::get(int page_num) {
 
     // Get or load the page. Basically asks the cache if it can return the page
     // if it's not in the cache, just load from disk and load in cache
-    Page *page = nullptr;
+    PageV2 *page = nullptr;
     PagerResult load_result = get_or_load_page(page_num, page);
     if (load_result != PagerResult::Success) {
         if (pre_lock == Lock::NOLOCK) {
@@ -221,11 +229,11 @@ PagerGetResult Pager::get(int page_num) {
     // Ref the page and pin it down
     page->refs_num += 1;
     if (page->refs_num == 1) pCache->pin_page(page_num);
-    result.data = page->data;
+    result.page = page;
     return result;
 }
 
-PagerAllocateResult Pager::allocate_page() {
+PagerAllocateResult Pager::allocate_page(V2PageKind kind) {
     /**
      * Description: Used to allocate a new page for a write (or resuing a page from the freelist)
      */
@@ -234,6 +242,11 @@ PagerAllocateResult Pager::allocate_page() {
     PagerAllocateResult result;
     if (!is_open) {
         result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+    if (kind != V2PageKind::BTreeLeaf &&
+        kind != V2PageKind::BTreeInternal) {
+        result.status = PagerResult::InvalidPageKind;
         return result;
     }
 
@@ -261,7 +274,7 @@ PagerAllocateResult Pager::allocate_page() {
         assert(freelist_head_page_num < static_cast<int>(db_header.db_page_count));
 
         // reuse the head of the freelist
-        Page *freelist_head_page = nullptr;
+        PageV2 *freelist_head_page = nullptr;
         PagerResult load_head_result = get_or_load_page(freelist_head_page_num, freelist_head_page);
         if (load_head_result != PagerResult::Success) {
             result.status = load_head_result;
@@ -278,7 +291,7 @@ PagerAllocateResult Pager::allocate_page() {
 
         // If there's a second free page, make sure to stitch back the linked list
         // We will load that page to journal it since we will be modifying it
-        Page *next_free_page = nullptr;
+        PageV2 *next_free_page = nullptr;
         if (next_free_page_num != FREELIST_NULL_PAGE_NUM) {
             assert(next_free_page_num < db_header.db_page_count);
             PagerResult load_next_result = get_or_load_page(static_cast<int>(next_free_page_num), next_free_page);
@@ -326,14 +339,17 @@ PagerAllocateResult Pager::allocate_page() {
         db_header.freelist_page_count--;
         sync_db_header_to_cached_header_page(); // Sync the in-memory bytes
 
-        // Zero out this page entirely
-        std::memset(freelist_head_page->data, 0, PAGE_SIZE);
+        // Reinitialize the reused frame with its new persistent page kind.
+        V2PageCodec::initialize(
+            freelist_head_page->data,
+            static_cast<std::uint32_t>(freelist_head_page_num),
+            kind);
         assert(freelist_head_page->refs_num == 0);
         freelist_head_page->refs_num = 1;
         pCache->pin_page(freelist_head_page_num);
 
         result.page_num = freelist_head_page_num;
-        result.data = freelist_head_page->data;
+        result.page = freelist_head_page;
         return result;
     }
 
@@ -353,7 +369,7 @@ PagerAllocateResult Pager::allocate_page() {
     sync_db_header_to_cached_header_page(); // sync the bytes
 
     // Make a brand new page for it
-    Page *new_page = make_page(new_page_num);
+    PageV2 *new_page = make_page(new_page_num, kind);
     new_page->refs_num = 1;
 
     // Add it to cache
@@ -378,7 +394,7 @@ PagerAllocateResult Pager::allocate_page() {
     dirty_pages[new_page_num] = new_entry;
 
     result.page_num = new_page_num;
-    result.data = new_page->data;
+    result.page = new_page;
     return result;
 }
 
@@ -410,7 +426,7 @@ PagerResult Pager::free_page(int page_num) {
     }
 
     // Get from cache or load from disk
-    Page *page_to_free = nullptr;
+    PageV2 *page_to_free = nullptr;
     PagerResult load_page_result = get_or_load_page(page_num, page_to_free);
     if (load_page_result != PagerResult::Success) {
         restore_lock_after_failure(pre_lock);
@@ -418,7 +434,7 @@ PagerResult Pager::free_page(int page_num) {
     }
 
     // get the head of the freelist if it exists
-    Page *old_freelist_head = nullptr;
+    PageV2 *old_freelist_head = nullptr;
     if (db_header.freelist_head_page_num != FREELIST_NULL_PAGE_NUM) {
         assert(db_header.freelist_head_page_num != static_cast<std::uint32_t>(page_num));
         PagerResult load_head_result = get_or_load_page(static_cast<int>(db_header.freelist_head_page_num), old_freelist_head);
@@ -494,7 +510,7 @@ PagerResult Pager::begin_write(int page_num) {
         return PagerResult::PageOutOfRange;
     }
 
-    Page *page = nullptr;
+    PageV2 *page = nullptr;
     PagerResult load_result = get_or_load_page(page_num, page);
     if (load_result != PagerResult::Success) {
         restore_lock_after_failure(pre_lock);
@@ -524,7 +540,7 @@ PagerResult Pager::ref_page(int page_num) {
         assert(pre_lock == Lock::SHARED || pre_lock == Lock::RESERVED || pre_lock == Lock::EXCLUSIVE);
     }
 
-    Page *page = pCache->get(page_num);
+    PageV2 *page = pCache->get(page_num);
     if (!page) {
         // If reacquiring SHARED forced us to purge stale cache entries, this page may no longer be around.
         if (pre_lock == Lock::NOLOCK) {
@@ -542,7 +558,7 @@ PagerResult Pager::ref_page(int page_num) {
 PagerResult Pager::unref_page(int page_num) {
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
-    Page *page = pCache->get(page_num);
+    PageV2 *page = pCache->get(page_num);
     assert(page != nullptr);
 
     page->refs_num--;
@@ -566,14 +582,14 @@ PagerGetRootResult Pager::get_btree_root() {
 
     if (db_header.btree_root_page_num == 0) {
         result.status = PagerResult::EmptyBTree;
-        result.data = nullptr;
+        result.page = nullptr;
         result.root_page_num = 0;
         return result;
     }
 
     PagerGetResult get_result = get(static_cast<int>(db_header.btree_root_page_num));
     result.status = get_result.status;
-    result.data = get_result.data;
+    result.page = get_result.page;
     result.root_page_num = db_header.btree_root_page_num;
     return result;
 }
@@ -762,7 +778,10 @@ PagerResult Pager::commit_phase_one() {
 
     // The backup images are durable now, so it is finally safe to overwrite the db pages.
     for (const auto &[page_num, dPage_entry] : dirty_pages) {
-        std::span<const char> new_page_data(dPage_entry->page->data, PAGE_SIZE);
+        // The common checksum covers the complete persistent page and must
+        // reflect the final bytes that are about to reach the database file.
+        V2PageCodec::update_checksum(dPage_entry->page->data);
+        std::span<const char> new_page_data(dPage_entry->page->data);
         try {
             disk::write_exact_at(
                 db_fd,
@@ -1195,7 +1214,7 @@ PagerResult Pager::cleanup_transaction_cache() {
     for (auto it = dirty_pages.begin(); it != dirty_pages.end(); ) {
         int page_num = it->first;
         DirtyPageEntry *dPage_entry = it->second;
-        Page *cached_page = pCache->get(page_num);
+        PageV2 *cached_page = pCache->get(page_num);
 
         if (!cached_page) {
             destroy_dirty_page_entry(dPage_entry);
@@ -1209,7 +1228,7 @@ PagerResult Pager::cleanup_transaction_cache() {
             // those stale handles after this point.
             pCache->force_remove(page_num);
         } else if (cached_page->refs_num > 0) {
-            std::memcpy(cached_page->data, dPage_entry->backup_image, PAGE_SIZE);
+            std::memcpy(cached_page->data.data(), dPage_entry->backup_image, PAGE_SIZE);
             cached_page->is_dirty = false;
             cached_page->need_flushing = false;
         } else {
@@ -1247,8 +1266,13 @@ PagerResult Pager::create_new_database_file() {
     initial_header.db_page_count = 1;
 
     // Serialize the initial DB header
-    char header_page[PAGE_SIZE] = {};
-    DBHeaderCodec::serialize_DBHeader(initial_header, header_page);
+    PageV2 header_page;
+    V2PageCodec::initialize(
+        header_page.data,
+        DB_HEADER_PAGE_NUM,
+        V2PageKind::DatabaseMetadata);
+    DBHeaderCodec::serialize_DBHeader(initial_header, page_payload(&header_page));
+    V2PageCodec::update_checksum(header_page.data);
 
     int create_fd = -1;
     try {
@@ -1259,7 +1283,7 @@ PagerResult Pager::create_new_database_file() {
 
     try {
         // Write the header to disk
-        std::span<const char> header_page_span(header_page, PAGE_SIZE);
+        std::span<const char> header_page_span(header_page.data);
         disk::write_exact_at(create_fd, header_page_span, 0);
     } catch (const std::exception &) {
         close_fd_if_open(create_fd);
@@ -1285,16 +1309,22 @@ PagerResult Pager::create_new_database_file() {
 
 PagerResult Pager::load_db_header_from_disk() {
     // TODO: Should we acquire a shared lock here?
-    char header_page[PAGE_SIZE] = {};
+    PageV2 header_page;
     try {
-        std::span<char> header_page_span(header_page, PAGE_SIZE);
+        std::span<char> header_page_span(header_page.data);
         disk::read_exact_at(db_fd, header_page_span, 0);
     } catch (const std::exception &) {
         return PagerResult::DbReadFailed;
     }
 
+    if (V2PageCodec::validate(header_page.data) != V2PageCodecResult::Success ||
+        V2PageCodec::page_num(header_page.data) != DB_HEADER_PAGE_NUM ||
+        V2PageCodec::page_kind(header_page.data) != V2PageKind::DatabaseMetadata) {
+        return PagerResult::DbHeaderCorrupt;
+    }
+
     DBHeader loaded_header;
-    DBHeaderCodec::deserialize_DBHeader(loaded_header, header_page);
+    DBHeaderCodec::deserialize_DBHeader(loaded_header, page_payload(&header_page));
     if (!DBHeaderCodec::validate_DBHeader(loaded_header)) {
         return PagerResult::DbHeaderCorrupt;
     }
@@ -1321,9 +1351,9 @@ PagerResult Pager::load_db_header_from_disk() {
     db_header = loaded_header;
     
     // if page 0 already happens to be cached, update that cached copy so it matches the disk/header we just loaded
-    Page *cached_header_page = pCache->get(DB_HEADER_PAGE_NUM);
+    PageV2 *cached_header_page = pCache->get(DB_HEADER_PAGE_NUM);
     if (cached_header_page) {
-        std::memcpy(cached_header_page->data, header_page, PAGE_SIZE);
+        std::memcpy(cached_header_page->data.data(), header_page.data.data(), PAGE_SIZE);
         cached_header_page->is_dirty = false;
         cached_header_page->need_flushing = false;
     }
@@ -1331,7 +1361,7 @@ PagerResult Pager::load_db_header_from_disk() {
     return PagerResult::Success;
 }
 
-PagerResult Pager::ensure_header_page_loaded(Page *&page) {
+PagerResult Pager::ensure_header_page_loaded(PageV2 *&page) {
     // Make sure the header is loaded. If it's not found in cache,
     // load it from disk. This is necessary for write transaction
     // as we have to mark the header as dirty.
@@ -1339,7 +1369,7 @@ PagerResult Pager::ensure_header_page_loaded(Page *&page) {
     return get_or_load_page(DB_HEADER_PAGE_NUM, page);
 }
 
-PagerResult Pager::get_or_load_page(int page_num, Page *&page) {
+PagerResult Pager::get_or_load_page(int page_num, PageV2 *&page) {
     // Given a reference to a pointer, get the poitner to the page struct
     // either from cache, or through reading disk
     page = pCache->get(page_num);
@@ -1366,7 +1396,7 @@ PagerResult Pager::ensure_transaction_started() {
 
     // If this is the first time we are modifying the db in the transaction,
     // Make sure to load it into the cache if it's not already loaded.
-    Page *header_page = nullptr;
+    PageV2 *header_page = nullptr;
     PagerResult header_load_result = ensure_header_page_loaded(header_page);
     if (header_load_result != PagerResult::Success) return header_load_result;
 
@@ -1390,14 +1420,14 @@ PagerResult Pager::mark_header_dirty_for_mutation() {
     if (txn_result != PagerResult::Success) return txn_result;
     
     // Make sure the header is loaded into cache and mark it as dirty
-    Page *header_page = nullptr;
+    PageV2 *header_page = nullptr;
     PagerResult header_load_result = ensure_header_page_loaded(header_page);
     if (header_load_result != PagerResult::Success) return header_load_result;
 
     return mark_loaded_page_dirty(header_page);
 }
 
-PagerResult Pager::mark_loaded_page_dirty(Page *page) {
+PagerResult Pager::mark_loaded_page_dirty(PageV2 *page) {
     // If it's already dirty, return nothing
     if (page->is_dirty && page->need_flushing) return PagerResult::Success;
 
@@ -1418,7 +1448,7 @@ PagerResult Pager::mark_loaded_page_dirty(Page *page) {
     if (it == dirty_pages.end()) {
         DirtyPageEntry *new_entry = new DirtyPageEntry();
         new_entry->backup_image = new char[PAGE_SIZE];
-        std::memcpy(new_entry->backup_image, page->data, PAGE_SIZE);
+        std::memcpy(new_entry->backup_image, page->data.data(), PAGE_SIZE);
         new_entry->page = page;
         dirty_pages[page->page_num] = new_entry;
     } else {
@@ -1429,21 +1459,25 @@ PagerResult Pager::mark_loaded_page_dirty(Page *page) {
 
 void Pager::sync_db_header_to_cached_header_page() {
     // Make sure that the modified in-memory db header is synced with the bytes in  in-memory cache buffer
-    Page *header_page = pCache->get(DB_HEADER_PAGE_NUM);
+    PageV2 *header_page = pCache->get(DB_HEADER_PAGE_NUM);
     assert(header_page != nullptr);
-    DBHeaderCodec::serialize_DBHeader(db_header, header_page->data);
+    DBHeaderCodec::serialize_DBHeader(db_header, page_payload(header_page));
+    V2PageCodec::update_checksum(header_page->data);
 }
 
-void Pager::read_freelist_links(Page *page, std::uint32_t &next_page_num, std::uint32_t &prev_page_num) {
+void Pager::read_freelist_links(PageV2 *page, std::uint32_t &next_page_num, std::uint32_t &prev_page_num) {
     // Trivial
-    next_page_num = get_u32_be(&page->data[FREELIST_NEXT_OFFSET]);
-    prev_page_num = get_u32_be(&page->data[FREELIST_PREV_OFFSET]);
+    const char *payload = page_payload(page);
+    next_page_num = get_u32_be(&payload[FREELIST_NEXT_OFFSET]);
+    prev_page_num = get_u32_be(&payload[FREELIST_PREV_OFFSET]);
 }
 
-void Pager::write_freelist_links(Page *page, std::uint32_t next_page_num, std::uint32_t prev_page_num) {
+void Pager::write_freelist_links(PageV2 *page, std::uint32_t next_page_num, std::uint32_t prev_page_num) {
     // Trivial
-    put_u32_be(&page->data[FREELIST_NEXT_OFFSET], next_page_num);
-    put_u32_be(&page->data[FREELIST_PREV_OFFSET], prev_page_num);
+    V2PageCodec::set_page_kind(page->data, V2PageKind::Freelist);
+    char *payload = page_payload(page);
+    put_u32_be(&payload[FREELIST_NEXT_OFFSET], next_page_num);
+    put_u32_be(&payload[FREELIST_PREV_OFFSET], prev_page_num);
 }
 
 Pager::PagerReadPageResult Pager::read_page_from_disk(int page_num) {
@@ -1463,9 +1497,9 @@ Pager::PagerReadPageResult Pager::read_page_from_disk(int page_num) {
     }
 
     std::streamoff offset = static_cast<std::streamoff>(page_num) * static_cast<std::streamoff>(PAGE_SIZE);
-    Page *page = nullptr;
+    PageV2 *page = nullptr;
     try {
-        page = make_page(page_num);
+        page = new PageV2();
 
         std::span<char> buffer_span(page->data);
         disk::read_exact_at(db_fd, buffer_span, offset);
@@ -1474,6 +1508,20 @@ Pager::PagerReadPageResult Pager::read_page_from_disk(int page_num) {
         result.status = PagerResult::DbReadFailed;
         return result;
     }
+    if (V2PageCodec::validate(page->data) != V2PageCodecResult::Success ||
+        V2PageCodec::page_num(page->data) != static_cast<std::uint32_t>(page_num)) {
+        delete page;
+        result.status = PagerResult::PageCorrupt;
+        return result;
+    }
+    if ((page_num == DB_HEADER_PAGE_NUM) !=
+        (V2PageCodec::page_kind(page->data) == V2PageKind::DatabaseMetadata)) {
+        delete page;
+        result.status = PagerResult::PageCorrupt;
+        return result;
+    }
+
+    page->page_num = static_cast<std::uint32_t>(page_num);
     result.page = page;
     return result;
 }
@@ -1494,7 +1542,7 @@ void Pager::handle_cache_eviction(const PCacheEviction &eviction) {
     dirty_pages.erase(it);
 }
 
-PagerResult Pager::cache_put(Page *page) {
+PagerResult Pager::cache_put(PageV2 *page) {
     PCachePutResult put_result = pCache->put(page);
     // Handle cache evictions for dirty pages if we succeded
     if (put_result.status == PCacheResult::Success) {

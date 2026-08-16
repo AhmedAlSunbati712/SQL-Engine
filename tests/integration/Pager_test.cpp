@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <DBHeaderCodec.h>
+#include <Endian.h>
 #include <Pager.h>
 #include <JournalCodec.h>
+#include <V2PageCodec.h>
 
 #include <array>
 #include <chrono>
@@ -35,9 +37,19 @@ class PagerIntegrationTest : public ::testing::Test {
             std::filesystem::remove_all(temp_dir, ec);
         }
 
-        std::array<char, PAGE_SIZE> make_filled_page(char byte) {
+        std::array<char, PAGE_SIZE> make_filled_page(
+            char byte,
+            std::uint32_t page_num = 1) {
             std::array<char, PAGE_SIZE> page{};
-            page.fill(byte);
+            V2PageCodec::initialize(
+                page,
+                page_num,
+                V2PageKind::BTreeLeaf);
+            std::fill(
+                page.begin() + V2_PAGE_HEADER_SIZE,
+                page.end(),
+                byte);
+            V2PageCodec::update_checksum(page);
             return page;
         }
 
@@ -53,8 +65,19 @@ class PagerIntegrationTest : public ::testing::Test {
         DBHeader read_db_header() {
             std::array<char, PAGE_SIZE> header_page = read_db_page(0);
             DBHeader header{};
-            DBHeaderCodec::deserialize_DBHeader(header, header_page.data());
+            DBHeaderCodec::deserialize_DBHeader(
+                header,
+                header_page.data() + V2_PAGE_HEADER_SIZE);
             return header;
+        }
+
+        void expect_zero_payload(const PageV2 *page) {
+            ASSERT_NE(page, nullptr);
+            for (std::size_t offset = V2_PAGE_HEADER_SIZE;
+                 offset < V2_PAGE_SIZE;
+                 ++offset) {
+                EXPECT_EQ(page->data[offset], '\0');
+            }
         }
 
         bool journal_exists() const {
@@ -126,6 +149,15 @@ TEST_F(PagerIntegrationTest, OpenCreatesNewDatabaseWithHeaderPage) {
     ASSERT_TRUE(std::filesystem::exists(db_path));
     EXPECT_EQ(std::filesystem::file_size(db_path), static_cast<std::uintmax_t>(PAGE_SIZE));
 
+    const std::array<char, PAGE_SIZE> header_page = read_db_page(0);
+    EXPECT_EQ(
+        V2PageCodec::validate(header_page),
+        V2PageCodecResult::Success);
+    EXPECT_EQ(V2PageCodec::page_num(header_page), 0u);
+    EXPECT_EQ(
+        V2PageCodec::page_kind(header_page),
+        V2PageKind::DatabaseMetadata);
+
     DBHeader header = read_db_header();
     EXPECT_EQ(DBHeaderCodec::validate_DBHeader(header), true);
     EXPECT_EQ(header.db_page_count, 1u);
@@ -134,20 +166,27 @@ TEST_F(PagerIntegrationTest, OpenCreatesNewDatabaseWithHeaderPage) {
 
     PagerGetResult get_result = pager.get(1);
     EXPECT_EQ(get_result.status, PagerResult::PageOutOfRange);
-    EXPECT_EQ(get_result.data, nullptr);
+    EXPECT_EQ(get_result.page, nullptr);
 }
 
 TEST_F(PagerIntegrationTest, AllocatePageAppendsAndCommitExtendsDatabase) {
     Pager pager;
     ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-    PagerAllocateResult allocate_result = pager.allocate_page();
+    PagerAllocateResult allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(allocate_result.status, PagerResult::Success);
     ASSERT_EQ(allocate_result.page_num, 1);
-    ASSERT_NE(allocate_result.data, nullptr);
+    ASSERT_NE(allocate_result.page, nullptr);
+    EXPECT_EQ(allocate_result.page->page_num, 1u);
+    EXPECT_EQ(
+        V2PageCodec::page_num(allocate_result.page->data),
+        allocate_result.page->page_num);
+    EXPECT_EQ(
+        V2PageCodec::page_kind(allocate_result.page->data),
+        V2PageKind::BTreeLeaf);
 
     auto page_bytes = make_filled_page('A');
-    std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+    std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
     ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
     ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
@@ -162,16 +201,79 @@ TEST_F(PagerIntegrationTest, AllocatePageAppendsAndCommitExtendsDatabase) {
     EXPECT_EQ(journal_size(), 0u);
 }
 
+TEST_F(PagerIntegrationTest, AllocatePageRejectsNonTreeKinds) {
+    Pager pager;
+    ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+
+    EXPECT_EQ(
+        pager.allocate_page(V2PageKind::DatabaseMetadata).status,
+        PagerResult::InvalidPageKind);
+    EXPECT_EQ(
+        pager.allocate_page(V2PageKind::Freelist).status,
+        PagerResult::InvalidPageKind);
+}
+
+TEST_F(PagerIntegrationTest, GetRejectsCorruptV2Page) {
+    {
+        Pager pager;
+        ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+        PagerAllocateResult allocation =
+            pager.allocate_page(V2PageKind::BTreeLeaf);
+        ASSERT_EQ(allocation.status, PagerResult::Success);
+        ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    std::fstream database(db_path, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(database.is_open());
+    database.seekp(
+        static_cast<std::streamoff>(PAGE_SIZE + V2_PAGE_HEADER_SIZE),
+        std::ios::beg);
+    const char corrupt = static_cast<char>(0xA5);
+    database.write(&corrupt, 1);
+    database.close();
+
+    Pager pager;
+    ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+    EXPECT_EQ(pager.get(1).status, PagerResult::PageCorrupt);
+}
+
+TEST_F(PagerIntegrationTest, GetRejectsEncodedPageNumberMismatch) {
+    {
+        Pager pager;
+        ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+        PagerAllocateResult allocation =
+            pager.allocate_page(V2PageKind::BTreeLeaf);
+        ASSERT_EQ(allocation.status, PagerResult::Success);
+        ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+        ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+    }
+
+    std::array<char, PAGE_SIZE> page = read_db_page(1);
+    put_u32_be(page.data() + PAGE_NUM_OFFSET, 7);
+    V2PageCodec::update_checksum(page);
+
+    std::fstream database(db_path, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(database.is_open());
+    database.seekp(static_cast<std::streamoff>(PAGE_SIZE), std::ios::beg);
+    database.write(page.data(), static_cast<std::streamsize>(page.size()));
+    database.close();
+
+    Pager pager;
+    ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+    EXPECT_EQ(pager.get(1).status, PagerResult::PageCorrupt);
+}
+
 TEST_F(PagerIntegrationTest, RollbackTransactionRemovesAppendedPages) {
     Pager pager;
     ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-    PagerAllocateResult allocate_result = pager.allocate_page();
+    PagerAllocateResult allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(allocate_result.status, PagerResult::Success);
     ASSERT_EQ(allocate_result.page_num, 1);
 
     auto page_bytes = make_filled_page('B');
-    std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+    std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
     ASSERT_EQ(pager.rollback_transaction(), PagerResult::Success);
 
@@ -182,7 +284,7 @@ TEST_F(PagerIntegrationTest, RollbackTransactionRemovesAppendedPages) {
 
     PagerGetResult get_result = pager.get(1);
     EXPECT_EQ(get_result.status, PagerResult::PageOutOfRange);
-    EXPECT_EQ(get_result.data, nullptr);
+    EXPECT_EQ(get_result.page, nullptr);
 }
 
 TEST_F(PagerIntegrationTest, FreePageAddsToFreelistAndNextAllocationReusesIt) {
@@ -190,12 +292,12 @@ TEST_F(PagerIntegrationTest, FreePageAddsToFreelistAndNextAllocationReusesIt) {
         Pager pager;
         ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = pager.allocate_page();
+        PagerAllocateResult allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
 
         auto page_bytes = make_filled_page('C');
-        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
@@ -214,12 +316,11 @@ TEST_F(PagerIntegrationTest, FreePageAddsToFreelistAndNextAllocationReusesIt) {
     Pager pager;
     ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-    PagerAllocateResult reuse_result = pager.allocate_page();
+    PagerAllocateResult reuse_result = pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(reuse_result.status, PagerResult::Success);
     ASSERT_EQ(reuse_result.page_num, 1);
 
-    std::array<char, PAGE_SIZE> zero_page{};
-    EXPECT_EQ(std::memcmp(reuse_result.data, zero_page.data(), PAGE_SIZE), 0);
+    expect_zero_payload(reuse_result.page);
 }
 
 TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAndTruncatesAppendedPages) {
@@ -229,11 +330,11 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAndTruncatesAppendedPages) {
         Pager writer_pager;
         ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        PagerAllocateResult allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
 
-        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         EXPECT_TRUE(journal_exists());
@@ -253,7 +354,7 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAndTruncatesAppendedPages) {
 
     PagerGetResult get_result = recovery_pager.get(1);
     EXPECT_EQ(get_result.status, PagerResult::PageOutOfRange);
-    EXPECT_EQ(get_result.data, nullptr);
+    EXPECT_EQ(get_result.page, nullptr);
 }
 
 TEST_F(PagerIntegrationTest, GetFromNoLockSeesPageCountAfterAnotherProcessAppends) {
@@ -264,12 +365,12 @@ TEST_F(PagerIntegrationTest, GetFromNoLockSeesPageCountAfterAnotherProcessAppend
         Pager writer_pager;
         ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        PagerAllocateResult allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
 
         auto page_bytes = make_filled_page('Z');
-        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
@@ -279,8 +380,8 @@ TEST_F(PagerIntegrationTest, GetFromNoLockSeesPageCountAfterAnotherProcessAppend
     // get() now has to refresh under SHARED before it decides this page is out of range.
     PagerGetResult get_result = stale_reader_pager.get(1);
     ASSERT_EQ(get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(get_result.data[i], 'Z');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_result.page->data.data()[i], 'Z');
     }
 }
 
@@ -288,12 +389,12 @@ TEST_F(PagerIntegrationTest, RefPageFromNoLockReacquiresShared) {
     Pager pager;
     ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-    PagerAllocateResult allocate_result = pager.allocate_page();
+    PagerAllocateResult allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(allocate_result.status, PagerResult::Success);
     ASSERT_EQ(allocate_result.page_num, 1);
 
     auto page_bytes = make_filled_page('R');
-    std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+    std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
     ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
     ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
@@ -304,8 +405,8 @@ TEST_F(PagerIntegrationTest, RefPageFromNoLockReacquiresShared) {
 
     PagerGetResult get_result = pager.get(1);
     ASSERT_EQ(get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(get_result.data[i], 'R');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_result.page->data.data()[i], 'R');
     }
 }
 
@@ -317,10 +418,10 @@ TEST_F(PagerIntegrationTest, RefPageFromNoLockReturnsPageNotCachedAfterPurge) {
         Pager setup_pager;
         ASSERT_EQ(setup_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = setup_pager.allocate_page();
+        PagerAllocateResult allocate_result = setup_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
-        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), original_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(setup_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(setup_pager.commit_phase_two(), PagerResult::Success);
@@ -340,7 +441,7 @@ TEST_F(PagerIntegrationTest, RefPageFromNoLockReturnsPageNotCachedAfterPurge) {
         PagerGetResult writer_get_result = writer_pager.get(1);
         ASSERT_EQ(writer_get_result.status, PagerResult::Success);
         ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
-        std::memcpy(writer_get_result.data, updated_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(writer_get_result.page->data.data(), updated_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
@@ -352,8 +453,8 @@ TEST_F(PagerIntegrationTest, RefPageFromNoLockReturnsPageNotCachedAfterPurge) {
 
     PagerGetResult refreshed_get_result = stale_reader_pager.get(1);
     ASSERT_EQ(refreshed_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(refreshed_get_result.data[i], 'T');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(refreshed_get_result.page->data.data()[i], 'T');
     }
 }
 
@@ -362,12 +463,12 @@ TEST_F(PagerIntegrationTest, MultipleProcessesCanReadSamePageConcurrently) {
         Pager setup_pager;
         ASSERT_EQ(setup_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = setup_pager.allocate_page();
+        PagerAllocateResult allocate_result = setup_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
 
         auto page_bytes = make_filled_page('U');
-        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(setup_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(setup_pager.commit_phase_two(), PagerResult::Success);
@@ -407,8 +508,8 @@ TEST_F(PagerIntegrationTest, MultipleProcessesCanReadSamePageConcurrently) {
     ASSERT_EQ(parent_pager.open(db_path.string()), PagerResult::Success);
     PagerGetResult parent_get_result = parent_pager.get(1);
     ASSERT_EQ(parent_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(parent_get_result.data[i], 'U');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(parent_get_result.page->data.data()[i], 'U');
     }
 
     send_signal(parent_to_child[1]);
@@ -434,7 +535,7 @@ TEST_F(PagerIntegrationTest, SecondWriterReturnsBusyWhileReservedHeldByAnotherPr
 
         Pager child_pager;
         send_pager_result(child_to_parent[1], child_pager.open(db_path.string()));
-        PagerAllocateResult child_allocate_result = child_pager.allocate_page();
+        PagerAllocateResult child_allocate_result = child_pager.allocate_page(V2PageKind::BTreeLeaf);
         send_pager_result(child_to_parent[1], child_allocate_result.status);
         wait_signal(parent_to_child[0]);
         child_pager.rollback_transaction();
@@ -452,7 +553,7 @@ TEST_F(PagerIntegrationTest, SecondWriterReturnsBusyWhileReservedHeldByAnotherPr
 
     Pager parent_pager;
     ASSERT_EQ(parent_pager.open(db_path.string()), PagerResult::Success);
-    PagerAllocateResult parent_allocate_result = parent_pager.allocate_page();
+    PagerAllocateResult parent_allocate_result = parent_pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(parent_allocate_result.status, PagerResult::Busy);
 
     send_signal(parent_to_child[1]);
@@ -466,12 +567,12 @@ TEST_F(PagerIntegrationTest, CommitPhaseOneReturnsBusyWhileAnotherProcessStillRe
         Pager setup_pager;
         ASSERT_EQ(setup_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = setup_pager.allocate_page();
+        PagerAllocateResult allocate_result = setup_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
 
         auto page_bytes = make_filled_page('V');
-        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(setup_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(setup_pager.commit_phase_two(), PagerResult::Success);
@@ -514,7 +615,7 @@ TEST_F(PagerIntegrationTest, CommitPhaseOneReturnsBusyWhileAnotherProcessStillRe
     ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
 
     auto updated_page_bytes = make_filled_page('W');
-    std::memcpy(writer_get_result.data, updated_page_bytes.data(), PAGE_SIZE);
+    std::memcpy(writer_get_result.page->data.data(), updated_page_bytes.data(), PAGE_SIZE);
 
     ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Busy);
 
@@ -536,10 +637,10 @@ TEST_F(PagerIntegrationTest, GetRecoversHotJournalWrittenByAnotherProcess) {
         Pager setup_pager;
         ASSERT_EQ(setup_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = setup_pager.allocate_page();
+        PagerAllocateResult allocate_result = setup_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
-        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), original_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(setup_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(setup_pager.commit_phase_two(), PagerResult::Success);
@@ -562,7 +663,7 @@ TEST_F(PagerIntegrationTest, GetRecoversHotJournalWrittenByAnotherProcess) {
         PagerGetResult writer_get_result = writer_pager.get(1);
         send_pager_result(child_to_parent[1], writer_get_result.status);
         send_pager_result(child_to_parent[1], writer_pager.begin_write(1));
-        std::memcpy(writer_get_result.data, updated_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(writer_get_result.page->data.data(), updated_page_bytes.data(), PAGE_SIZE);
         send_pager_result(child_to_parent[1], writer_pager.commit_phase_one());
 
         ::close(child_to_parent[1]);
@@ -580,8 +681,8 @@ TEST_F(PagerIntegrationTest, GetRecoversHotJournalWrittenByAnotherProcess) {
 
     PagerGetResult recovery_get_result = recovery_pager.get(1);
     ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(recovery_get_result.data[i], 'X');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.page->data.data()[i], 'X');
     }
     EXPECT_EQ(read_db_page(1), original_page_bytes);
     EXPECT_TRUE(journal_exists());
@@ -603,10 +704,10 @@ TEST_F(PagerIntegrationTest, GetRefreshesStaleHeaderAfterOtherProcessAppendCommi
 
         Pager writer_pager;
         send_pager_result(child_to_parent[1], writer_pager.open(db_path.string()));
-        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        PagerAllocateResult allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         send_pager_result(child_to_parent[1], allocate_result.status);
         auto page_bytes = make_filled_page('Q');
-        std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
         send_pager_result(child_to_parent[1], writer_pager.commit_phase_one());
         send_pager_result(child_to_parent[1], writer_pager.commit_phase_two());
 
@@ -624,20 +725,20 @@ TEST_F(PagerIntegrationTest, GetRefreshesStaleHeaderAfterOtherProcessAppendCommi
 
     PagerGetResult get_result = stale_reader_pager.get(1);
     ASSERT_EQ(get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(get_result.data[i], 'Q');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_result.page->data.data()[i], 'Q');
     }
 }
 
 TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageCommitsUpdatedBytes) {
     Pager writer_pager;
     ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
-    PagerAllocateResult allocate_result = writer_pager.allocate_page();
+    PagerAllocateResult allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(allocate_result.status, PagerResult::Success);
     EXPECT_EQ(allocate_result.page_num, 1);
 
     auto page_bytes = make_filled_page('A');
-    std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+    std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
     writer_pager.commit_phase_one();
 
     // Make sure that there are not journal records on disk for this.
@@ -663,17 +764,16 @@ TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageCommitsUpdatedBytes) {
     // Now, we need to get that page, and ensure it has the content we wrote!
     PagerGetResult get_result = writer_pager.get(1);
     ASSERT_EQ(get_result.status, PagerResult::Success);
-    char *get_page_bytes = get_result.data;
-    for (int i = 0; i < PAGE_SIZE; i++) {
+    char *get_page_bytes = get_result.page->data.data();
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
         EXPECT_EQ(get_page_bytes[i], 'A');
     }
 
     header = read_db_header();
-    char header_bytes[PAGE_SIZE] = {};
-    DBHeaderCodec::serialize_DBHeader(header, header_bytes);
+    const std::array<char, PAGE_SIZE> header_bytes = read_db_page(0);
     PagerResult begin_write_result = writer_pager.begin_write(1);
     ASSERT_EQ(begin_write_result, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
         get_page_bytes[i] = 'B';
     }
     writer_pager.commit_phase_one();
@@ -697,7 +797,7 @@ TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageCommitsUpdatedBytes) {
             if (jPage_record.page_num == 0) {
                 EXPECT_EQ(jPage_record.data[j], header_bytes[j]);
             } else {
-                EXPECT_EQ(jPage_record.data[j], 'A');
+                EXPECT_EQ(jPage_record.data[j], page_bytes[j]);
             }
         }
 
@@ -722,8 +822,8 @@ TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageCommitsUpdatedBytes) {
 
     PagerGetResult recovery_get_result = recovery_pager.get(1);
     ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(recovery_get_result.data[i], 'B');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.page->data.data()[i], 'B');
     }
 
 }
@@ -731,11 +831,11 @@ TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageCommitsUpdatedBytes) {
 TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageRollbackRestoresOriginalBytes) {
     Pager writer_pager;
     ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
-    PagerAllocateResult allocate_result = writer_pager.allocate_page();
+    PagerAllocateResult allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(allocate_result.status, PagerResult::Success);
     EXPECT_EQ(allocate_result.page_num, 1);
     auto page_bytes = make_filled_page('A');
-    std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+    std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
     ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
     ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
@@ -743,15 +843,15 @@ TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageRollbackRestoresOriginalByt
     PagerGetResult get_result = writer_pager.get(1);
     ASSERT_EQ(get_result.status, PagerResult::Success);
     ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        get_result.data[i] = 'B';
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        get_result.page->data.data()[i] = 'B';
     }
 
     ASSERT_EQ(writer_pager.rollback_transaction(), PagerResult::Success);
 
     // The overwrite never made it to a durable journal, so the original page bytes should be restored
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(get_result.data[i], 'A');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_result.page->data.data()[i], 'A');
     }
 
     EXPECT_EQ(read_db_page(1), page_bytes);
@@ -768,8 +868,8 @@ TEST_F(PagerIntegrationTest, BeginWriteOnExistingPageRollbackRestoresOriginalByt
 
     PagerGetResult recovery_get_result = recovery_pager.get(1);
     ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(recovery_get_result.data[i], 'A');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.page->data.data()[i], 'A');
     }
 
 }
@@ -782,10 +882,10 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterExistingPageOverwrite) {
         Pager writer_pager;
         ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        PagerAllocateResult allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
-        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), original_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
@@ -793,7 +893,7 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterExistingPageOverwrite) {
         PagerGetResult get_result = writer_pager.get(1);
         ASSERT_EQ(get_result.status, PagerResult::Success);
         ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
-        std::memcpy(get_result.data, updated_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(get_result.page->data.data(), updated_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         EXPECT_TRUE(journal_exists());
@@ -820,8 +920,8 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterExistingPageOverwrite) {
 
     PagerGetResult recovery_get_result = recovery_pager.get(1);
     ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(recovery_get_result.data[i], 'A');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.page->data.data()[i], 'A');
     }
 }
 
@@ -829,12 +929,12 @@ TEST_F(PagerIntegrationTest, FreePageRollbackRestoresFreelistState) {
     Pager pager;
     ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-    PagerAllocateResult allocate_result = pager.allocate_page();
+    PagerAllocateResult allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(allocate_result.status, PagerResult::Success);
     ASSERT_EQ(allocate_result.page_num, 1);
 
     auto page_bytes = make_filled_page('C');
-    std::memcpy(allocate_result.data, page_bytes.data(), PAGE_SIZE);
+    std::memcpy(allocate_result.page->data.data(), page_bytes.data(), PAGE_SIZE);
 
     ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
     ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
@@ -859,8 +959,8 @@ TEST_F(PagerIntegrationTest, FreePageRollbackRestoresFreelistState) {
 
     PagerGetResult get_result = pager.get(1);
     ASSERT_EQ(get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(get_result.data[i], 'C');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(get_result.page->data.data()[i], 'C');
     }
     EXPECT_EQ(read_db_page(1), page_bytes);
 
@@ -869,8 +969,8 @@ TEST_F(PagerIntegrationTest, FreePageRollbackRestoresFreelistState) {
 
     PagerGetResult recovery_get_result = recovery_pager.get(1);
     ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(recovery_get_result.data[i], 'C');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.page->data.data()[i], 'C');
     }
 }
 
@@ -882,10 +982,10 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreelistPageReuse) {
         Pager pager;
         ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = pager.allocate_page();
+        PagerAllocateResult allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
-        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), original_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
@@ -905,10 +1005,10 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreelistPageReuse) {
         Pager writer_pager;
         ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult reuse_result = writer_pager.allocate_page();
+        PagerAllocateResult reuse_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(reuse_result.status, PagerResult::Success);
         ASSERT_EQ(reuse_result.page_num, 1);
-        std::memcpy(reuse_result.data, reused_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(reuse_result.page->data.data(), reused_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         EXPECT_TRUE(journal_exists());
@@ -931,12 +1031,11 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreelistPageReuse) {
     EXPECT_EQ(header.freelist_head_page_num, 1u);
     EXPECT_EQ(header.freelist_page_count, 1u);
 
-    PagerAllocateResult recovered_reuse_result = recovery_pager.allocate_page();
+    PagerAllocateResult recovered_reuse_result = recovery_pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(recovered_reuse_result.status, PagerResult::Success);
     EXPECT_EQ(recovered_reuse_result.page_num, 1);
 
-    std::array<char, PAGE_SIZE> zero_page{};
-    EXPECT_EQ(std::memcmp(recovered_reuse_result.data, zero_page.data(), PAGE_SIZE), 0);
+    expect_zero_payload(recovered_reuse_result.page);
 }
 
 TEST_F(PagerIntegrationTest, OpenRecoversHotJournalWithMultipleJournalSections) {
@@ -948,10 +1047,10 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalWithMultipleJournalSections) 
         Pager writer_pager;
         ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        PagerAllocateResult allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
-        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), original_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
@@ -960,14 +1059,14 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalWithMultipleJournalSections) 
         ASSERT_EQ(get_result.status, PagerResult::Success);
 
         ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
-        std::memcpy(get_result.data, first_update_bytes.data(), PAGE_SIZE);
+        std::memcpy(get_result.page->data.data(), first_update_bytes.data(), PAGE_SIZE);
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         EXPECT_TRUE(journal_exists());
         EXPECT_GT(journal_size(), 0u);
         EXPECT_EQ(read_db_page(1), first_update_bytes);
 
         ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
-        std::memcpy(get_result.data, second_update_bytes.data(), PAGE_SIZE);
+        std::memcpy(get_result.page->data.data(), second_update_bytes.data(), PAGE_SIZE);
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         EXPECT_EQ(read_db_page(1), second_update_bytes);
     }
@@ -991,8 +1090,8 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalWithMultipleJournalSections) 
 
     PagerGetResult recovery_get_result = recovery_pager.get(1);
     ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(recovery_get_result.data[i], 'A');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.page->data.data()[i], 'A');
     }
 }
 
@@ -1003,10 +1102,10 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreePage) {
         Pager writer_pager;
         ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult allocate_result = writer_pager.allocate_page();
+        PagerAllocateResult allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(allocate_result.status, PagerResult::Success);
         ASSERT_EQ(allocate_result.page_num, 1);
-        std::memcpy(allocate_result.data, original_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(allocate_result.page->data.data(), original_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
@@ -1043,27 +1142,27 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreePage) {
 
     PagerGetResult recovery_get_result = recovery_pager.get(1);
     ASSERT_EQ(recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(recovery_get_result.data[i], 'F');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(recovery_get_result.page->data.data()[i], 'F');
     }
 }
 
 TEST_F(PagerIntegrationTest, FreePageWithExistingFreelistRollbackRestoresLinks) {
     auto first_page_bytes = make_filled_page('G');
-    auto second_page_bytes = make_filled_page('H');
+    auto second_page_bytes = make_filled_page('H', 2);
 
     Pager pager;
     ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-    PagerAllocateResult first_allocate_result = pager.allocate_page();
+    PagerAllocateResult first_allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(first_allocate_result.status, PagerResult::Success);
     ASSERT_EQ(first_allocate_result.page_num, 1);
-    std::memcpy(first_allocate_result.data, first_page_bytes.data(), PAGE_SIZE);
+    std::memcpy(first_allocate_result.page->data.data(), first_page_bytes.data(), PAGE_SIZE);
 
-    PagerAllocateResult second_allocate_result = pager.allocate_page();
+    PagerAllocateResult second_allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(second_allocate_result.status, PagerResult::Success);
     ASSERT_EQ(second_allocate_result.page_num, 2);
-    std::memcpy(second_allocate_result.data, second_page_bytes.data(), PAGE_SIZE);
+    std::memcpy(second_allocate_result.page->data.data(), second_page_bytes.data(), PAGE_SIZE);
 
     ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
     ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
@@ -1091,36 +1190,35 @@ TEST_F(PagerIntegrationTest, FreePageWithExistingFreelistRollbackRestoresLinks) 
 
     PagerGetResult second_get_result = pager.get(2);
     ASSERT_EQ(second_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(second_get_result.data[i], 'H');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(second_get_result.page->data.data()[i], 'H');
     }
     EXPECT_EQ(read_db_page(2), second_page_bytes);
 
-    PagerAllocateResult reuse_result = pager.allocate_page();
+    PagerAllocateResult reuse_result = pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(reuse_result.status, PagerResult::Success);
     EXPECT_EQ(reuse_result.page_num, 1);
 
-    std::array<char, PAGE_SIZE> zero_page{};
-    EXPECT_EQ(std::memcmp(reuse_result.data, zero_page.data(), PAGE_SIZE), 0);
+    expect_zero_payload(reuse_result.page);
 }
 
 TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreePageWithExistingFreelist) {
     auto first_page_bytes = make_filled_page('I');
-    auto second_page_bytes = make_filled_page('J');
+    auto second_page_bytes = make_filled_page('J', 2);
 
     {
         Pager pager;
         ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult first_allocate_result = pager.allocate_page();
+        PagerAllocateResult first_allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(first_allocate_result.status, PagerResult::Success);
         ASSERT_EQ(first_allocate_result.page_num, 1);
-        std::memcpy(first_allocate_result.data, first_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(first_allocate_result.page->data.data(), first_page_bytes.data(), PAGE_SIZE);
 
-        PagerAllocateResult second_allocate_result = pager.allocate_page();
+        PagerAllocateResult second_allocate_result = pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(second_allocate_result.status, PagerResult::Success);
         ASSERT_EQ(second_allocate_result.page_num, 2);
-        std::memcpy(second_allocate_result.data, second_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(second_allocate_result.page->data.data(), second_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
@@ -1162,37 +1260,36 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterFreePageWithExistingFree
 
     PagerGetResult second_get_result = recovery_pager.get(2);
     ASSERT_EQ(second_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(second_get_result.data[i], 'J');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(second_get_result.page->data.data()[i], 'J');
     }
 
-    PagerAllocateResult reuse_result = recovery_pager.allocate_page();
+    PagerAllocateResult reuse_result = recovery_pager.allocate_page(V2PageKind::BTreeLeaf);
     ASSERT_EQ(reuse_result.status, PagerResult::Success);
     EXPECT_EQ(reuse_result.page_num, 1);
 
-    std::array<char, PAGE_SIZE> zero_page{};
-    EXPECT_EQ(std::memcmp(reuse_result.data, zero_page.data(), PAGE_SIZE), 0);
+    expect_zero_payload(reuse_result.page);
 }
 
 TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterMultiPageOverwrite) {
     auto first_original_page_bytes = make_filled_page('K');
-    auto second_original_page_bytes = make_filled_page('L');
+    auto second_original_page_bytes = make_filled_page('L', 2);
     auto first_updated_page_bytes = make_filled_page('M');
-    auto second_updated_page_bytes = make_filled_page('N');
+    auto second_updated_page_bytes = make_filled_page('N', 2);
 
     {
         Pager writer_pager;
         ASSERT_EQ(writer_pager.open(db_path.string()), PagerResult::Success);
 
-        PagerAllocateResult first_allocate_result = writer_pager.allocate_page();
+        PagerAllocateResult first_allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(first_allocate_result.status, PagerResult::Success);
         ASSERT_EQ(first_allocate_result.page_num, 1);
-        std::memcpy(first_allocate_result.data, first_original_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(first_allocate_result.page->data.data(), first_original_page_bytes.data(), PAGE_SIZE);
 
-        PagerAllocateResult second_allocate_result = writer_pager.allocate_page();
+        PagerAllocateResult second_allocate_result = writer_pager.allocate_page(V2PageKind::BTreeLeaf);
         ASSERT_EQ(second_allocate_result.status, PagerResult::Success);
         ASSERT_EQ(second_allocate_result.page_num, 2);
-        std::memcpy(second_allocate_result.data, second_original_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(second_allocate_result.page->data.data(), second_original_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         ASSERT_EQ(writer_pager.commit_phase_two(), PagerResult::Success);
@@ -1200,12 +1297,12 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterMultiPageOverwrite) {
         PagerGetResult first_get_result = writer_pager.get(1);
         ASSERT_EQ(first_get_result.status, PagerResult::Success);
         ASSERT_EQ(writer_pager.begin_write(1), PagerResult::Success);
-        std::memcpy(first_get_result.data, first_updated_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(first_get_result.page->data.data(), first_updated_page_bytes.data(), PAGE_SIZE);
 
         PagerGetResult second_get_result = writer_pager.get(2);
         ASSERT_EQ(second_get_result.status, PagerResult::Success);
         ASSERT_EQ(writer_pager.begin_write(2), PagerResult::Success);
-        std::memcpy(second_get_result.data, second_updated_page_bytes.data(), PAGE_SIZE);
+        std::memcpy(second_get_result.page->data.data(), second_updated_page_bytes.data(), PAGE_SIZE);
 
         ASSERT_EQ(writer_pager.commit_phase_one(), PagerResult::Success);
         EXPECT_TRUE(journal_exists());
@@ -1233,14 +1330,14 @@ TEST_F(PagerIntegrationTest, OpenRecoversHotJournalAfterMultiPageOverwrite) {
 
     PagerGetResult first_recovery_get_result = recovery_pager.get(1);
     ASSERT_EQ(first_recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(first_recovery_get_result.data[i], 'K');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(first_recovery_get_result.page->data.data()[i], 'K');
     }
 
     PagerGetResult second_recovery_get_result = recovery_pager.get(2);
     ASSERT_EQ(second_recovery_get_result.status, PagerResult::Success);
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        EXPECT_EQ(second_recovery_get_result.data[i], 'L');
+    for (std::size_t i = V2_PAGE_HEADER_SIZE; i < PAGE_SIZE; i++) {
+        EXPECT_EQ(second_recovery_get_result.page->data.data()[i], 'L');
     }
 }
 

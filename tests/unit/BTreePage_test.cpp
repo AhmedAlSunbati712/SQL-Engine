@@ -3,6 +3,8 @@
 #include <BTreePage.h>
 #include <Endian.h>
 #include <KeyCodec.h>
+#include <PageV2.h>
+#include <V2PageCodec.h>
 #include <ValueCodec.h>
 
 #include <array>
@@ -14,7 +16,11 @@
 
 namespace {
 
-constexpr std::size_t PAGE_SIZE = 4096;
+constexpr std::size_t PAGE_SIZE = V2_PAGE_SIZE;
+
+char *payload(std::array<char, PAGE_SIZE> &page) {
+    return page.data() + V2_PAGE_HEADER_SIZE;
+}
 
 Value make_value(ValueType type, const std::string &payload) {
     Value value{};
@@ -40,7 +46,8 @@ void write_leaf_cell(char *page, std::uint16_t cell_offset, const Key &key, Valu
 }
 
 void build_leaf_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &expected_keys) {
-    page.fill(0);
+    V2PageCodec::initialize(page, 1, V2PageKind::BTreeLeaf);
+    char *out = payload(page);
     Value false_char = make_value(ValueType::Char, "F");
     Value true_bool = ValueCodec::make_bool(true);
     Value negative_int = ValueCodec::make_varint(-5);
@@ -55,22 +62,22 @@ void build_leaf_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &expect
         KeyCodec::make_bytes(std::vector<char>{'z', '1'})
     };
 
-    put_u8_be(page.data(), static_cast<std::uint8_t>(PageType::Leaf));
-    put_u16_be(&page[1], 5);
-    put_u16_be(&page[3], 17);
-    put_u16_be(&page[5], 4030);
+    put_u8_be(out, static_cast<std::uint8_t>(PageType::Leaf));
+    put_u16_be(&out[1], 5);
+    put_u16_be(&out[3], 17);
+    put_u16_be(&out[5], 4006);
 
-    put_u16_be(&page[7], 4088);
-    put_u16_be(&page[9], 4073);
-    put_u16_be(&page[11], 4056);
-    put_u16_be(&page[13], 4044);
-    put_u16_be(&page[15], 4031);
+    put_u16_be(&out[7], 4064);
+    put_u16_be(&out[9], 4049);
+    put_u16_be(&out[11], 4032);
+    put_u16_be(&out[13], 4020);
+    put_u16_be(&out[15], 4007);
 
-    write_leaf_cell(page.data(), 4088, expected_keys[0], false_char.type, false_char.data.data(), false_char.size);
-    write_leaf_cell(page.data(), 4073, expected_keys[1], true_bool.type, true_bool.data.data(), true_bool.size);
-    write_leaf_cell(page.data(), 4056, expected_keys[2], negative_int.type, negative_int.data.data(), negative_int.size);
-    write_leaf_cell(page.data(), 4044, expected_keys[3], cat_value.type, cat_value.data.data(), cat_value.size);
-    write_leaf_cell(page.data(), 4031, expected_keys[4], bytes_value.type, bytes_value.data.data(), bytes_value.size);
+    write_leaf_cell(out, 4064, expected_keys[0], false_char.type, false_char.data.data(), false_char.size);
+    write_leaf_cell(out, 4049, expected_keys[1], true_bool.type, true_bool.data.data(), true_bool.size);
+    write_leaf_cell(out, 4032, expected_keys[2], negative_int.type, negative_int.data.data(), negative_int.size);
+    write_leaf_cell(out, 4020, expected_keys[3], cat_value.type, cat_value.data.data(), cat_value.size);
+    write_leaf_cell(out, 4007, expected_keys[4], bytes_value.type, bytes_value.data.data(), bytes_value.size);
 }
 
 void write_internal_cell(char *page, std::uint16_t cell_offset, const Key &key, std::uint32_t right_child_page_num) {
@@ -79,7 +86,8 @@ void write_internal_cell(char *page, std::uint16_t cell_offset, const Key &key, 
 }
 
 void build_internal_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &expected_keys) {
-    page.fill(0);
+    V2PageCodec::initialize(page, 1, V2PageKind::BTreeInternal);
+    char *out = payload(page);
 
     expected_keys = {
         KeyCodec::make_bool(false),
@@ -87,19 +95,19 @@ void build_internal_page(std::array<char, PAGE_SIZE> &page, std::vector<Key> &ex
         KeyCodec::make_string("cat")
     };
 
-    put_u8_be(page.data(), static_cast<std::uint8_t>(PageType::Internal));
-    put_u16_be(&page[1], 3);
-    put_u16_be(&page[3], 17);
-    put_u16_be(&page[5], 4062);
-    put_u32_be(&page[7], 11);
+    put_u8_be(out, static_cast<std::uint8_t>(PageType::Internal));
+    put_u16_be(&out[1], 3);
+    put_u16_be(&out[3], 17);
+    put_u16_be(&out[5], 4038);
+    put_u32_be(&out[7], 11);
 
-    put_u16_be(&page[11], 4088);
-    put_u16_be(&page[13], 4073);
-    put_u16_be(&page[15], 4063);
+    put_u16_be(&out[11], 4064);
+    put_u16_be(&out[13], 4049);
+    put_u16_be(&out[15], 4039);
 
-    write_internal_cell(page.data(), 4088, expected_keys[0], 22);
-    write_internal_cell(page.data(), 4073, expected_keys[1], 33);
-    write_internal_cell(page.data(), 4063, expected_keys[2], 44);
+    write_internal_cell(out, 4064, expected_keys[0], 22);
+    write_internal_cell(out, 4049, expected_keys[1], 33);
+    write_internal_cell(out, 4039, expected_keys[2], 44);
 }
 
 void expect_key_equals(const Key &actual, const Key &expected) {

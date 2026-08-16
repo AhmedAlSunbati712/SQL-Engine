@@ -4,8 +4,9 @@
 #include <cstdint>
 #include <ios>
 #include <Endian.h>
+#include <PageV2.h>
 
-#define PAGE_SIZE 4096
+inline constexpr std::size_t PAGE_SIZE = V2_PAGE_SIZE;
 constexpr std::size_t DB_HEADER_SIZE = 36;
 
 constexpr std::streamoff align_to_page_boundary(std::streamoff offset) {
@@ -13,17 +14,9 @@ constexpr std::streamoff align_to_page_boundary(std::streamoff offset) {
 }
 static const char DBHeader_magic_string[16] = {0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00};
 
-struct Page {
-    char data[4096];
-    int page_num;
-    int refs_num;
-    bool is_dirty;
-    bool need_flushing;
-};
-
 struct DirtyPageEntry {
             char *backup_image = nullptr;
-            Page *page = nullptr;
+            PageV2 *page = nullptr;
 };
 
 
