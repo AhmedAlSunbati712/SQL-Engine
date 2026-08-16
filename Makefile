@@ -31,6 +31,7 @@ SRC = \
 	src/TransactionManager/WaitForGraph.cpp \
 	src/LockMgr.cpp \
 	src/LockManager/LockManager.cpp \
+	src/PageLatchManager.cpp \
 	src/PCache.cpp \
 	src/Pager.cpp \
 	src/disk/DiskIO.cpp \
@@ -65,6 +66,7 @@ OBJ = \
 	build/TransactionManager/WaitForGraph.o \
 	build/LockMgr.o \
 	build/LockManager/LockManager.o \
+	build/PageLatchManager.o \
 	build/PCache.o \
 	build/Pager.o \
 	build/disk/DiskIO.o \
