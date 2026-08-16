@@ -157,17 +157,17 @@ needs that page.
 ### B+ Tree Operation
 
 Every public B+ tree call creates a `BTreeOperation`. It carries the transaction
-ID for diagnostics and owns every pager reference and latch retained by that
-call:
+ID for diagnostics and owns logical page latches, but never pager references or
+frame pointers:
 
 ```cpp
 class BTreeOperation {
 public:
-    BTreeOperation(TransactionId txn_id, Pager& pager);
+    BTreeOperation(TransactionId txn_id, PageLatchManager& latch_manager);
     ~BTreeOperation();
 
-    PageV2* lock_shared(PageV2* pinned_page);
-    PageV2* lock_exclusive(PageV2* pinned_page);
+    void lock_shared(std::uint32_t page_num);
+    void lock_exclusive(std::uint32_t page_num);
 
     void release(std::uint32_t page_num);
     void release_all();
@@ -175,24 +175,22 @@ public:
 
 private:
     TransactionId txn_id_;
-    Pager& pager_;
-    std::vector<HeldPage> held_pages_;
-    std::unordered_map<std::uint32_t, PageLatchMode> held_modes_;
+    PageLatchManager& latch_manager_;
+    std::unordered_map<std::uint32_t, HeldPageLatch> held_latches_;
 };
 ```
 
-`PageV2` contains one `std::shared_mutex latch`. `BTreeOperation` stores either
-a `std::shared_lock` or `std::unique_lock` for every held page. The transaction
-does not own these locks. Destroying the operation releases every remaining
-latch and then calls `Pager::unref_page()` even when traversal, allocation, WAL
-construction, or page modification throws. Holding a latch without the pager
-reference is invalid because the cached `PageV2` could otherwise be evicted.
-Transaction IDs are not part of latch compatibility and there is no latch
-wait-for graph.
+`PageLatchManager` stores weak references to shared latch states in 64 shards.
+The move-only read and write guards retain the live state while waiting and
+while held; the shard mutex is released before the wait. `PageV2` contains no
+latch. The transaction does not own these guards, and destroying the operation
+releases every remaining logical latch. The B+ tree explicitly balances Pager
+references, may unreference a frame while retaining its page-number latch, and
+must never reuse a `PageV2*` after unreferencing it. Transaction IDs are not part
+of latch compatibility and there is no latch wait-for graph.
 
-The small `held_modes_` index makes inspection of the latch mode held for a
-page an average `O(1)` lookup. The vector remains authoritative for guard
-ownership and reverse-order release.
+The `held_latches_` map makes inspection of the latch mode held for a page an
+average `O(1)` lookup and owns the guards themselves.
 
 ### Global Acquisition Order
 

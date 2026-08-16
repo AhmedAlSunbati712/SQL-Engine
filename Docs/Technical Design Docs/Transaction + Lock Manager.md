@@ -78,11 +78,11 @@ The responsibilities are divided as follows:
 ### Operation-Scoped Page Latches
 
 Transactions own logical key locks, but they do not own page latches. Each B+
-tree call creates a `BTreeOperation` containing its transaction ID and the
-shared or exclusive locks acquired from pinned `PageV2` objects. `PageV2`
-stores one `std::shared_mutex`; no separate page-latch table or manager is
-needed. The operation releases every remaining latch and pager reference on
-normal return or stack unwinding, always unlocking before unreferencing.
+tree call creates a `BTreeOperation` containing its transaction ID and logical
+page latches acquired by page number from a sharded `PageLatchManager`.
+`PageV2` stores no latch. The operation owns no pins or frame pointers, so the
+B+ tree explicitly unreferences frames during traversal while retaining any
+ancestor latch needed for later propagation.
 
 The B+ tree prevents latch cycles with one global order: header before root,
 parent before child, and a consistent sibling order. Code never reacquires an
@@ -194,10 +194,12 @@ a non-owning `Transaction &` obtained from that handle.
 
 The manager receives the WAL, logical-lock manager, and a logical-undo
 executor as non-owning references. The undo executor applies one stored
-logical inverse through the B+ tree and returns the resulting physical page
-effects; the transaction manager uses those effects to append the CLR. This
-keeps transaction lifecycle and WAL chaining in the manager without making it
-implement B+ tree operations itself.
+logical inverse through the B+ tree and receives a one-shot compensation
+callback from TransactionManager. It invokes that callback with the physical
+effects while its `BTreeOperation` still owns all relevant page latches, then
+installs the returned CLR LSN before releasing them. This keeps transaction
+lifecycle and WAL chaining in the manager without making it implement B+ tree
+operations itself.
 
 ## Transaction Context
 
