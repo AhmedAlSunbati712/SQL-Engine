@@ -225,12 +225,11 @@ S(header)
     -> release header
 ```
 
-The simple first write path takes `X(header)` followed by `X(root)`. It may
-release the header once the operation reaches a child that is safe and can no
-longer propagate a split, merge, or root replacement to the header. A later
-optimization may start optimistically and restart with `X(header)` only when a
-root structural change is required. It must not upgrade the header latch while
-retaining a shared latch.
+The write path takes `X(header)` followed by `X(root)`. During an optimistic
+pass it releases ancestors as soon as the newly latched child is safe. If the
+target leaf is unsafe, the pass makes no change, releases every latch, and
+restarts from the header in pessimistic mode. It never reacquires the header
+while retaining a descendant latch.
 
 ### Point Reads
 
@@ -249,19 +248,28 @@ returns. The logical `S(key)` lock remains held until transaction completion.
 
 ### Put and Delete
 
-`put` and `delete` acquire `X(key)` before entering the tree. The simple first
-implementation descends with exclusive latch crabbing. After latching a child,
-it releases all unnecessary ancestors only when that child is safe:
+`put` and `delete` acquire `X(key)` before entering the tree. They first descend
+with optimistic exclusive latch crabbing. After latching a child, the operation
+releases all unnecessary ancestors when that child is safe:
 
-- For insertion, the child is safe when the new encoded entry cannot make it
-  overflow.
-- For deletion, the child is safe when removing the entry cannot make it
-  underflow. The root follows its special occupancy rules.
+- For insertion, an internal child is safe below maximum key capacity. A leaf
+  is safe when the key already exists or one more key fits under the current
+  key-count limit.
+- For deletion, an internal child is safe when it is above minimum occupancy
+  and the target key is not below its first separator. A leaf is safe when the
+  key is absent, or when deleting it cannot underflow the leaf and does not
+  remove its first key. The root follows its special occupancy rules.
 
-Unsafe ancestors remain pinned and exclusively latched so a split, merge,
-redistribution, separator update, or root replacement can propagate upward
-without reacquiring an ancestor. Every retained latch is released when the
-operation ends; only the logical `X(key)` lock survives until commit or abort.
+If the optimistic pass reaches an unsafe target leaf, it has not mutated any
+page. It unreferences the leaf, releases every page latch, and restarts from the
+header in pessimistic mode. The pessimistic pass retains the logical latches
+needed for split, merge, redistribution, separator update, or root replacement.
+Frames may still be unreferenced during traversal because logical page latches
+are keyed by page number and outlive cache frames. Retained pages are reloaded
+by number when propagation needs them.
+
+The current safety check is deliberately key-count based. Byte-capacity safety
+for variable-sized entries remains future work.
 
 ### Range Scans Without Leaf Links
 
