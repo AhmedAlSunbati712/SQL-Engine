@@ -331,12 +331,25 @@ BTreeStatus BTree::insert_impl(
         }
         return BTreeStatus::Success;
     };
-    LeafDescentResult descent_result = descend_from_root_to_leaf(
-        key,
-        true,
-        &operation,
-        PageLatchMode::Exclusive,
-        BTreeMutationType::Insert);
+    BTreeTraversalMode traversal_mode = BTreeTraversalMode::Optimistic;
+    LeafDescentResult descent_result{};
+    for (;;) {
+        descent_result = descend_from_root_to_leaf(
+            key,
+            true,
+            &operation,
+            PageLatchMode::Exclusive,
+            BTreeMutationType::Insert,
+            traversal_mode);
+
+        if (!descent_result.requires_pessimistic_restart) break;
+
+        // The optimistic pass has not modified the leaf. Drop its frame and
+        // every latch before restarting from page zero in top-down order.
+        pager->unref_page(descent_result.leaf_page_num);
+        operation.release_all();
+        traversal_mode = BTreeTraversalMode::Pessimistic;
+    }
     if (descent_result.status == BTreeStatus::EmptyTree) {
         PagerAllocateResult allocation_result = pager->allocate_page(
             operation,
@@ -733,7 +746,8 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
     bool include_path,
     BTreeOperation *operation,
     PageLatchMode latch_mode,
-    BTreeMutationType mutation_type
+    BTreeMutationType mutation_type,
+    BTreeTraversalMode traversal_mode
 ) {
     LeafDescentResult descent_result{};
 
@@ -789,12 +803,19 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
         if (
             operation &&
             latch_mode == PageLatchMode::Exclusive &&
-            mutation_type == BTreeMutationType::Insert
+            mutation_type == BTreeMutationType::Insert &&
+            traversal_mode == BTreeTraversalMode::Optimistic
         ) {
             BLeafPage root_page(root_get_result.page->data.data());
-            if (root_page.get_key_count() < MAX_KEYS(BTREE_ORDER)) {
+            const std::size_t key_idx = root_page.lower_bound_key(key);
+            const std::optional<Key> existing_key = root_page.key_at(key_idx);
+            const bool key_exists =
+                existing_key && KeyCodec::equal(*existing_key, key);
+            if (key_exists || root_page.get_key_count() < MAX_KEYS(BTREE_ORDER)) {
                 operation->release_all_exclusive_except(
                     root_get_result.root_page_num);
+            } else {
+                descent_result.requires_pessimistic_restart = true;
             }
         } else if (
             operation &&
@@ -817,6 +838,22 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
         descent_result.leaf_page = root_get_result.page->data.data();
         descent_result.leaf_page_num = root_get_result.root_page_num;
         return descent_result;
+    }
+
+    // If this internal root can absorb one separator, changes below it cannot
+    // propagate into page zero. An unsafe leaf will still restart before it is
+    // modified, so this optimistic release never reacquires page zero upward.
+    if (
+        operation &&
+        latch_mode == PageLatchMode::Exclusive &&
+        mutation_type == BTreeMutationType::Insert &&
+        traversal_mode == BTreeTraversalMode::Optimistic
+    ) {
+        BInternalPage root_page(root_get_result.page->data.data());
+        if (root_page.get_key_count() < MAX_KEYS(BTREE_ORDER)) {
+            operation->release_all_exclusive_except(
+                root_get_result.root_page_num);
+        }
     }
 
     // Otherwise, keep on descending downwards until we hit a leaf
@@ -870,16 +907,35 @@ LeafDescentResult BTree::descend_from_root_to_leaf(
         PageType child_page_type = BTreePage::peek_page_type(
             pager_get_result.page->data.data());
 
-        // At a leaf we can prove that this insert cannot split anywhere, so
-        // neither tree ancestors nor page-zero allocation metadata are needed.
+        // Optimistic insertion releases ancestors as soon as a child can stop
+        // split propagation. A full target leaf is never modified in this pass;
+        // it signals the caller to restart pessimistically from page zero.
         if (
             operation &&
             latch_mode == PageLatchMode::Exclusive &&
             mutation_type == BTreeMutationType::Insert &&
-            child_page_type == PageType::Leaf
+            traversal_mode == BTreeTraversalMode::Optimistic
         ) {
-            BLeafPage child_page(pager_get_result.page->data.data());
-            if (child_page.get_key_count() < MAX_KEYS(BTREE_ORDER)) {
+            bool child_is_safe = false;
+            if (child_page_type == PageType::Leaf) {
+                BLeafPage child_page(pager_get_result.page->data.data());
+                const std::size_t key_idx = child_page.lower_bound_key(key);
+                const std::optional<Key> existing_key = child_page.key_at(key_idx);
+                const bool key_exists =
+                    existing_key && KeyCodec::equal(*existing_key, key);
+                child_is_safe =
+                    key_exists ||
+                    child_page.get_key_count() < MAX_KEYS(BTREE_ORDER);
+                if (!child_is_safe) {
+                    descent_result.requires_pessimistic_restart = true;
+                }
+            } else {
+                BInternalPage child_page(pager_get_result.page->data.data());
+                child_is_safe =
+                    child_page.get_key_count() < MAX_KEYS(BTREE_ORDER);
+            }
+
+            if (child_is_safe) {
                 operation->release_all_exclusive_except(
                     *target_child_page_num);
             }

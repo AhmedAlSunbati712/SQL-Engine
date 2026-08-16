@@ -49,6 +49,11 @@ enum class BTreeMutationType : std::uint8_t {
     Remove,
 };
 
+enum class BTreeTraversalMode : std::uint8_t {
+    Optimistic = 0,
+    Pessimistic,
+};
+
 struct BTreeGetStatus {
     BTreeStatus status;
     Value value;
@@ -70,6 +75,7 @@ struct LeafDescentResult {
     char *leaf_page = nullptr;
     std::uint32_t leaf_page_num = 0;
     std::vector<TraversalPathEntry> path;
+    bool requires_pessimistic_restart = false;
 };
 
 class BTreeCursor;
@@ -119,7 +125,8 @@ class BTree {
             bool include_path,
             BTreeOperation *operation = nullptr,
             PageLatchMode latch_mode = PageLatchMode::Shared,
-            BTreeMutationType mutation_type = BTreeMutationType::None);
+            BTreeMutationType mutation_type = BTreeMutationType::None,
+            BTreeTraversalMode traversal_mode = BTreeTraversalMode::Optimistic);
         struct MergeParentContext {
             std::uint32_t parent_page_num;
             std::size_t child_idx;
