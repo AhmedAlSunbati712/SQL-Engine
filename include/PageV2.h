@@ -3,7 +3,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <shared_mutex>
 
 /// Exact byte size of every persistent V2 database page.
 inline constexpr std::size_t V2_PAGE_SIZE = 4096;
@@ -45,11 +44,8 @@ struct PageV2 {
     std::uint32_t page_num = 0;
     std::uint32_t refs_num = 0;
     bool is_dirty = false;
+    bool wal_pending = false;
     bool need_flushing = false;
-
-    // Protects the in-memory page bytes for one short B+ tree operation.
-    // The page remains pinned while a shared or exclusive latch is held.
-    std::shared_mutex latch;
 };
 
 static_assert(V2_PAGE_HEADER_SIZE == 24);

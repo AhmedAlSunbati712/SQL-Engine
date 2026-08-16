@@ -5,6 +5,7 @@
 #include <Pager.h>
 #include <JournalCodec.h>
 #include <V2PageCodec.h>
+#include <containers/BTreeOperation.h>
 
 #include <array>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <string>
 #include <system_error>
 
@@ -167,6 +169,74 @@ TEST_F(PagerIntegrationTest, OpenCreatesNewDatabaseWithHeaderPage) {
     PagerGetResult get_result = pager.get(1);
     EXPECT_EQ(get_result.status, PagerResult::PageOutOfRange);
     EXPECT_EQ(get_result.page, nullptr);
+}
+
+TEST_F(PagerIntegrationTest, OperationAwareAllocationRetainsLatchesAndReturnsEffects) {
+    Pager pager;
+    ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+
+    BTreeOperation operation(1, pager.page_latch_manager());
+    PagerAllocateResult allocation = pager.allocate_page(
+        operation,
+        V2PageKind::BTreeLeaf);
+
+    ASSERT_EQ(allocation.status, PagerResult::Success);
+    ASSERT_EQ(allocation.page_num, 1);
+    ASSERT_EQ(allocation.effects.size(), 2U);
+    EXPECT_EQ(allocation.effects[0].kind, PageEffectKind::Write);
+    EXPECT_EQ(allocation.effects[0].page_num, 0U);
+    EXPECT_EQ(allocation.effects[1].kind, PageEffectKind::Allocate);
+    EXPECT_EQ(allocation.effects[1].page_num, 1U);
+    EXPECT_EQ(allocation.effects[1].after_image, allocation.page->data);
+
+    EXPECT_EQ(operation.latch_mode(0), PageLatchMode::Exclusive);
+    EXPECT_EQ(operation.latch_mode(1), PageLatchMode::Exclusive);
+    ASSERT_EQ(pager.unref_page(1), PagerResult::Success);
+
+    std::future<PageReadLatch> blocked_reader = std::async(
+        std::launch::async,
+        [&] { return pager.page_latch_manager().lock_shared(1); });
+    EXPECT_EQ(blocked_reader.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+
+    operation.release_all();
+    EXPECT_EQ(blocked_reader.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_TRUE(blocked_reader.get().owns_lock());
+    EXPECT_EQ(pager.rollback_transaction(), PagerResult::Success);
+}
+
+TEST_F(PagerIntegrationTest, OperationAwareFreeReturnsEveryChangedPage) {
+    Pager pager;
+    ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
+
+    PagerAllocateResult first = pager.allocate_page(V2PageKind::BTreeLeaf);
+    PagerAllocateResult second = pager.allocate_page(V2PageKind::BTreeLeaf);
+    ASSERT_EQ(first.status, PagerResult::Success);
+    ASSERT_EQ(second.status, PagerResult::Success);
+    ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+    ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+    ASSERT_EQ(pager.unref_page(1), PagerResult::Success);
+    ASSERT_EQ(pager.unref_page(2), PagerResult::Success);
+    ASSERT_EQ(pager.free_page(1), PagerResult::Success);
+    ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
+    ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
+
+    BTreeOperation operation(2, pager.page_latch_manager());
+    PagerMutationResult freed = pager.free_page(operation, 2);
+
+    ASSERT_EQ(freed.status, PagerResult::Success);
+    ASSERT_EQ(freed.effects.size(), 3U);
+    EXPECT_EQ(freed.effects[0].page_num, 0U);
+    EXPECT_EQ(freed.effects[0].kind, PageEffectKind::Write);
+    EXPECT_EQ(freed.effects[1].page_num, 1U);
+    EXPECT_EQ(freed.effects[1].kind, PageEffectKind::Write);
+    EXPECT_EQ(freed.effects[2].page_num, 2U);
+    EXPECT_EQ(freed.effects[2].kind, PageEffectKind::Free);
+
+    EXPECT_EQ(operation.latch_mode(0), PageLatchMode::Exclusive);
+    EXPECT_EQ(operation.latch_mode(1), PageLatchMode::Exclusive);
+    EXPECT_EQ(operation.latch_mode(2), PageLatchMode::Exclusive);
+    operation.release_all();
+    EXPECT_EQ(pager.rollback_transaction(), PagerResult::Success);
 }
 
 TEST_F(PagerIntegrationTest, AllocatePageAppendsAndCommitExtendsDatabase) {

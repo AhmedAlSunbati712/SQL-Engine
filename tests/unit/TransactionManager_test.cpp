@@ -57,16 +57,18 @@ PageEffect effect(std::uint32_t page_num, char marker) {
 
 class RecordingUndoExecutor final : public TransactionUndoExecutor {
 public:
-    std::vector<PageEffect> undo(
+    void undo(
         Transaction& transaction,
-        const UndoDescriptor& undo) override {
+        const UndoDescriptor& undo,
+        CompensationAppender append_compensation) override {
         transaction_ids.push_back(transaction.id());
         undos.push_back(undo);
-        return {effect(9, 'u')};
+        compensation_lsns.push_back(append_compensation({effect(9, 'u')}));
     }
 
     std::vector<TransactionId> transaction_ids;
     std::vector<UndoDescriptor> undos;
+    std::vector<Lsn> compensation_lsns;
 };
 
 struct ManagerFixture {
@@ -160,6 +162,7 @@ TEST(TransactionManagerTest, AbortUndoesActionsAndChainsCompensationRecord) {
     ASSERT_EQ(fixture.undo_executor.transaction_ids.size(), 1u);
     EXPECT_EQ(fixture.undo_executor.transaction_ids[0], transaction->id());
     EXPECT_TRUE(std::holds_alternative<InsertUndo>(fixture.undo_executor.undos[0]));
+    ASSERT_EQ(fixture.undo_executor.compensation_lsns.size(), 1u);
 
     const std::vector<WalRecord> records = fixture.log.scan();
     ASSERT_EQ(records.size(), 5u);

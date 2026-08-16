@@ -13,6 +13,7 @@ public:
     void set_undo(UndoDescriptor undo);
     void add_effect(PageEffect effect);
     PendingWalRecord build() const;
+    const std::vector<PageEffect>& effects() const noexcept { return effects_; }
 
 private:
     std::uint64_t transaction_id_;

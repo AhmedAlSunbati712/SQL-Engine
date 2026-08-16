@@ -156,13 +156,35 @@ AbortStatus TransactionManager::abort(const TransactionHandle& transaction, Abor
         }
 
         const auto payload = std::get<BTreeActionPayload>(WalRecords::decode(record));
-        std::vector<PageEffect> effects = undo_executor_.undo(*transaction, payload.undo);
-        const CompensationPayload compensation{
-            .undo_of_lsn = record.lsn,
-            .undo_next_lsn = record.prev_lsn,
-            .effects = std::move(effects),
+        bool compensation_appended = false;
+
+        // The undo executor invokes this while it still owns every page latch
+        // protecting the inverse's physical changes. The callback is one-shot
+        // so one logical inverse can enter the WAL chain only once.
+        auto append_compensation = [&](std::vector<PageEffect> effects) -> Lsn {
+            if (compensation_appended) {
+                throw std::logic_error("Compensation callback invoked more than once");
+            }
+            const CompensationPayload compensation{
+                .undo_of_lsn = record.lsn,
+                .undo_next_lsn = record.prev_lsn,
+                .effects = std::move(effects),
+            };
+            transaction->last_lsn_ = log_.append(WalRecords::compensation(
+                transaction->id_,
+                transaction->last_lsn_,
+                compensation));
+            compensation_appended = true;
+            return transaction->last_lsn_;
         };
-        transaction->last_lsn_ = log_.append(WalRecords::compensation(transaction->id_, transaction->last_lsn_, compensation));
+
+        undo_executor_.undo(
+            *transaction,
+            payload.undo,
+            append_compensation);
+        if (!compensation_appended) {
+            throw std::runtime_error("Undo completed without appending compensation");
+        }
         undo_lsn = record.prev_lsn;
     }
 

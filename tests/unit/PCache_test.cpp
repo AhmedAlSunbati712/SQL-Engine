@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 #include <PCache.h>
 
+#include <future>
+#include <vector>
+
 namespace {
 
 PageV2 *make_page(int page_num, int refs_num = 0, bool is_dirty = false, bool need_flushing = false) {
@@ -186,6 +189,23 @@ TEST(PCacheTest, PutReturnsDirtyFlushWhenOnlyVictimIsDirtyAndNeedsFlushing) {
     delete new_page;
 }
 
+TEST(PCacheTest, PutRejectsWalPendingVictim) {
+    PCache cache(1);
+    PageV2 *page = make_page(1, 0, true, true);
+    page->wal_pending = true;
+    PageV2 *new_page = make_page(2);
+
+    EXPECT_EQ(cache.put(page).status, PCacheResult::Success);
+
+    PCachePutResult put_result = cache.put(new_page);
+
+    EXPECT_EQ(put_result.status, PCacheResult::WalPending);
+    EXPECT_EQ(cache.get(1), page);
+    EXPECT_EQ(cache.get(2), nullptr);
+
+    delete new_page;
+}
+
 TEST(PCacheTest, PutEvictsDirtyPageWhenVictimDoesNotNeedFlushing) {
     PCache cache(1);
     PageV2 *page = make_page(1, 0, true, false);
@@ -221,6 +241,27 @@ TEST(PCacheTest, PutPrefersCleanVictimOverDirtyVictim) {
     EXPECT_EQ(cache.get(1), dirty_page);
     EXPECT_EQ(cache.get(2), nullptr);
     EXPECT_EQ(cache.get(3), new_page);
+}
+
+TEST(PCacheTest, ConcurrentPutsKeepMetadataConsistent) {
+    PCache cache(64);
+    std::vector<std::future<PCacheResult>> puts;
+
+    for (int page_num = 1; page_num <= 32; page_num++) {
+        puts.push_back(std::async(std::launch::async, [&, page_num] {
+            return cache.put(make_page(page_num)).status;
+        }));
+    }
+
+    for (std::future<PCacheResult>& put : puts) {
+        EXPECT_EQ(put.get(), PCacheResult::Success);
+    }
+    EXPECT_EQ(cache.len(), 32);
+    EXPECT_EQ(cache.unpinned_len(), 32);
+
+    for (int page_num = 1; page_num <= 32; page_num++) {
+        EXPECT_NE(cache.get(page_num), nullptr);
+    }
 }
 
 } // namespace

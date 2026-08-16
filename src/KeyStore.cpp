@@ -1,10 +1,13 @@
 #include <KeyStore.h>
 
 #include <KeyCodec.h>
+#include <LockManager/LockManager.h>
+#include <Log/PendingBTreeAction.h>
 #include <ValueCodec.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 /**
@@ -193,6 +196,28 @@ KeyStoreCursorStatus KeyStoreCursor::translate_cursor_status(
 
 KeyStore::KeyStore(KeyStoreOptions options) : options(options) {}
 
+void KeyStore::attach_transaction_manager(
+    TransactionManager &manager
+) noexcept {
+    transaction_manager = &manager;
+    tree.attach_transaction_manager(manager);
+}
+
+void KeyStore::undo(
+    Transaction &transaction,
+    const UndoDescriptor &undo,
+    CompensationAppender append_compensation
+) {
+    // BTree invokes the callback before its operation object releases the
+    // logical page latches protecting the inverse and its physical effects.
+    if (!tree.apply_undo(
+            transaction,
+            undo,
+            std::move(append_compensation))) {
+        throw std::runtime_error("Failed to apply logical transaction undo");
+    }
+}
+
 KeyStore::~KeyStore() {
     /**
      * Destruction is the last-resort cleanup path and cannot return a status.
@@ -302,6 +327,62 @@ KeyStoreGetResult KeyStore::get(const Key &key) {
     return result;
 }
 
+KeyStoreGetResult KeyStore::get(
+    const TransactionHandle &transaction,
+    const Key &key
+) {
+    KeyStoreGetResult result{};
+    if (!is_open) {
+        result.status = KeyStoreStatus::NotOpen;
+        return result;
+    }
+    if (!transaction_manager || !transaction) {
+        result.status = KeyStoreStatus::TransactionNotFound;
+        return result;
+    }
+    if (!KeyCodec::validate_key(key)) {
+        result.status = KeyStoreStatus::InvalidKey;
+        return result;
+    }
+
+    // Logical locks are always acquired before entering the B-tree and taking
+    // any page latch. A lock already owned by this transaction is reusable.
+    LockManagerStatus lock_status = transaction_manager->lock_manager().lock_shared(
+        transaction->id(),
+        key);
+    if (lock_status == LockManagerStatus::Deadlock) {
+        result.status = KeyStoreStatus::Deadlock;
+        return result;
+    }
+    if (lock_status == LockManagerStatus::TransactionNotFound) {
+        result.status = KeyStoreStatus::TransactionNotFound;
+        return result;
+    }
+    if (lock_status != LockManagerStatus::Success &&
+        lock_status != LockManagerStatus::TxnHoldsShared &&
+        lock_status != LockManagerStatus::TxnHoldsExclusive) {
+        result.status = KeyStoreStatus::ReadFailed;
+        return result;
+    }
+
+    BTreeGetStatus get_result = tree.get(key);
+    if (get_result.status == BTreeStatus::KeyNotInTree) {
+        result.status = KeyStoreStatus::KeyNotFound;
+        return result;
+    }
+    if (get_result.status != BTreeStatus::Success) {
+        result.status = KeyStoreStatus::ReadFailed;
+        return result;
+    }
+    if (!ValueCodec::validate_value(get_result.value)) {
+        result.status = KeyStoreStatus::DecodeFailed;
+        return result;
+    }
+
+    result.value = std::move(get_result.value);
+    return result;
+}
+
 KeyStoreStatus KeyStore::put(
     const Key &key,
     const Value &value
@@ -340,6 +421,55 @@ KeyStoreStatus KeyStore::put(
     }
 
     return finish_autocommit_write(write_status);
+}
+
+KeyStoreStatus KeyStore::put(
+    const TransactionHandle &transaction,
+    const Key &key,
+    const Value &value
+) {
+    if (!is_open) return KeyStoreStatus::NotOpen;
+    if (!transaction_manager || !transaction) return KeyStoreStatus::TransactionNotFound;
+    if (!KeyCodec::validate_key(key)) return KeyStoreStatus::InvalidKey;
+    if (!ValueCodec::validate_value(value)) return KeyStoreStatus::InvalidValue;
+
+    // Writers take the exclusive logical key lock immediately. This avoids a
+    // read-then-promote cycle inside KeyStore while still allowing replacement
+    // undo to read the old value under the exclusive lock.
+    LockManagerStatus lock_status = transaction_manager->lock_manager().lock_exclusive(
+        transaction->id(),
+        key);
+    if (lock_status == LockManagerStatus::Deadlock) return KeyStoreStatus::Deadlock;
+    if (lock_status == LockManagerStatus::TransactionNotFound) {
+        return KeyStoreStatus::TransactionNotFound;
+    }
+    if (lock_status != LockManagerStatus::Success &&
+        lock_status != LockManagerStatus::TxnHoldsExclusive) {
+        return KeyStoreStatus::WriteFailed;
+    }
+
+    BTreeGetStatus previous = tree.get(key);
+    if (previous.status != BTreeStatus::Success &&
+        previous.status != BTreeStatus::KeyNotInTree) {
+        return KeyStoreStatus::ReadFailed;
+    }
+
+    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    if (previous.status == BTreeStatus::Success) {
+        action.set_undo(UpdateUndo{key, previous.value});
+    } else {
+        action.set_undo(InsertUndo{key});
+    }
+
+    Value stored_value = value;
+    BTreeStatus write_status = tree.insert(
+        transaction,
+        key,
+        stored_value,
+        action);
+    return write_status == BTreeStatus::Success
+        ? KeyStoreStatus::Success
+        : KeyStoreStatus::WriteFailed;
 }
 
 KeyStoreRemoveResult KeyStore::remove(const Key &key) {
@@ -413,6 +543,63 @@ KeyStoreRemoveResult KeyStore::remove(const Key &key) {
     if (result.status == KeyStoreStatus::Success) {
         result.value = std::move(remove_result.value);
     }
+    return result;
+}
+
+KeyStoreRemoveResult KeyStore::remove(
+    const TransactionHandle &transaction,
+    const Key &key
+) {
+    KeyStoreRemoveResult result{};
+    if (!is_open) {
+        result.status = KeyStoreStatus::NotOpen;
+        return result;
+    }
+    if (!transaction_manager || !transaction) {
+        result.status = KeyStoreStatus::TransactionNotFound;
+        return result;
+    }
+    if (!KeyCodec::validate_key(key)) {
+        result.status = KeyStoreStatus::InvalidKey;
+        return result;
+    }
+
+    LockManagerStatus lock_status = transaction_manager->lock_manager().lock_exclusive(
+        transaction->id(),
+        key);
+    if (lock_status == LockManagerStatus::Deadlock) {
+        result.status = KeyStoreStatus::Deadlock;
+        return result;
+    }
+    if (lock_status == LockManagerStatus::TransactionNotFound) {
+        result.status = KeyStoreStatus::TransactionNotFound;
+        return result;
+    }
+    if (lock_status != LockManagerStatus::Success &&
+        lock_status != LockManagerStatus::TxnHoldsExclusive) {
+        result.status = KeyStoreStatus::WriteFailed;
+        return result;
+    }
+
+    BTreeGetStatus previous = tree.get(key);
+    if (previous.status == BTreeStatus::KeyNotInTree) {
+        result.status = KeyStoreStatus::KeyNotFound;
+        return result;
+    }
+    if (previous.status != BTreeStatus::Success) {
+        result.status = KeyStoreStatus::ReadFailed;
+        return result;
+    }
+
+    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    action.set_undo(DeleteUndo{key, previous.value});
+    BTreeRemoveStatus remove_result = tree.remove(transaction, key, action);
+    if (remove_result.status != BTreeStatus::Success) {
+        result.status = KeyStoreStatus::WriteFailed;
+        return result;
+    }
+
+    result.value = std::move(remove_result.value);
     return result;
 }
 

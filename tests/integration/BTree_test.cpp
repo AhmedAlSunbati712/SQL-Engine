@@ -2,11 +2,19 @@
 
 #include <BTree.h>
 #include <KeyCodec.h>
+#include <LockManager/LockManager.h>
+#include <Log/Log.h>
+#include <Log/PendingBTreeAction.h>
+#include <Log/WalRecords.h>
+#include <TransactionManager/TransactionManager.h>
+#include <V2PageCodec.h>
 #include <ValueCodec.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -20,6 +28,34 @@ std::string value_to_string(const Value &value) {
 
 Key make_key(std::uint64_t key) {
     return KeyCodec::make_uint64(key);
+}
+
+class NoopUndoExecutor final : public TransactionUndoExecutor {
+public:
+    void undo(
+        Transaction&,
+        const UndoDescriptor&,
+        CompensationAppender) override {
+    }
+};
+
+Config wal_config() {
+    return {
+        .max_index_bytes = 100 * Index::ENTRY_SIZE,
+        .max_store_bytes = 1024 * 1024,
+        .initial_lsn = 1,
+    };
+}
+
+std::array<char, V2_PAGE_SIZE> read_page(
+    const std::filesystem::path& path,
+    std::uint32_t page_num
+) {
+    std::array<char, V2_PAGE_SIZE> bytes{};
+    std::ifstream input(path, std::ios::binary);
+    input.seekg(static_cast<std::streamoff>(page_num) * V2_PAGE_SIZE);
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return bytes;
 }
 
 class BTreeIntegrationTest : public ::testing::Test {
@@ -79,6 +115,80 @@ TEST_F(BTreeIntegrationTest, InsertCommitAndReopenPreservesSingleKey) {
     BTree reopened_tree;
     ASSERT_EQ(reopened_tree.open(db_path.string()), BTreeStatus::Success);
     expect_get_value(reopened_tree, 7, "A");
+}
+
+TEST_F(BTreeIntegrationTest, MutationActionCollectsCompleteDeduplicatedEffects) {
+    BTree tree;
+    ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
+
+    Key key = make_key(7);
+    Value value = ValueCodec::make_char("A");
+    PendingBTreeAction action(1, 1);
+    action.set_undo(InsertUndo{key});
+
+    ASSERT_EQ(tree.insert(key, value, action), BTreeStatus::Success);
+    ASSERT_EQ(action.effects().size(), 2U);
+
+    const PageEffect *header_effect = nullptr;
+    const PageEffect *root_effect = nullptr;
+    for (const PageEffect& effect : action.effects()) {
+        if (effect.page_num == 0) header_effect = &effect;
+        if (effect.page_num == 1) root_effect = &effect;
+    }
+
+    ASSERT_NE(header_effect, nullptr);
+    ASSERT_NE(root_effect, nullptr);
+    EXPECT_EQ(header_effect->kind, PageEffectKind::Write);
+    EXPECT_EQ(root_effect->kind, PageEffectKind::Allocate);
+    EXPECT_EQ(V2PageCodec::page_num(header_effect->after_image), 0U);
+    EXPECT_EQ(V2PageCodec::page_num(root_effect->after_image), 1U);
+}
+
+TEST_F(BTreeIntegrationTest, TransactionalInsertAppendsWalAndInstallsAssignedLsn) {
+    const std::filesystem::path wal_path = temp_dir / "wal";
+    Log log(wal_config());
+    log.open(wal_path.string());
+    LockManager lock_manager;
+    NoopUndoExecutor undo_executor;
+    TransactionManager transaction_manager(log, lock_manager, undo_executor);
+
+    BTree tree;
+    ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
+    tree.attach_transaction_manager(transaction_manager);
+
+    const TransactionHandle transaction = transaction_manager.begin();
+    Key key = make_key(7);
+    Value value = ValueCodec::make_char("A");
+    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    action.set_undo(InsertUndo{key});
+
+    ASSERT_EQ(
+        tree.insert(transaction, key, value, action),
+        BTreeStatus::Success);
+    const Lsn action_lsn = transaction->last_lsn();
+    ASSERT_EQ(action_lsn, 2U);
+
+    const WalRecord record = log.read(action_lsn);
+    EXPECT_EQ(record.type, WalRecordType::BTreeAction);
+    EXPECT_EQ(record.prev_lsn, 1U);
+    EXPECT_EQ(
+        std::get<BTreeActionPayload>(WalRecords::decode(record)).effects.size(),
+        2U);
+
+    // The legacy pager commit remains in place during this integration slice.
+    // Flush it so the test can inspect the installed LSNs on disk.
+    ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
+    EXPECT_GE(log.durable_lsn(), action_lsn);
+    const auto header = read_page(db_path, 0);
+    const auto root = read_page(db_path, 1);
+    EXPECT_EQ(V2PageCodec::page_lsn(header), action_lsn);
+    EXPECT_EQ(V2PageCodec::page_lsn(root), action_lsn);
+    EXPECT_EQ(V2PageCodec::validate(header), V2PageCodecResult::Success);
+    EXPECT_EQ(V2PageCodec::validate(root), V2PageCodecResult::Success);
+
+    EXPECT_EQ(
+        transaction_manager.commit(transaction),
+        CommitStatus::Success);
 }
 
 TEST_F(BTreeIntegrationTest, OverwriteExistingKeyCommitAndReopenPreservesUpdatedValue) {

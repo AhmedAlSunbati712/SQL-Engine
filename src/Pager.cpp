@@ -2,7 +2,9 @@
 #include <DBHeaderCodec.h>
 #include <DiskIO.h>
 #include <JournalCodec.h>
+#include <Log/Log.h>
 #include <V2PageCodec.h>
+#include <containers/BTreeOperation.h>
 
 #include <cassert>
 #include <cstring>
@@ -51,6 +53,15 @@ bool close_fd_if_open(int &fd) {
     }
 }
 
+PageEffect page_effect(PageEffectKind kind, const PageV2 *page) {
+    PageEffect effect{
+        .kind = kind,
+        .page_num = page->page_num,
+    };
+    effect.after_image = page->data;
+    return effect;
+}
+
 } // namespace
 
 Pager::Pager() {
@@ -71,6 +82,7 @@ Pager::~Pager() {
 }
 
 PagerResult Pager::open(std::string db_file) {
+    std::lock_guard lock(mutex_);
     assert(!is_open);
     if (is_open) return PagerResult::OpenDbFailed;
 
@@ -172,6 +184,7 @@ PagerResult Pager::open(std::string db_file) {
 }
 
 PagerGetResult Pager::get(int page_num) {
+    std::lock_guard lock(mutex_);
     /**
      * Check in the cache. if it returns the page. return it
      * if it's not, read from disk, and put in the cache
@@ -233,7 +246,75 @@ PagerGetResult Pager::get(int page_num) {
     return result;
 }
 
+PagerAllocateResult Pager::allocate_page(
+    BTreeOperation& operation,
+    V2PageKind kind
+) {
+    PagerAllocateResult result;
+    if (!is_open) {
+        result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+
+    // Page zero owns the page count and freelist head. Keep its exclusive
+    // latch in the B-tree operation until the complete WAL action is appended.
+    operation.lock_exclusive(DB_HEADER_PAGE_NUM);
+
+    PageV2 *freelist_head_page = nullptr;
+    PageV2 *next_free_page = nullptr;
+    std::uint32_t freelist_head_page_num = FREELIST_NULL_PAGE_NUM;
+    std::uint32_t next_free_page_num = FREELIST_NULL_PAGE_NUM;
+
+    if (db_header.freelist_page_count > 0) {
+        freelist_head_page_num = db_header.freelist_head_page_num;
+        operation.lock_exclusive(freelist_head_page_num);
+
+        PagerResult head_result = get_or_load_page(
+            static_cast<int>(freelist_head_page_num),
+            freelist_head_page);
+        if (head_result != PagerResult::Success) {
+            result.status = head_result;
+            return result;
+        }
+
+        std::uint32_t ignored_previous = FREELIST_NULL_PAGE_NUM;
+        read_freelist_links(
+            freelist_head_page,
+            next_free_page_num,
+            ignored_previous);
+
+        if (next_free_page_num != FREELIST_NULL_PAGE_NUM) {
+            operation.lock_exclusive(next_free_page_num);
+            PagerResult next_result = get_or_load_page(
+                static_cast<int>(next_free_page_num),
+                next_free_page);
+            if (next_result != PagerResult::Success) {
+                result.status = next_result;
+                return result;
+            }
+        }
+    } else {
+        // A brand-new page can be latched before its frame exists because the
+        // latch manager is keyed by the stable logical page number.
+        operation.lock_exclusive(db_header.db_page_count);
+    }
+
+    result = allocate_page(kind);
+    if (result.status != PagerResult::Success) return result;
+
+    PageV2 *header_page = pCache->get(DB_HEADER_PAGE_NUM);
+    assert(header_page != nullptr);
+    result.effects.push_back(page_effect(PageEffectKind::Write, header_page));
+
+    if (next_free_page) {
+        result.effects.push_back(page_effect(PageEffectKind::Write, next_free_page));
+    }
+    result.effects.push_back(page_effect(PageEffectKind::Allocate, result.page));
+    return result;
+}
+
 PagerAllocateResult Pager::allocate_page(V2PageKind kind) {
+    std::lock_guard lock(mutex_);
     /**
      * Description: Used to allocate a new page for a write (or resuing a page from the freelist)
      */
@@ -398,7 +479,46 @@ PagerAllocateResult Pager::allocate_page(V2PageKind kind) {
     return result;
 }
 
+PagerMutationResult Pager::free_page(
+    BTreeOperation& operation,
+    std::uint32_t page_num
+) {
+    PagerMutationResult result;
+    if (!is_open) {
+        result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+
+    // Freeing always changes page zero and the freed page. If a freelist
+    // already exists, its old head also receives a new previous link.
+    operation.lock_exclusive(DB_HEADER_PAGE_NUM);
+    operation.lock_exclusive(page_num);
+
+    const std::uint32_t old_head_page_num = db_header.freelist_head_page_num;
+    if (old_head_page_num != FREELIST_NULL_PAGE_NUM) {
+        operation.lock_exclusive(old_head_page_num);
+    }
+
+    result.status = free_page(static_cast<int>(page_num));
+    if (result.status != PagerResult::Success) return result;
+
+    PageV2 *header_page = pCache->get(DB_HEADER_PAGE_NUM);
+    PageV2 *freed_page = pCache->get(static_cast<int>(page_num));
+    assert(header_page != nullptr);
+    assert(freed_page != nullptr);
+
+    result.effects.push_back(page_effect(PageEffectKind::Write, header_page));
+    if (old_head_page_num != FREELIST_NULL_PAGE_NUM) {
+        PageV2 *old_head = pCache->get(static_cast<int>(old_head_page_num));
+        assert(old_head != nullptr);
+        result.effects.push_back(page_effect(PageEffectKind::Write, old_head));
+    }
+    result.effects.push_back(page_effect(PageEffectKind::Free, freed_page));
+    return result;
+}
+
 PagerResult Pager::free_page(int page_num) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     // Boundary check for anything below the first real payload page.
@@ -482,6 +602,7 @@ PagerResult Pager::free_page(int page_num) {
 }
 
 PagerResult Pager::begin_write(int page_num) {
+    std::lock_guard lock(mutex_);
     /**
     * V1 for begin write: read page through get, ignore lock permissions, mark it as dirty
     * add to dirty pages disk and add to journal.
@@ -527,6 +648,7 @@ PagerResult Pager::begin_write(int page_num) {
 }
 
 PagerResult Pager::ref_page(int page_num) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     assert(page_num > DB_HEADER_PAGE_NUM);
@@ -556,6 +678,7 @@ PagerResult Pager::ref_page(int page_num) {
 }
 
 PagerResult Pager::unref_page(int page_num) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     PageV2 *page = pCache->get(page_num);
@@ -574,6 +697,7 @@ PagerResult Pager::unref_page(int page_num) {
 }
 
 PagerGetRootResult Pager::get_btree_root() {
+    std::lock_guard lock(mutex_);
     PagerGetRootResult result{};
     if (!is_open) {
         result.status = PagerResult::DatabaseNotOpen;
@@ -594,7 +718,30 @@ PagerGetRootResult Pager::get_btree_root() {
     return result;
 }
 
+PagerMutationResult Pager::set_btree_root(
+    BTreeOperation& operation,
+    std::uint32_t root_page_num
+) {
+    PagerMutationResult result;
+    if (!is_open) {
+        result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+
+    operation.lock_exclusive(DB_HEADER_PAGE_NUM);
+    if (root_page_num != 0) operation.lock_exclusive(root_page_num);
+
+    result.status = set_btree_root(root_page_num);
+    if (result.status != PagerResult::Success) return result;
+
+    PageV2 *header_page = pCache->get(DB_HEADER_PAGE_NUM);
+    assert(header_page != nullptr);
+    result.effects.push_back(page_effect(PageEffectKind::Write, header_page));
+    return result;
+}
+
 PagerResult Pager::set_btree_root(std::uint32_t root_page_num) {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     PagerResult header_result = mark_header_dirty_for_mutation();
@@ -605,8 +752,84 @@ PagerResult Pager::set_btree_root(std::uint32_t root_page_num) {
     return PagerResult::Success;
 }
 
+PagerResult Pager::install_page_lsn(
+    BTreeOperation& operation,
+    std::uint32_t page_num,
+    Lsn lsn
+) {
+    std::lock_guard lock(mutex_);
+    if (!is_open) return PagerResult::DatabaseNotOpen;
+    if (lsn == 0) return PagerResult::PageCorrupt;
+
+    // The page image cannot be published under an LSN unless this operation
+    // still owns the exclusive logical latch that protected its modification.
+    const std::optional<PageLatchMode> mode = operation.latch_mode(page_num);
+    if (!mode || *mode != PageLatchMode::Exclusive) {
+        return PagerResult::Busy;
+    }
+
+    PageV2 *page = nullptr;
+    bool must_unref = false;
+    if (page_num == DB_HEADER_PAGE_NUM) {
+        PagerResult load_result = ensure_header_page_loaded(page);
+        if (load_result != PagerResult::Success) return load_result;
+    } else {
+        PagerGetResult get_result = get(static_cast<int>(page_num));
+        if (get_result.status != PagerResult::Success) return get_result.status;
+        page = get_result.page;
+        must_unref = true;
+    }
+
+    V2PageCodec::set_page_lsn(page->data, lsn);
+    V2PageCodec::update_checksum(page->data);
+    page->is_dirty = true;
+    page->wal_pending = false;
+
+    if (must_unref) {
+        PagerResult unref_result = unref_page(static_cast<int>(page_num));
+        if (unref_result != PagerResult::Success) return unref_result;
+    }
+    return PagerResult::Success;
+}
+
+PagerResult Pager::mark_wal_pending(
+    BTreeOperation& operation,
+    std::uint32_t page_num
+) {
+    std::lock_guard lock(mutex_);
+    if (!is_open) return PagerResult::DatabaseNotOpen;
+
+    // A frame may become non-evictable only while the operation still owns
+    // the exclusive logical latch protecting its unlogged bytes.
+    const std::optional<PageLatchMode> mode = operation.latch_mode(page_num);
+    if (!mode || *mode != PageLatchMode::Exclusive) {
+        return PagerResult::Busy;
+    }
+
+    PageV2 *page = nullptr;
+    bool must_unref = false;
+    if (page_num == DB_HEADER_PAGE_NUM) {
+        PagerResult load_result = ensure_header_page_loaded(page);
+        if (load_result != PagerResult::Success) return load_result;
+    } else {
+        PagerGetResult get_result = get(static_cast<int>(page_num));
+        if (get_result.status != PagerResult::Success) return get_result.status;
+        page = get_result.page;
+        must_unref = true;
+    }
+
+    page->is_dirty = true;
+    page->wal_pending = true;
+
+    if (must_unref) {
+        return unref_page(static_cast<int>(page_num));
+    }
+    return PagerResult::Success;
+}
+
 
 PagerResult Pager::commit_phase_one() {
+    std::lock_guard lock(mutex_);
     /**
      * Phase 1:
      * write the original images of the dirty pages to the journal
@@ -778,6 +1001,20 @@ PagerResult Pager::commit_phase_one() {
 
     // The backup images are durable now, so it is finally safe to overwrite the db pages.
     for (const auto &[page_num, dPage_entry] : dirty_pages) {
+        if (dPage_entry->page->wal_pending) return PagerResult::CacheSpillFailed;
+
+        // WAL must reach stable storage before a page carrying that record's
+        // LSN is allowed to overwrite the database file.
+        const Lsn page_lsn = V2PageCodec::page_lsn(dPage_entry->page->data);
+        if (page_lsn != 0) {
+            if (!log_) return PagerResult::CacheSpillFailed;
+            try {
+                log_->sync_through(page_lsn);
+            } catch (...) {
+                return PagerResult::CacheSpillFailed;
+            }
+        }
+
         // The common checksum covers the complete persistent page and must
         // reflect the final bytes that are about to reach the database file.
         V2PageCodec::update_checksum(dPage_entry->page->data);
@@ -810,6 +1047,7 @@ PagerResult Pager::commit_phase_one() {
 }
 
 PagerResult Pager::commit_phase_two() {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
     assert(write_txn_state == WriteTxnState::JournalDurable);
     assert(lock_manager->get_curr_lock() == Lock::EXCLUSIVE);
@@ -852,6 +1090,7 @@ PagerResult Pager::commit_phase_two() {
 }
 
 PagerResult Pager::rollback_transaction() {
+    std::lock_guard lock(mutex_);
     if (!is_open) return PagerResult::DatabaseNotOpen;
 
     // No active write transaction. nothing to rollback.
@@ -878,6 +1117,7 @@ PagerResult Pager::rollback_transaction() {
 }
 
 PagerResult Pager::rollback_hot_journal() {
+    std::lock_guard lock(mutex_);
     /**
      * TODO: since we have multiple headers now, what we probably need to do is the following:
      * while the current the current offset is not at the end of the journal file, read a number of bytes
@@ -1572,6 +1812,9 @@ PagerResult Pager::cache_put(PageV2 *page) {
     delete page;
     // TODO: In the future, we will expand the cache temporarily
     if (put_result.status == PCacheResult::NoVictim) {
+        return PagerResult::NoEvictablePage;
+    }
+    if (put_result.status == PCacheResult::WalPending) {
         return PagerResult::NoEvictablePage;
     }
     // If it was dirty flush and we still failed to overspill, then we are cooked

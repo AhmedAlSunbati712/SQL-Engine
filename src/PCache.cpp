@@ -24,12 +24,14 @@ PCache::~PCache() {
  *        Otherwse, we return a pointer to the page struct.
  */
 PageV2 *PCache::get(int page_num) {
+    std::lock_guard lock(mutex_);
     auto iterator = cache_map.find(page_num);
     if (iterator == cache_map.end()) return nullptr;
     return iterator->second;
 }
 
 PCachePutResult PCache::put(PageV2 *page) {
+    std::lock_guard lock(mutex_);
     assert(page != nullptr);
     int page_num = page->page_num;
 
@@ -56,8 +58,14 @@ PCachePutResult PCache::put(PageV2 *page) {
         it_head--; // This is now an iterator that starts at head
 
         PageV2 *victim_page = nullptr;
+        bool found_pending_page = false;
         while (it != it_head) {
             PageV2 *candidate_page = *it;
+            if (candidate_page->wal_pending) {
+                found_pending_page = true;
+                it--;
+                continue;
+            }
             if (!candidate_page->is_dirty) {
                 victim_page = candidate_page;
                 break;
@@ -67,7 +75,12 @@ PCachePutResult PCache::put(PageV2 *page) {
         }
 
         // If a victim page page is dirty, we need to do some cleanup
-        assert(victim_page != nullptr);
+        if (!victim_page) {
+            result.status = found_pending_page
+                ? PCacheResult::WalPending
+                : PCacheResult::NoVictim;
+            return result;
+        }
         // Since we added the flag need_flush, what should be the condition we check here?
         // if victim_page->is_dirty + need_flush, we definitely need a cache spillover
         // if need_flush is false, then that means there's a copy of the page on disk in both the
@@ -104,6 +117,7 @@ PCachePutResult PCache::put(PageV2 *page) {
 }
 
 PCacheResult PCache::remove(int page_num) {
+    std::lock_guard lock(mutex_);
     // why would we even need to call this?
     // Yes we would need it since we would need to remove a page from cache if it's dirty and we want to rollback
     // Errors that could be encountered:
@@ -126,6 +140,7 @@ PCacheResult PCache::remove(int page_num) {
 }
 
 void PCache::force_remove(int page_num) {
+    std::lock_guard lock(mutex_);
     auto it = cache_map.find(page_num);
     if (it == cache_map.end()) return;
 
@@ -143,6 +158,7 @@ void PCache::force_remove(int page_num) {
 }
 
 void PCache::pin_page(int page_num) {
+    std::lock_guard lock(mutex_);
     // Check if page exists in cache first
     auto it = cache_map.find(page_num);
     assert(it != cache_map.end());
@@ -161,6 +177,7 @@ void PCache::pin_page(int page_num) {
 }
 
 void PCache::unpin_page(int page_num) {
+    std::lock_guard lock(mutex_);
     // check if page exists in the cache
     auto it = cache_map.find(page_num);
     assert(it != cache_map.end());
@@ -176,9 +193,11 @@ void PCache::unpin_page(int page_num) {
 }
 
 int PCache::len() {
+    std::lock_guard lock(mutex_);
     return length;
 }
 
 int PCache::unpinned_len() {
+    std::lock_guard lock(mutex_);
     return unpinned_pages->len();
 }

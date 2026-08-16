@@ -1,4 +1,4 @@
-#include <Pager.h>
+#include <PageLatchManager.h>
 #include <containers/BTreeOperation.h>
 
 #include <gtest/gtest.h>
@@ -9,79 +9,64 @@
 using namespace std::chrono_literals;
 
 TEST(BTreeOperationTest, SharedLatchAllowsAnotherReader) {
-    Pager pager;
-    PageV2 page;
-    page.page_num = 7;
-    BTreeOperation operation(1, pager);
+    PageLatchManager manager;
+    BTreeOperation operation(1, manager);
 
-    EXPECT_EQ(operation.lock_shared(&page), &page);
-    ASSERT_TRUE(operation.latch_mode(page.page_num).has_value());
-    EXPECT_EQ(*operation.latch_mode(page.page_num), PageLatchMode::Shared);
+    operation.lock_shared(7);
+    ASSERT_TRUE(operation.latch_mode(7).has_value());
+    EXPECT_EQ(*operation.latch_mode(7), PageLatchMode::Shared);
 
-    std::future<bool> reader = std::async(std::launch::async, [&] {
-        const bool acquired = page.latch.try_lock_shared();
-        if (acquired) page.latch.unlock_shared();
-        return acquired;
-    });
+    std::future<PageReadLatch> reader = std::async(
+        std::launch::async,
+        [&] { return manager.lock_shared(7); });
 
-    EXPECT_TRUE(reader.get());
-    operation.release(page.page_num);
-    EXPECT_FALSE(operation.latch_mode(page.page_num).has_value());
+    EXPECT_EQ(reader.wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(reader.get().owns_lock());
+    operation.release(7);
+    EXPECT_FALSE(operation.latch_mode(7).has_value());
 }
 
 TEST(BTreeOperationTest, ExclusiveLatchBlocksReaderUntilRelease) {
-    Pager pager;
-    PageV2 page;
-    page.page_num = 8;
-    BTreeOperation operation(1, pager);
+    PageLatchManager manager;
+    BTreeOperation operation(1, manager);
 
-    ASSERT_EQ(operation.lock_exclusive(&page), &page);
-    ASSERT_TRUE(operation.latch_mode(page.page_num).has_value());
-    EXPECT_EQ(*operation.latch_mode(page.page_num), PageLatchMode::Exclusive);
+    operation.lock_exclusive(8);
+    ASSERT_TRUE(operation.latch_mode(8).has_value());
+    EXPECT_EQ(*operation.latch_mode(8), PageLatchMode::Exclusive);
 
-    std::promise<void> reader_started;
-    std::future<void> started = reader_started.get_future();
-    std::future<void> reader = std::async(
+    std::future<PageReadLatch> reader = std::async(
         std::launch::async,
-        [&page, signal = std::move(reader_started)]() mutable {
-            signal.set_value();
-            std::shared_lock lock(page.latch);
-        });
+        [&] { return manager.lock_shared(8); });
 
-    started.wait();
     EXPECT_EQ(reader.wait_for(50ms), std::future_status::timeout);
-
-    operation.release(page.page_num);
+    operation.release(8);
     EXPECT_EQ(reader.wait_for(1s), std::future_status::ready);
-    reader.get();
+    EXPECT_TRUE(reader.get().owns_lock());
 }
 
 TEST(BTreeOperationTest, DestructorReleasesEveryHeldLatch) {
-    Pager pager;
-    PageV2 first;
-    PageV2 second;
-    first.page_num = 9;
-    second.page_num = 10;
+    PageLatchManager manager;
 
     {
-        BTreeOperation operation(1, pager);
-        ASSERT_EQ(operation.lock_exclusive(&first), &first);
-        ASSERT_EQ(operation.lock_shared(&second), &second);
+        BTreeOperation operation(1, manager);
+        operation.lock_exclusive(9);
+        operation.lock_shared(10);
     }
 
-    EXPECT_TRUE(first.latch.try_lock());
-    first.latch.unlock();
-    EXPECT_TRUE(second.latch.try_lock());
-    second.latch.unlock();
+    EXPECT_TRUE(manager.lock_exclusive(9).owns_lock());
+    EXPECT_TRUE(manager.lock_exclusive(10).owns_lock());
 }
 
-TEST(BTreeOperationTest, RejectsNullAndDuplicatePages) {
-    Pager pager;
-    PageV2 page;
-    page.page_num = 11;
-    BTreeOperation operation(1, pager);
+TEST(BTreeOperationTest, DuplicateRequestsAreIdempotentAndUpgradeIsRejected) {
+    PageLatchManager manager;
+    BTreeOperation operation(1, manager);
 
-    EXPECT_THROW(operation.lock_shared(nullptr), std::invalid_argument);
-    ASSERT_EQ(operation.lock_shared(&page), &page);
-    EXPECT_THROW(operation.lock_exclusive(&page), std::logic_error);
+    operation.lock_shared(11);
+    EXPECT_NO_THROW(operation.lock_shared(11));
+    EXPECT_THROW(operation.lock_exclusive(11), std::logic_error);
+
+    operation.lock_exclusive(12);
+    EXPECT_NO_THROW(operation.lock_exclusive(12));
+    EXPECT_NO_THROW(operation.lock_shared(12));
+    EXPECT_EQ(*operation.latch_mode(12), PageLatchMode::Exclusive);
 }

@@ -986,8 +986,12 @@ checkpoint metadata, and safe segment reclamation are a later milestone.
 
 ## Immediate Implementation Order
 
-Stages 1 and 2 are complete: V2 CRC32C covers the whole page with the checksum
-field zeroed, PCache/Pager/B+ tree use V2 frames and payload boundaries, and
-the typed Log stack is implemented. The rollback journal still owns commit
-and crash recovery. The next bounded task is operation-scoped mutation integration using
-`PendingBTreeAction`; WAL cutover remains a later, separately tested task.
+V2 pages, the typed Log stack, logical page latches, transaction-aware KeyStore
+operations, complete B+ tree page effects, WAL finalization, WAL-before-data,
+and latch-scoped CLR append are implemented. `wal_pending` prevents an action's
+frames from being selected for eviction before append assigns an LSN.
+
+The remaining cutover boundary is startup recovery. The rollback journal is
+still retained for the legacy embedded API and hot-journal recovery until WAL
+analysis/redo/undo and equivalent crash-injection tests exist. It must not be
+deleted merely because runtime commit and abort now emit WAL.

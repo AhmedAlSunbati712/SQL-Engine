@@ -2,7 +2,52 @@
 #include <BTreeCursor.h>
 #include <KeyCodec.h>
 #include <Pager.h>
+#include <algorithm>
 #include <cassert>
+#include <utility>
+
+namespace {
+
+void record_page_effect(
+    PendingBTreeAction *action,
+    PageEffectKind kind,
+    const PageV2 *page
+) {
+    if (!action) return;
+    PageEffect effect{
+        .kind = kind,
+        .page_num = page->page_num,
+    };
+    effect.after_image = page->data;
+    action->add_effect(std::move(effect));
+}
+
+void record_page_effect(
+    PendingBTreeAction *action,
+    PageEffectKind kind,
+    std::uint32_t page_num,
+    const char *page_data
+) {
+    if (!action) return;
+    PageEffect effect{
+        .kind = kind,
+        .page_num = page_num,
+    };
+    std::copy_n(page_data, V2_PAGE_SIZE, effect.after_image.begin());
+    action->add_effect(std::move(effect));
+}
+
+void record_pager_effects(
+    PendingBTreeAction *action,
+    std::vector<PageEffect> effects
+) {
+    if (!action) return;
+    for (PageEffect& effect : effects) {
+        action->add_effect(std::move(effect));
+    }
+}
+
+} // namespace
 
 BTree::~BTree() {
     // A cursor holds a pointer back to this BTree, so the BTree must always outlive it.
@@ -36,6 +81,7 @@ BTreeStatus BTree::open(std::string db_file) {
     assert(!pager_open && pager == nullptr);
 
     pager = new Pager();
+    if (transaction_manager) pager->attach_log(transaction_manager->log());
     PagerResult open_result = pager->open(db_file);
     if (open_result != PagerResult::Success) {
         delete pager;
@@ -45,6 +91,7 @@ BTreeStatus BTree::open(std::string db_file) {
 
     currently_open_db_file = std::move(db_file);
     pager_open = true;
+    storage_poisoned = false;
     return BTreeStatus::Success;
 }
 
@@ -140,10 +187,19 @@ BTreeGetStatus BTree::get(const Key &key) {
      * return status
     */
     BTreeGetStatus get_result{};
+    if (storage_poisoned) {
+        get_result.status = BTreeStatus::FailedToRead;
+        return get_result;
+    }
     get_result.status = BTreeStatus::Success;
+    BTreeOperation operation(0, pager->page_latch_manager());
+
     // Descend from the root tohe leaf. We pass false to the second arg
     // Since we are not interested in keeping the parent pointers
-    LeafDescentResult descent_result = descend_from_root_to_leaf(key, false);
+    LeafDescentResult descent_result = descend_from_root_to_leaf(
+        key,
+        false,
+        &operation);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         get_result.status = BTreeStatus::KeyNotInTree;
         return get_result;
@@ -179,6 +235,34 @@ BTreeGetStatus BTree::get(const Key &key) {
 }
 
 BTreeStatus BTree::insert(const Key &key, Value &value) {
+    return insert_impl(key, value, nullptr, nullptr);
+}
+
+BTreeStatus BTree::insert(
+    const Key &key,
+    Value &value,
+    PendingBTreeAction &action
+) {
+    return insert_impl(key, value, &action, nullptr);
+}
+
+BTreeStatus BTree::insert(
+    const TransactionHandle &transaction,
+    const Key &key,
+    Value &value,
+    PendingBTreeAction &action
+) {
+    return insert_impl(key, value, &action, &transaction);
+}
+
+BTreeStatus BTree::insert_impl(
+    const Key &key,
+    Value &value,
+    PendingBTreeAction *action,
+    const TransactionHandle *transaction,
+    Transaction *undo_transaction,
+    TransactionUndoExecutor::CompensationAppender *append_compensation
+) {
     /**
      * descent <- descend_from_root_to_leaf(key)
      *
@@ -224,14 +308,40 @@ BTreeStatus BTree::insert(const Key &key, Value &value) {
      * return success
     */
     // A split or even an in-place insert can invalidate an active cursor's position.
+    if (storage_poisoned) return BTreeStatus::FailedToInsert;
     if (active_cursor_count > 0) return BTreeStatus::CursorActive;
 
     // Descend from the root to the target leaf.
     // We need the path this time in case the insert changes separators or causes a split.
-    LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
+    BTreeOperation operation(
+        transaction && *transaction
+            ? (*transaction)->id()
+            : (undo_transaction ? undo_transaction->id() : 0),
+        pager->page_latch_manager());
+    auto finish = [&](BTreeStatus status) {
+        if (status != BTreeStatus::Success || !action) return status;
+        bool finalized = true;
+        if (transaction) {
+            finalized = finalize_action(operation, *transaction, *action);
+        } else if (append_compensation) {
+            finalized = finalize_compensation(operation, *action, *append_compensation);
+        }
+        if (!finalized) {
+            return BTreeStatus::FailedToInsert;
+        }
+        return BTreeStatus::Success;
+    };
+    LeafDescentResult descent_result = descend_from_root_to_leaf(
+        key,
+        true,
+        &operation,
+        PageLatchMode::Exclusive);
     if (descent_result.status == BTreeStatus::EmptyTree) {
-        PagerAllocateResult allocation_result = pager->allocate_page(V2PageKind::BTreeLeaf);
+        PagerAllocateResult allocation_result = pager->allocate_page(
+            operation,
+            V2PageKind::BTreeLeaf);
         if (allocation_result.status != PagerResult::Success) return BTreeStatus::FailedToInsert;
+        record_pager_effects(action, std::move(allocation_result.effects));
 
         std::uint32_t root_page_num = allocation_result.page_num;
         BLeafPage::fill_initial_layout(allocation_result.page->data.data());
@@ -244,10 +354,14 @@ BTreeStatus BTree::insert(const Key &key, Value &value) {
         }
 
         root_leaf.write_back();
-        PagerResult set_root_result = pager->set_btree_root(root_page_num);
+        record_page_effect(action, PageEffectKind::Write, allocation_result.page);
+        PagerMutationResult set_root_result = pager->set_btree_root(
+            operation,
+            root_page_num);
         pager->unref_page(root_page_num);
-        if (set_root_result != PagerResult::Success) return BTreeStatus::FailedToInsert;
-        return BTreeStatus::Success;
+        if (set_root_result.status != PagerResult::Success) return BTreeStatus::FailedToInsert;
+        record_pager_effects(action, std::move(set_root_result.effects));
+        return finish(BTreeStatus::Success);
     }
     if (descent_result.status != BTreeStatus::Success) return descent_result.status;
 
@@ -272,8 +386,13 @@ BTreeStatus BTree::insert(const Key &key, Value &value) {
         }
 
         target_leaf.write_back();
+        record_page_effect(
+            action,
+            PageEffectKind::Write,
+            descent_result.leaf_page_num,
+            descent_result.leaf_page);
         pager->unref_page(descent_result.leaf_page_num);
-        return BTreeStatus::Success;
+        return finish(BTreeStatus::Success);
     }
 
     bool insert_result = target_leaf.insert_at(idx, key, value);
@@ -287,21 +406,53 @@ BTreeStatus BTree::insert(const Key &key, Value &value) {
     // Flush the modified in-memory vectors back into the raw page bytes before handing off
     // to the structural repair helpers.
     target_leaf.write_back();
+    record_page_effect(
+        action,
+        PageEffectKind::Write,
+        descent_result.leaf_page_num,
+        descent_result.leaf_page);
 
     if (needs_split) {
         BTreeStatus split_result = propagate_splitting(
             descent_result.leaf_page_num,
-            descent_result.path
+            descent_result.path,
+            operation,
+            action
         );
         pager->unref_page(descent_result.leaf_page_num);
-        return split_result;
+        return finish(split_result);
     }
 
     pager->unref_page(descent_result.leaf_page_num);
-    return BTreeStatus::Success;
+    return finish(BTreeStatus::Success);
 }
 
 BTreeRemoveStatus BTree::remove(const Key &key) {
+    return remove_impl(key, nullptr, nullptr);
+}
+
+BTreeRemoveStatus BTree::remove(
+    const Key &key,
+    PendingBTreeAction &action
+) {
+    return remove_impl(key, &action, nullptr);
+}
+
+BTreeRemoveStatus BTree::remove(
+    const TransactionHandle &transaction,
+    const Key &key,
+    PendingBTreeAction &action
+) {
+    return remove_impl(key, &action, &transaction);
+}
+
+BTreeRemoveStatus BTree::remove_impl(
+    const Key &key,
+    PendingBTreeAction *action,
+    const TransactionHandle *transaction,
+    Transaction *undo_transaction,
+    TransactionUndoExecutor::CompensationAppender *append_compensation
+) {
     /**
      * descent <- descend_from_root_to_leaf(key)
      * if descent failed, return failure
@@ -341,20 +492,46 @@ BTreeRemoveStatus BTree::remove(const Key &key) {
     BTreeRemoveStatus remove_result{};
 
     // Deletes can change separator keys, merge pages, or free the cursor's current page.
+    if (storage_poisoned) {
+        remove_result.status = BTreeStatus::FailedToRemove;
+        return remove_result;
+    }
     if (active_cursor_count > 0) {
         remove_result.status = BTreeStatus::CursorActive;
         return remove_result;
     }
 
-    LeafDescentResult descent_result = descend_from_root_to_leaf(key, true);
+    BTreeOperation operation(
+        transaction && *transaction
+            ? (*transaction)->id()
+            : (undo_transaction ? undo_transaction->id() : 0),
+        pager->page_latch_manager());
+    auto finish = [&](BTreeRemoveStatus status) {
+        if (status.status != BTreeStatus::Success || !action) return status;
+        bool finalized = true;
+        if (transaction) {
+            finalized = finalize_action(operation, *transaction, *action);
+        } else if (append_compensation) {
+            finalized = finalize_compensation(operation, *action, *append_compensation);
+        }
+        if (!finalized) {
+            status.status = BTreeStatus::FailedToRemove;
+        }
+        return status;
+    };
+    LeafDescentResult descent_result = descend_from_root_to_leaf(
+        key,
+        true,
+        &operation,
+        PageLatchMode::Exclusive);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         remove_result.status = BTreeStatus::KeyNotInTree;
-        return remove_result;
+        return finish(remove_result);
     }
 
     if (descent_result.status != BTreeStatus::Success) {
         remove_result.status = descent_result.status;
-        return remove_result;
+        return finish(remove_result);
     }
 
     // Parse the leaf page and find the key
@@ -391,13 +568,22 @@ BTreeRemoveStatus BTree::remove(const Key &key) {
     // Flush the updated logical leaf state back into the raw page bytes before we
     // start borrowing, merging, or changing separator keys higher up the tree.
     target_leaf_page.write_back();
+    record_page_effect(
+        action,
+        PageEffectKind::Write,
+        leaf_page_num,
+        descent_result.leaf_page);
     
     // Now check if we went under the min size
     if (target_leaf_page.get_key_count() < MIN_KEYS(BTREE_ORDER)) {
-        BTreeStatus merging_status = propagate_merging(leaf_page_num, descent_result.path);
+        BTreeStatus merging_status = propagate_merging(
+            leaf_page_num,
+            descent_result.path,
+            operation,
+            action);
         pager->unref_page(leaf_page_num);
         remove_result.status = merging_status;
-        return remove_result;
+        return finish(remove_result);
     }
 
     // We are assuming in practice that deleting a key from a non-root leaf node will leave at least one key left in the node
@@ -405,30 +591,180 @@ BTreeRemoveStatus BTree::remove(const Key &key) {
 
     // If the first key got deleted, propagate it up
     if (is_first_key) {
-        BTreeStatus separator_change_status = propagate_separator_change_upward(descent_result.path, *target_leaf_page.key_at(0));
+        BTreeStatus separator_change_status = propagate_separator_change_upward(
+            descent_result.path,
+            *target_leaf_page.key_at(0),
+            operation,
+            action);
         pager->unref_page(leaf_page_num);
         remove_result.status = separator_change_status;
-        return remove_result;
+        return finish(remove_result);
     }
 
     pager->unref_page(leaf_page_num);
 
-    return remove_result;
+    return finish(remove_result);
+}
+
+void BTree::attach_transaction_manager(
+    TransactionManager &manager
+) noexcept {
+    transaction_manager = &manager;
+    if (pager) pager->attach_log(manager.log());
+}
+
+bool BTree::finalize_action(
+    BTreeOperation &operation,
+    const TransactionHandle &transaction,
+    PendingBTreeAction &action
+) {
+    if (!transaction_manager || !transaction) return false;
+
+    // Pending frames cannot be flushed or selected for eviction while the
+    // complete multi-page action is waiting for its assigned WAL LSN.
+    for (const PageEffect &effect : action.effects()) {
+        PagerResult pending_result = pager->mark_wal_pending(
+            operation,
+            effect.page_num);
+        if (pending_result != PagerResult::Success) {
+            storage_poisoned = true;
+            return false;
+        }
+    }
+
+    Lsn lsn = 0;
+    try {
+        // Append the complete action before publishing its LSN into any page.
+        // The operation still owns every exclusive logical latch at this point.
+        lsn = transaction_manager->append_action(
+            transaction,
+            action.build());
+    } catch (...) {
+        storage_poisoned = true;
+        throw;
+    }
+
+    // Reload each affected frame by logical page number, install the assigned
+    // LSN, and recompute its checksum before allowing the latch to be released.
+    for (const PageEffect &effect : action.effects()) {
+        PagerResult install_result = pager->install_page_lsn(
+            operation,
+            effect.page_num,
+            lsn);
+        if (install_result != PagerResult::Success) {
+            storage_poisoned = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool BTree::finalize_compensation(
+    BTreeOperation &operation,
+    PendingBTreeAction &action,
+    TransactionUndoExecutor::CompensationAppender &append_compensation
+) {
+    for (const PageEffect &effect : action.effects()) {
+        if (pager->mark_wal_pending(operation, effect.page_num) != PagerResult::Success) {
+            storage_poisoned = true;
+            return false;
+        }
+    }
+
+    Lsn lsn = 0;
+    try {
+        lsn = append_compensation(action.effects());
+    } catch (...) {
+        storage_poisoned = true;
+        throw;
+    }
+
+    for (const PageEffect &effect : action.effects()) {
+        if (pager->install_page_lsn(operation, effect.page_num, lsn) != PagerResult::Success) {
+            storage_poisoned = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool BTree::apply_undo(
+    Transaction &transaction,
+    const UndoDescriptor &undo,
+    TransactionUndoExecutor::CompensationAppender append_compensation
+) {
+    PendingBTreeAction action(transaction.id(), transaction.last_lsn());
+    action.set_undo(undo);
+
+    if (const auto *insert = std::get_if<InsertUndo>(&undo)) {
+        return remove_impl(
+            insert->key,
+            &action,
+            nullptr,
+            &transaction,
+            &append_compensation).status == BTreeStatus::Success;
+    }
+
+    Key key{};
+    Value value{};
+    if (const auto *update = std::get_if<UpdateUndo>(&undo)) {
+        key = update->key;
+        value = update->old_value;
+    } else {
+        const auto &deletion = std::get<DeleteUndo>(undo);
+        key = deletion.key;
+        value = deletion.old_value;
+    }
+    return insert_impl(
+        key,
+        value,
+        &action,
+        nullptr,
+        &transaction,
+        &append_compensation) == BTreeStatus::Success;
 }
 
 
 
-LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_path) {
+LeafDescentResult BTree::descend_from_root_to_leaf(
+    const Key &key,
+    bool include_path,
+    BTreeOperation *operation,
+    PageLatchMode latch_mode
+) {
     LeafDescentResult descent_result{};
+
+    // Holding page zero keeps the root page number stable until the root's
+    // own latch has been acquired.
+    if (operation) {
+        if (latch_mode == PageLatchMode::Shared) {
+            operation->lock_shared(0);
+        } else {
+            operation->lock_exclusive(0);
+        }
+    }
     PagerGetRootResult root_get_result = pager->get_btree_root();
 
     if (root_get_result.status == PagerResult::EmptyBTree) {
+        if (operation) operation->release(0);
         descent_result.status = BTreeStatus::EmptyTree;
         return descent_result;
     }
     if (root_get_result.status != PagerResult::Success) {
+        if (operation) operation->release(0);
         descent_result.status = BTreeStatus::FailedToGetRoot;
         return descent_result;
+    }
+
+    // Acquire the root before releasing page zero. The root frame remains
+    // referenced independently by Pager until this descent releases it.
+    if (operation) {
+        if (latch_mode == PageLatchMode::Shared) {
+            operation->lock_shared(root_get_result.root_page_num);
+            operation->release(0);
+        } else {
+            operation->lock_exclusive(root_get_result.root_page_num);
+        }
     }
 
     // If the root is already a leaf, return the root
@@ -463,12 +799,26 @@ LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_
             child_dir = ChildDirection::Left;
         }
 
+        // Latch the child before releasing the parent so structural changes
+        // cannot invalidate the route between these two pages.
+        if (operation) {
+            if (latch_mode == PageLatchMode::Shared) {
+                operation->lock_shared(*target_child_page_num);
+            } else {
+                operation->lock_exclusive(*target_child_page_num);
+            }
+        }
+
         // Get the computed child page number. That's the next page in our traversal
         PagerGetResult pager_get_result = pager->get(*target_child_page_num);
         pager->unref_page(curr_page_num); // Make sure to unref the parent page since we don't need it anymore.
+        if (operation && latch_mode == PageLatchMode::Shared) {
+            operation->release(curr_page_num);
+        }
 
         // Handle failure of reading
         if (pager_get_result.status != PagerResult::Success) {
+            if (operation) operation->release(*target_child_page_num);
             descent_result.status = BTreeStatus::FailedToRead;
             return descent_result;
         }
@@ -496,7 +846,12 @@ LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_
     return descent_result;
 }
 
-BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector<TraversalPathEntry> &path) {
+BTreeStatus BTree::propagate_splitting(
+    std::uint32_t split_page_num,
+    std::vector<TraversalPathEntry> &path,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
+) {
     /**
      * The page split_page_num overflowed after an insert.
      * Split it into the old left page plus a new right sibling, then repair the parent.
@@ -533,11 +888,14 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
     if (page_type == PageType::Leaf) {
         BLeafPage split_page(get_split_page_result.page->data.data());
 
-        PagerAllocateResult allocation_result = pager->allocate_page(V2PageKind::BTreeLeaf);
+        PagerAllocateResult allocation_result = pager->allocate_page(
+            operation,
+            V2PageKind::BTreeLeaf);
         if (allocation_result.status != PagerResult::Success) {
             pager->unref_page(split_page_num);
             return BTreeStatus::FailedToAllocateNewPage;
         }
+        record_pager_effects(action, std::move(allocation_result.effects));
         
         std::uint32_t new_leaf_page_num = allocation_result.page_num;
         BLeafPage::fill_initial_layout(allocation_result.page->data.data());
@@ -545,11 +903,22 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
 
         std::size_t median_separator_idx = split_page.get_key_count() / 2;
         BTree::migrate_leaf(split_page, new_leaf_page, median_separator_idx); // Assumes it does the write_back on both
+        record_page_effect(
+            action,
+            PageEffectKind::Write,
+            split_page_num,
+            get_split_page_result.page->data.data());
+        record_page_effect(action, PageEffectKind::Write, allocation_result.page);
 
         if (path.size() == 0) {
             // The current node we are splitting is a root node
             // Handle the splitting of the root and return
-            BTreeStatus split_root = handle_splitting_root(split_page_num, new_leaf_page_num, *new_leaf_page.key_at(0));
+            BTreeStatus split_root = handle_splitting_root(
+                split_page_num,
+                new_leaf_page_num,
+                *new_leaf_page.key_at(0),
+                operation,
+                action);
             pager->unref_page(split_page_num);
             pager->unref_page(new_leaf_page_num);
             return split_root;
@@ -589,13 +958,18 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
         // Now check if we need to split the parent
         bool parent_needs_split = (parent_page.get_key_count() > MAX_KEYS(BTREE_ORDER));
         parent_page.write_back();
+        record_page_effect(action, PageEffectKind::Write, get_parent_result.page);
 
         pager->unref_page(split_page_num);
         pager->unref_page(new_leaf_page_num);
 
         if (parent_needs_split) {
             pager->unref_page(parent_path_entry.parent_page_num);
-            return propagate_splitting(parent_path_entry.parent_page_num, path);
+            return propagate_splitting(
+                parent_path_entry.parent_page_num,
+                path,
+                operation,
+                action);
         }
 
         pager->unref_page(parent_path_entry.parent_page_num);
@@ -605,11 +979,14 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
 
         // Allocate the new internal page that is going to hold everything to the right
         // of the promoted median separator.
-        PagerAllocateResult allocation_result = pager->allocate_page(V2PageKind::BTreeInternal);
+        PagerAllocateResult allocation_result = pager->allocate_page(
+            operation,
+            V2PageKind::BTreeInternal);
         if (allocation_result.status != PagerResult::Success) {
             pager->unref_page(split_page_num);
             return BTreeStatus::FailedToAllocateNewPage;
         }
+        record_pager_effects(action, std::move(allocation_result.effects));
 
         std::uint32_t new_internal_page_num = allocation_result.page_num;
         BInternalPage::fill_initial_layout(allocation_result.page->data.data());
@@ -632,11 +1009,18 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
 
         split_page.write_back();
         new_internal_page.write_back();
+        record_page_effect(action, PageEffectKind::Write, get_split_page_result.page);
+        record_page_effect(action, PageEffectKind::Write, allocation_result.page);
 
         if (path.size() == 0) {
             // The current internal page being split is the root.
             // Create a new root above the two split children.
-            BTreeStatus split_root = handle_splitting_root(split_page_num, new_internal_page_num, *promoted_key);
+            BTreeStatus split_root = handle_splitting_root(
+                split_page_num,
+                new_internal_page_num,
+                *promoted_key,
+                operation,
+                action);
             pager->unref_page(split_page_num);
             pager->unref_page(new_internal_page_num);
             return split_root;
@@ -681,13 +1065,18 @@ BTreeStatus BTree::propagate_splitting(std::uint32_t split_page_num, std::vector
         // The promoted median already becomes the new separator for the new right child.
         bool parent_needs_split = (parent_page.get_key_count() > MAX_KEYS(BTREE_ORDER));
         parent_page.write_back();
+        record_page_effect(action, PageEffectKind::Write, get_parent_result.page);
 
         pager->unref_page(split_page_num);
         pager->unref_page(new_internal_page_num);
 
         if (parent_needs_split) {
             pager->unref_page(parent_path_entry.parent_page_num);
-            return propagate_splitting(parent_path_entry.parent_page_num, path);
+            return propagate_splitting(
+                parent_path_entry.parent_page_num,
+                path,
+                operation,
+                action);
         }
 
         pager->unref_page(parent_path_entry.parent_page_num);
@@ -756,12 +1145,17 @@ void BTree::migrate_internal(BInternalPage &src, BInternalPage &dst, std::size_t
 BTreeStatus BTree::handle_splitting_root(
     std::uint32_t left_child_page_num,
     std::uint32_t right_child_page_num,
-    const Key &separator_key
+    const Key &separator_key,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
 ) {
     // A root split means we need to allocate a brand new internal root above the
     // two children that just came out of the split.
-    PagerAllocateResult allocation_result = pager->allocate_page(V2PageKind::BTreeInternal);
+    PagerAllocateResult allocation_result = pager->allocate_page(
+        operation,
+        V2PageKind::BTreeInternal);
     if (allocation_result.status != PagerResult::Success) return BTreeStatus::FailedToAllocateNewPage;
+    record_pager_effects(action, std::move(allocation_result.effects));
 
     std::uint32_t new_root_page_num = allocation_result.page_num;
     BInternalPage::fill_initial_layout(allocation_result.page->data.data());
@@ -785,17 +1179,23 @@ BTreeStatus BTree::handle_splitting_root(
     }
 
     new_root_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, allocation_result.page);
 
-    PagerResult set_root_result = pager->set_btree_root(new_root_page_num);
+    PagerMutationResult set_root_result = pager->set_btree_root(
+        operation,
+        new_root_page_num);
     pager->unref_page(new_root_page_num);
-    if (set_root_result != PagerResult::Success) return BTreeStatus::FailedToInsert;
+    if (set_root_result.status != PagerResult::Success) return BTreeStatus::FailedToInsert;
+    record_pager_effects(action, std::move(set_root_result.effects));
 
     return BTreeStatus::Success;
 }
 
 BTreeStatus BTree::propagate_separator_change_upward(
     const std::vector<TraversalPathEntry> &path,
-    const Key &new_subtree_min
+    const Key &new_subtree_min,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
 ) {
     /**
      * A delete changed the minimum key of some subtree.
@@ -815,6 +1215,7 @@ BTreeStatus BTree::propagate_separator_change_upward(
         // If we reached this subtree by taking the right side of a separator, then
         // that separator stores this subtree's minimum. Update it and stop.
         if (entry.child_dir == ChildDirection::Right) {
+            operation.lock_exclusive(entry.parent_page_num);
             PagerGetResult get_parent_result = pager->get(entry.parent_page_num);
             if (get_parent_result.status != PagerResult::Success) return BTreeStatus::FailedToRead;
 
@@ -832,6 +1233,7 @@ BTreeStatus BTree::propagate_separator_change_upward(
             }
 
             parent_page.write_back();
+            record_page_effect(action, PageEffectKind::Write, get_parent_result.page);
             pager->unref_page(entry.parent_page_num);
             return BTreeStatus::Success;
         }
@@ -844,6 +1246,7 @@ BTreeStatus BTree::propagate_separator_change_upward(
         // Otherwise we took the left side of some separator strictly after the first.
         // That means this subtree is not the leftmost child overall, and the separator
         // immediately before it stores its minimum.
+        operation.lock_exclusive(entry.parent_page_num);
         PagerGetResult get_parent_result = pager->get(entry.parent_page_num);
         if (get_parent_result.status != PagerResult::Success) return BTreeStatus::FailedToRead;
 
@@ -861,13 +1264,20 @@ BTreeStatus BTree::propagate_separator_change_upward(
         }
 
         parent_page.write_back();
+        record_page_effect(action, PageEffectKind::Write, get_parent_result.page);
         pager->unref_page(entry.parent_page_num);
         return BTreeStatus::Success;
     }
 
     return BTreeStatus::Success;
 }
-BTreeStatus BTree::handle_root_underflow(std::uint32_t underflow_page_num, PageType underflow_page_type, char *underflow_page_data) {
+BTreeStatus BTree::handle_root_underflow(
+    std::uint32_t underflow_page_num,
+    PageType underflow_page_type,
+    char *underflow_page_data,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
+) {
     // The root is special. It is allowed to violate the usual min-size rules.
     if (underflow_page_type == PageType::Leaf) {
         BLeafPage root_leaf(underflow_page_data);
@@ -879,15 +1289,19 @@ BTreeStatus BTree::handle_root_underflow(std::uint32_t underflow_page_num, PageT
         }
 
         // The tree became empty. Clear the root pointer in the header and free this page.
-        PagerResult clear_root_result = pager->set_btree_root(0);
-        if (clear_root_result != PagerResult::Success) {
+        PagerMutationResult clear_root_result = pager->set_btree_root(operation, 0);
+        if (clear_root_result.status != PagerResult::Success) {
             pager->unref_page(underflow_page_num);
             return BTreeStatus::FailedToRemove;
         }
+        record_pager_effects(action, std::move(clear_root_result.effects));
 
-        PagerResult free_root_result = pager->free_page(underflow_page_num);
+        PagerMutationResult free_root_result = pager->free_page(
+            operation,
+            underflow_page_num);
         pager->unref_page(underflow_page_num);
-        if (free_root_result != PagerResult::Success) return BTreeStatus::FailedToRemove;
+        if (free_root_result.status != PagerResult::Success) return BTreeStatus::FailedToRemove;
+        record_pager_effects(action, std::move(free_root_result.effects));
         return BTreeStatus::Success;
     }
 
@@ -906,15 +1320,21 @@ BTreeStatus BTree::handle_root_underflow(std::uint32_t underflow_page_num, PageT
         return BTreeStatus::FailedToRemove;
     }
 
-    PagerResult set_root_result = pager->set_btree_root(*only_child_page_num);
-    if (set_root_result != PagerResult::Success) {
+    PagerMutationResult set_root_result = pager->set_btree_root(
+        operation,
+        *only_child_page_num);
+    if (set_root_result.status != PagerResult::Success) {
         pager->unref_page(underflow_page_num);
         return BTreeStatus::FailedToRemove;
     }
+    record_pager_effects(action, std::move(set_root_result.effects));
 
-    PagerResult free_root_result = pager->free_page(underflow_page_num);
+    PagerMutationResult free_root_result = pager->free_page(
+        operation,
+        underflow_page_num);
     pager->unref_page(underflow_page_num);
-    if (free_root_result != PagerResult::Success) return BTreeStatus::FailedToRemove;
+    if (free_root_result.status != PagerResult::Success) return BTreeStatus::FailedToRemove;
+    record_pager_effects(action, std::move(free_root_result.effects));
     return BTreeStatus::Success;
 }
 
@@ -945,17 +1365,33 @@ BTree::MergeParentContext BTree::build_merge_parent_context(const TraversalPathE
     return ctx;
 }
 
-BTreeStatus BTree::finish_parent_after_merge(BInternalPage &parent_page, std::uint32_t parent_page_num, std::vector<TraversalPathEntry> &path) {
+BTreeStatus BTree::finish_parent_after_merge(
+    BInternalPage &parent_page,
+    std::uint32_t parent_page_num,
+    std::vector<TraversalPathEntry> &path,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
+) {
     // Merging deleted one separator from the parent. If that pushed the parent below
     // the minimum, keep repairing upward recursively.
     bool parent_underflow = parent_page.get_key_count() < MIN_KEYS(BTREE_ORDER);
     path.pop_back();
     pager->unref_page(parent_page_num);
-    if (parent_underflow) return propagate_merging(parent_page_num, path);
+    if (parent_underflow) return propagate_merging(
+        parent_page_num,
+        path,
+        operation,
+        action);
     return BTreeStatus::Success;
 }
 
-BTreeStatus BTree::borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num) {
+BTreeStatus BTree::borrow_from_right_leaf(
+    BLeafPage &current_leaf,
+    BInternalPage &parent_page,
+    const MergeParentContext &ctx,
+    std::uint32_t underflow_page_num,
+    PendingBTreeAction *action
+) {
     if (ctx.right_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
 
     // Load the right sibling and first make sure it can actually spare a key.
@@ -1006,6 +1442,9 @@ BTreeStatus BTree::borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage
     current_leaf.write_back();
     right_sibling.write_back();
     parent_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, underflow_page_num, current_leaf.data());
+    record_page_effect(action, PageEffectKind::Write, *ctx.right_sibling_page_num, right_sibling.data());
+    record_page_effect(action, PageEffectKind::Write, ctx.parent_page_num, parent_page.data());
 
     pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
     pager->unref_page(ctx.parent_page_num);
@@ -1013,7 +1452,13 @@ BTreeStatus BTree::borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage
     return BTreeStatus::Success;
 }
 
-BTreeStatus BTree::borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num) {
+BTreeStatus BTree::borrow_from_left_leaf(
+    BLeafPage &current_leaf,
+    BInternalPage &parent_page,
+    const MergeParentContext &ctx,
+    std::uint32_t underflow_page_num,
+    PendingBTreeAction *action
+) {
     if (ctx.left_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
 
     // Load the left sibling and make sure it can actually lend.
@@ -1065,6 +1510,9 @@ BTreeStatus BTree::borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage 
     left_sibling.write_back();
     current_leaf.write_back();
     parent_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, *ctx.left_sibling_page_num, left_sibling.data());
+    record_page_effect(action, PageEffectKind::Write, underflow_page_num, current_leaf.data());
+    record_page_effect(action, PageEffectKind::Write, ctx.parent_page_num, parent_page.data());
 
     pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
     pager->unref_page(ctx.parent_page_num);
@@ -1072,7 +1520,15 @@ BTreeStatus BTree::borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage 
     return BTreeStatus::Success;
 }
 
-BTreeStatus BTree::merge_with_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+BTreeStatus BTree::merge_with_right_leaf(
+    BLeafPage &current_leaf,
+    BInternalPage &parent_page,
+    const MergeParentContext &ctx,
+    std::uint32_t underflow_page_num,
+    std::vector<TraversalPathEntry> &path,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
+) {
     if (ctx.right_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
 
     // Merge the right sibling into the current leaf.
@@ -1116,21 +1572,39 @@ BTreeStatus BTree::merge_with_right_leaf(BLeafPage &current_leaf, BInternalPage 
 
     current_leaf.write_back();
     parent_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, underflow_page_num, current_leaf.data());
+    record_page_effect(action, PageEffectKind::Write, ctx.parent_page_num, parent_page.data());
 
-    PagerResult free_result = pager->free_page(static_cast<int>(*ctx.right_sibling_page_num));
-    if (free_result != PagerResult::Success) {
+    PagerMutationResult free_result = pager->free_page(
+        operation,
+        *ctx.right_sibling_page_num);
+    if (free_result.status != PagerResult::Success) {
         pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
         pager->unref_page(ctx.parent_page_num);
         pager->unref_page(underflow_page_num);
         return BTreeStatus::FailedToRemove;
     }
+    record_pager_effects(action, std::move(free_result.effects));
 
     pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
     pager->unref_page(underflow_page_num);
-    return finish_parent_after_merge(parent_page, ctx.parent_page_num, path);
+    return finish_parent_after_merge(
+        parent_page,
+        ctx.parent_page_num,
+        path,
+        operation,
+        action);
 }
 
-BTreeStatus BTree::merge_with_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+BTreeStatus BTree::merge_with_left_leaf(
+    BLeafPage &current_leaf,
+    BInternalPage &parent_page,
+    const MergeParentContext &ctx,
+    std::uint32_t underflow_page_num,
+    std::vector<TraversalPathEntry> &path,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
+) {
     if (ctx.left_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
 
     // Merge the current leaf into the left sibling.
@@ -1174,21 +1648,37 @@ BTreeStatus BTree::merge_with_left_leaf(BLeafPage &current_leaf, BInternalPage &
 
     left_sibling.write_back();
     parent_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, *ctx.left_sibling_page_num, left_sibling.data());
+    record_page_effect(action, PageEffectKind::Write, ctx.parent_page_num, parent_page.data());
 
-    PagerResult free_result = pager->free_page(underflow_page_num);
-    if (free_result != PagerResult::Success) {
+    PagerMutationResult free_result = pager->free_page(
+        operation,
+        underflow_page_num);
+    if (free_result.status != PagerResult::Success) {
         pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
         pager->unref_page(ctx.parent_page_num);
         pager->unref_page(underflow_page_num);
         return BTreeStatus::FailedToRemove;
     }
+    record_pager_effects(action, std::move(free_result.effects));
 
     pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
     pager->unref_page(underflow_page_num);
-    return finish_parent_after_merge(parent_page, ctx.parent_page_num, path);
+    return finish_parent_after_merge(
+        parent_page,
+        ctx.parent_page_num,
+        path,
+        operation,
+        action);
 }
 
-BTreeStatus BTree::borrow_from_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num) {
+BTreeStatus BTree::borrow_from_right_internal(
+    BInternalPage &current_page,
+    BInternalPage &parent_page,
+    const MergeParentContext &ctx,
+    std::uint32_t underflow_page_num,
+    PendingBTreeAction *action
+) {
     if (ctx.right_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
 
     // Load the right internal sibling and make sure it can lend one separator.
@@ -1247,6 +1737,9 @@ BTreeStatus BTree::borrow_from_right_internal(BInternalPage &current_page, BInte
     current_page.write_back();
     right_sibling.write_back();
     parent_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, underflow_page_num, current_page.data());
+    record_page_effect(action, PageEffectKind::Write, *ctx.right_sibling_page_num, right_sibling.data());
+    record_page_effect(action, PageEffectKind::Write, ctx.parent_page_num, parent_page.data());
 
     pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
     pager->unref_page(ctx.parent_page_num);
@@ -1254,7 +1747,13 @@ BTreeStatus BTree::borrow_from_right_internal(BInternalPage &current_page, BInte
     return BTreeStatus::Success;
 }
 
-BTreeStatus BTree::borrow_from_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num) {
+BTreeStatus BTree::borrow_from_left_internal(
+    BInternalPage &current_page,
+    BInternalPage &parent_page,
+    const MergeParentContext &ctx,
+    std::uint32_t underflow_page_num,
+    PendingBTreeAction *action
+) {
     if (ctx.left_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
 
     // Load the left internal sibling and make sure it can lend one separator.
@@ -1310,6 +1809,9 @@ BTreeStatus BTree::borrow_from_left_internal(BInternalPage &current_page, BInter
     left_sibling.write_back();
     current_page.write_back();
     parent_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, *ctx.left_sibling_page_num, left_sibling.data());
+    record_page_effect(action, PageEffectKind::Write, underflow_page_num, current_page.data());
+    record_page_effect(action, PageEffectKind::Write, ctx.parent_page_num, parent_page.data());
 
     pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
     pager->unref_page(ctx.parent_page_num);
@@ -1317,7 +1819,15 @@ BTreeStatus BTree::borrow_from_left_internal(BInternalPage &current_page, BInter
     return BTreeStatus::Success;
 }
 
-BTreeStatus BTree::merge_with_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+BTreeStatus BTree::merge_with_right_internal(
+    BInternalPage &current_page,
+    BInternalPage &parent_page,
+    const MergeParentContext &ctx,
+    std::uint32_t underflow_page_num,
+    std::vector<TraversalPathEntry> &path,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
+) {
     if (ctx.right_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
 
     // Merge the right internal page into the current page.
@@ -1398,21 +1908,39 @@ BTreeStatus BTree::merge_with_right_internal(BInternalPage &current_page, BInter
 
     current_page.write_back();
     parent_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, underflow_page_num, current_page.data());
+    record_page_effect(action, PageEffectKind::Write, ctx.parent_page_num, parent_page.data());
 
-    PagerResult free_result = pager->free_page(static_cast<int>(*ctx.right_sibling_page_num));
-    if (free_result != PagerResult::Success) {
+    PagerMutationResult free_result = pager->free_page(
+        operation,
+        *ctx.right_sibling_page_num);
+    if (free_result.status != PagerResult::Success) {
         pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
         pager->unref_page(ctx.parent_page_num);
         pager->unref_page(underflow_page_num);
         return BTreeStatus::FailedToRemove;
     }
+    record_pager_effects(action, std::move(free_result.effects));
 
     pager->unref_page(static_cast<int>(*ctx.right_sibling_page_num));
     pager->unref_page(underflow_page_num);
-    return finish_parent_after_merge(parent_page, ctx.parent_page_num, path);
+    return finish_parent_after_merge(
+        parent_page,
+        ctx.parent_page_num,
+        path,
+        operation,
+        action);
 }
 
-BTreeStatus BTree::merge_with_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+BTreeStatus BTree::merge_with_left_internal(
+    BInternalPage &current_page,
+    BInternalPage &parent_page,
+    const MergeParentContext &ctx,
+    std::uint32_t underflow_page_num,
+    std::vector<TraversalPathEntry> &path,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
+) {
     if (ctx.left_sibling_page_num == std::nullopt) return BTreeStatus::FailedToRemove;
 
     // Merge the current internal page into the left sibling.
@@ -1492,21 +2020,36 @@ BTreeStatus BTree::merge_with_left_internal(BInternalPage &current_page, BIntern
 
     left_sibling.write_back();
     parent_page.write_back();
+    record_page_effect(action, PageEffectKind::Write, *ctx.left_sibling_page_num, left_sibling.data());
+    record_page_effect(action, PageEffectKind::Write, ctx.parent_page_num, parent_page.data());
 
-    PagerResult free_result = pager->free_page(underflow_page_num);
-    if (free_result != PagerResult::Success) {
+    PagerMutationResult free_result = pager->free_page(
+        operation,
+        underflow_page_num);
+    if (free_result.status != PagerResult::Success) {
         pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
         pager->unref_page(ctx.parent_page_num);
         pager->unref_page(underflow_page_num);
         return BTreeStatus::FailedToRemove;
     }
+    record_pager_effects(action, std::move(free_result.effects));
 
     pager->unref_page(static_cast<int>(*ctx.left_sibling_page_num));
     pager->unref_page(underflow_page_num);
-    return finish_parent_after_merge(parent_page, ctx.parent_page_num, path);
+    return finish_parent_after_merge(
+        parent_page,
+        ctx.parent_page_num,
+        path,
+        operation,
+        action);
 }
 
-BTreeStatus BTree::propagate_merging(std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path) {
+BTreeStatus BTree::propagate_merging(
+    std::uint32_t underflow_page_num,
+    std::vector<TraversalPathEntry> &path,
+    BTreeOperation &operation,
+    PendingBTreeAction *action
+) {
     /**
      * Repair an underflow after delete.
      *
@@ -1519,6 +2062,7 @@ BTreeStatus BTree::propagate_merging(std::uint32_t underflow_page_num, std::vect
      */
     // Load the underflowing page first so we can inspect whether we are dealing
     // with a leaf or an internal page.
+    operation.lock_exclusive(underflow_page_num);
     PagerGetResult get_underflow_result = pager->get(underflow_page_num);
     if (get_underflow_result.status != PagerResult::Success) return BTreeStatus::FailedToRead;
 
@@ -1527,11 +2071,17 @@ BTreeStatus BTree::propagate_merging(std::uint32_t underflow_page_num, std::vect
     // Roots are handled separately because they are allowed to break the normal
     // min-key invariant.
     if (path.empty()) {
-        return handle_root_underflow(underflow_page_num, underflow_page_type, get_underflow_result.page->data.data());
+        return handle_root_underflow(
+            underflow_page_num,
+            underflow_page_type,
+            get_underflow_result.page->data.data(),
+            operation,
+            action);
     }
 
     // Load the parent and compute the sibling context around the underflowing page.
     TraversalPathEntry parent_path_entry = path.back();
+    operation.lock_exclusive(parent_path_entry.parent_page_num);
     PagerGetResult get_parent_result = pager->get(parent_path_entry.parent_page_num);
     if (get_parent_result.status != PagerResult::Success) {
         pager->unref_page(underflow_page_num);
@@ -1548,46 +2098,104 @@ BTreeStatus BTree::propagate_merging(std::uint32_t underflow_page_num, std::vect
     BInternalPage parent_page(get_parent_result.page->data.data());
     MergeParentContext ctx = build_merge_parent_context(parent_path_entry, parent_page);
 
+    // Siblings are acquired in page-number order so two structural repairs
+    // cannot take the same sibling group in opposite orders.
+    std::vector<std::uint32_t> sibling_page_nums;
+    if (ctx.left_sibling_page_num) sibling_page_nums.push_back(*ctx.left_sibling_page_num);
+    if (ctx.right_sibling_page_num) sibling_page_nums.push_back(*ctx.right_sibling_page_num);
+    std::sort(sibling_page_nums.begin(), sibling_page_nums.end());
+    for (std::uint32_t sibling_page_num : sibling_page_nums) {
+        operation.lock_exclusive(sibling_page_num);
+    }
+
     if (underflow_page_type == PageType::Leaf) {
         BLeafPage current_leaf(get_underflow_result.page->data.data());
 
         // Try to repair the leaf by borrowing before we merge anything.
         if (ctx.right_sibling_page_num != std::nullopt) {
-            BTreeStatus right_borrow_result = borrow_from_right_leaf(current_leaf, parent_page, ctx, underflow_page_num);
+            BTreeStatus right_borrow_result = borrow_from_right_leaf(
+                current_leaf,
+                parent_page,
+                ctx,
+                underflow_page_num,
+                action);
             if (right_borrow_result == BTreeStatus::Success) return BTreeStatus::Success;
             if (right_borrow_result == BTreeStatus::FailedToRead) return right_borrow_result;
         }
 
         if (ctx.left_sibling_page_num != std::nullopt) {
-            BTreeStatus left_borrow_result = borrow_from_left_leaf(current_leaf, parent_page, ctx, underflow_page_num);
+            BTreeStatus left_borrow_result = borrow_from_left_leaf(
+                current_leaf,
+                parent_page,
+                ctx,
+                underflow_page_num,
+                action);
             if (left_borrow_result == BTreeStatus::Success) return BTreeStatus::Success;
             if (left_borrow_result == BTreeStatus::FailedToRead) return left_borrow_result;
         }
 
         // If borrowing failed from both sides, we have to merge.
         if (ctx.right_sibling_page_num != std::nullopt) {
-            return merge_with_right_leaf(current_leaf, parent_page, ctx, underflow_page_num, path);
+            return merge_with_right_leaf(
+                current_leaf,
+                parent_page,
+                ctx,
+                underflow_page_num,
+                path,
+                operation,
+                action);
         }
-        return merge_with_left_leaf(current_leaf, parent_page, ctx, underflow_page_num, path);
+        return merge_with_left_leaf(
+            current_leaf,
+            parent_page,
+            ctx,
+            underflow_page_num,
+            path,
+            operation,
+            action);
     }
 
     BInternalPage current_page(get_underflow_result.page->data.data());
 
     // Same flow for internal pages: try borrowing first, then fall back to merging.
     if (ctx.right_sibling_page_num != std::nullopt) {
-        BTreeStatus right_borrow_result = borrow_from_right_internal(current_page, parent_page, ctx, underflow_page_num);
+        BTreeStatus right_borrow_result = borrow_from_right_internal(
+            current_page,
+            parent_page,
+            ctx,
+            underflow_page_num,
+            action);
         if (right_borrow_result == BTreeStatus::Success) return BTreeStatus::Success;
         if (right_borrow_result == BTreeStatus::FailedToRead) return right_borrow_result;
     }
 
     if (ctx.left_sibling_page_num != std::nullopt) {
-        BTreeStatus left_borrow_result = borrow_from_left_internal(current_page, parent_page, ctx, underflow_page_num);
+        BTreeStatus left_borrow_result = borrow_from_left_internal(
+            current_page,
+            parent_page,
+            ctx,
+            underflow_page_num,
+            action);
         if (left_borrow_result == BTreeStatus::Success) return BTreeStatus::Success;
         if (left_borrow_result == BTreeStatus::FailedToRead) return left_borrow_result;
     }
 
     if (ctx.right_sibling_page_num != std::nullopt) {
-        return merge_with_right_internal(current_page, parent_page, ctx, underflow_page_num, path);
+        return merge_with_right_internal(
+            current_page,
+            parent_page,
+            ctx,
+            underflow_page_num,
+            path,
+            operation,
+            action);
     }
-    return merge_with_left_internal(current_page, parent_page, ctx, underflow_page_num, path);
+    return merge_with_left_internal(
+        current_page,
+        parent_page,
+        ctx,
+        underflow_page_num,
+        path,
+        operation,
+        action);
 }
