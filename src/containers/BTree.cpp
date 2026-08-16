@@ -141,9 +141,14 @@ BTreeGetStatus BTree::get(const Key &key) {
     */
     BTreeGetStatus get_result{};
     get_result.status = BTreeStatus::Success;
+    BTreeOperation operation(0, pager->page_latch_manager());
+
     // Descend from the root tohe leaf. We pass false to the second arg
     // Since we are not interested in keeping the parent pointers
-    LeafDescentResult descent_result = descend_from_root_to_leaf(key, false);
+    LeafDescentResult descent_result = descend_from_root_to_leaf(
+        key,
+        false,
+        &operation);
     if (descent_result.status == BTreeStatus::EmptyTree) {
         get_result.status = BTreeStatus::KeyNotInTree;
         return get_result;
@@ -418,17 +423,34 @@ BTreeRemoveStatus BTree::remove(const Key &key) {
 
 
 
-LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_path) {
+LeafDescentResult BTree::descend_from_root_to_leaf(
+    const Key &key,
+    bool include_path,
+    BTreeOperation *operation
+) {
     LeafDescentResult descent_result{};
+
+    // Holding page zero keeps the root page number stable until the root's
+    // own latch has been acquired.
+    if (operation) operation->lock_shared(0);
     PagerGetRootResult root_get_result = pager->get_btree_root();
 
     if (root_get_result.status == PagerResult::EmptyBTree) {
+        if (operation) operation->release(0);
         descent_result.status = BTreeStatus::EmptyTree;
         return descent_result;
     }
     if (root_get_result.status != PagerResult::Success) {
+        if (operation) operation->release(0);
         descent_result.status = BTreeStatus::FailedToGetRoot;
         return descent_result;
+    }
+
+    // Acquire the root before releasing page zero. The root frame remains
+    // referenced independently by Pager until this descent releases it.
+    if (operation) {
+        operation->lock_shared(root_get_result.root_page_num);
+        operation->release(0);
     }
 
     // If the root is already a leaf, return the root
@@ -463,12 +485,18 @@ LeafDescentResult BTree::descend_from_root_to_leaf(const Key &key, bool include_
             child_dir = ChildDirection::Left;
         }
 
+        // Latch the child before releasing the parent so structural changes
+        // cannot invalidate the route between these two pages.
+        if (operation) operation->lock_shared(*target_child_page_num);
+
         // Get the computed child page number. That's the next page in our traversal
         PagerGetResult pager_get_result = pager->get(*target_child_page_num);
         pager->unref_page(curr_page_num); // Make sure to unref the parent page since we don't need it anymore.
+        if (operation) operation->release(curr_page_num);
 
         // Handle failure of reading
         if (pager_get_result.status != PagerResult::Success) {
+            if (operation) operation->release(*target_child_page_num);
             descent_result.status = BTreeStatus::FailedToRead;
             return descent_result;
         }

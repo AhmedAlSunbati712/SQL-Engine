@@ -1,6 +1,7 @@
 #pragma once
 #include <BTreePage.h>
 #include <Pager.h>
+#include <containers/BTreeOperation.h>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -84,7 +85,10 @@ class BTree {
 
         void register_cursor();
         void unregister_cursor();
-        LeafDescentResult descend_from_root_to_leaf(const Key &key, bool include_path);
+        LeafDescentResult descend_from_root_to_leaf(
+            const Key &key,
+            bool include_path,
+            BTreeOperation *operation = nullptr);
         struct MergeParentContext {
             std::uint32_t parent_page_num;
             std::size_t child_idx;
