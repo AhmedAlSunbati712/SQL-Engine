@@ -2,6 +2,8 @@
 
 #include <BTree.h>
 #include <KeyCodec.h>
+#include <Log/PendingBTreeAction.h>
+#include <V2PageCodec.h>
 #include <ValueCodec.h>
 
 #include <chrono>
@@ -79,6 +81,33 @@ TEST_F(BTreeIntegrationTest, InsertCommitAndReopenPreservesSingleKey) {
     BTree reopened_tree;
     ASSERT_EQ(reopened_tree.open(db_path.string()), BTreeStatus::Success);
     expect_get_value(reopened_tree, 7, "A");
+}
+
+TEST_F(BTreeIntegrationTest, MutationActionCollectsCompleteDeduplicatedEffects) {
+    BTree tree;
+    ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
+
+    Key key = make_key(7);
+    Value value = ValueCodec::make_char("A");
+    PendingBTreeAction action(1, 1);
+    action.set_undo(InsertUndo{key});
+
+    ASSERT_EQ(tree.insert(key, value, action), BTreeStatus::Success);
+    ASSERT_EQ(action.effects().size(), 2U);
+
+    const PageEffect *header_effect = nullptr;
+    const PageEffect *root_effect = nullptr;
+    for (const PageEffect& effect : action.effects()) {
+        if (effect.page_num == 0) header_effect = &effect;
+        if (effect.page_num == 1) root_effect = &effect;
+    }
+
+    ASSERT_NE(header_effect, nullptr);
+    ASSERT_NE(root_effect, nullptr);
+    EXPECT_EQ(header_effect->kind, PageEffectKind::Write);
+    EXPECT_EQ(root_effect->kind, PageEffectKind::Allocate);
+    EXPECT_EQ(V2PageCodec::page_num(header_effect->after_image), 0U);
+    EXPECT_EQ(V2PageCodec::page_num(root_effect->after_image), 1U);
 }
 
 TEST_F(BTreeIntegrationTest, OverwriteExistingKeyCommitAndReopenPreservesUpdatedValue) {

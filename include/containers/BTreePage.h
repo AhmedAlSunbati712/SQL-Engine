@@ -22,6 +22,7 @@ class BTreePage {
         std::size_t lower_bound_key(const Key &key) const;
         std::optional<Key> first_key() const;
         std::optional<Key> key_at(std::size_t idx) const;
+        const char *data() const noexcept { return page; }
         virtual void write_back();
         virtual bool remove(const Key &key) = 0;
 
