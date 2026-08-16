@@ -3,6 +3,7 @@
 #include <DiskIO.h>
 #include <JournalCodec.h>
 #include <V2PageCodec.h>
+#include <containers/BTreeOperation.h>
 
 #include <cassert>
 #include <cstring>
@@ -49,6 +50,15 @@ bool close_fd_if_open(int &fd) {
         fd = -1;
         return false;
     }
+}
+
+PageEffect page_effect(PageEffectKind kind, const PageV2 *page) {
+    PageEffect effect{
+        .kind = kind,
+        .page_num = page->page_num,
+    };
+    effect.after_image = page->data;
+    return effect;
 }
 
 } // namespace
@@ -233,6 +243,73 @@ PagerGetResult Pager::get(int page_num) {
     return result;
 }
 
+PagerAllocateResult Pager::allocate_page(
+    BTreeOperation& operation,
+    V2PageKind kind
+) {
+    PagerAllocateResult result;
+    if (!is_open) {
+        result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+
+    // Page zero owns the page count and freelist head. Keep its exclusive
+    // latch in the B-tree operation until the complete WAL action is appended.
+    operation.lock_exclusive(DB_HEADER_PAGE_NUM);
+
+    PageV2 *freelist_head_page = nullptr;
+    PageV2 *next_free_page = nullptr;
+    std::uint32_t freelist_head_page_num = FREELIST_NULL_PAGE_NUM;
+    std::uint32_t next_free_page_num = FREELIST_NULL_PAGE_NUM;
+
+    if (db_header.freelist_page_count > 0) {
+        freelist_head_page_num = db_header.freelist_head_page_num;
+        operation.lock_exclusive(freelist_head_page_num);
+
+        PagerResult head_result = get_or_load_page(
+            static_cast<int>(freelist_head_page_num),
+            freelist_head_page);
+        if (head_result != PagerResult::Success) {
+            result.status = head_result;
+            return result;
+        }
+
+        std::uint32_t ignored_previous = FREELIST_NULL_PAGE_NUM;
+        read_freelist_links(
+            freelist_head_page,
+            next_free_page_num,
+            ignored_previous);
+
+        if (next_free_page_num != FREELIST_NULL_PAGE_NUM) {
+            operation.lock_exclusive(next_free_page_num);
+            PagerResult next_result = get_or_load_page(
+                static_cast<int>(next_free_page_num),
+                next_free_page);
+            if (next_result != PagerResult::Success) {
+                result.status = next_result;
+                return result;
+            }
+        }
+    } else {
+        // A brand-new page can be latched before its frame exists because the
+        // latch manager is keyed by the stable logical page number.
+        operation.lock_exclusive(db_header.db_page_count);
+    }
+
+    result = allocate_page(kind);
+    if (result.status != PagerResult::Success) return result;
+
+    PageV2 *header_page = pCache->get(DB_HEADER_PAGE_NUM);
+    assert(header_page != nullptr);
+    result.effects.push_back(page_effect(PageEffectKind::Write, header_page));
+
+    if (next_free_page) {
+        result.effects.push_back(page_effect(PageEffectKind::Write, next_free_page));
+    }
+    result.effects.push_back(page_effect(PageEffectKind::Allocate, result.page));
+    return result;
+}
+
 PagerAllocateResult Pager::allocate_page(V2PageKind kind) {
     /**
      * Description: Used to allocate a new page for a write (or resuing a page from the freelist)
@@ -395,6 +472,44 @@ PagerAllocateResult Pager::allocate_page(V2PageKind kind) {
 
     result.page_num = new_page_num;
     result.page = new_page;
+    return result;
+}
+
+PagerMutationResult Pager::free_page(
+    BTreeOperation& operation,
+    std::uint32_t page_num
+) {
+    PagerMutationResult result;
+    if (!is_open) {
+        result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+
+    // Freeing always changes page zero and the freed page. If a freelist
+    // already exists, its old head also receives a new previous link.
+    operation.lock_exclusive(DB_HEADER_PAGE_NUM);
+    operation.lock_exclusive(page_num);
+
+    const std::uint32_t old_head_page_num = db_header.freelist_head_page_num;
+    if (old_head_page_num != FREELIST_NULL_PAGE_NUM) {
+        operation.lock_exclusive(old_head_page_num);
+    }
+
+    result.status = free_page(static_cast<int>(page_num));
+    if (result.status != PagerResult::Success) return result;
+
+    PageV2 *header_page = pCache->get(DB_HEADER_PAGE_NUM);
+    PageV2 *freed_page = pCache->get(static_cast<int>(page_num));
+    assert(header_page != nullptr);
+    assert(freed_page != nullptr);
+
+    result.effects.push_back(page_effect(PageEffectKind::Write, header_page));
+    if (old_head_page_num != FREELIST_NULL_PAGE_NUM) {
+        PageV2 *old_head = pCache->get(static_cast<int>(old_head_page_num));
+        assert(old_head != nullptr);
+        result.effects.push_back(page_effect(PageEffectKind::Write, old_head));
+    }
+    result.effects.push_back(page_effect(PageEffectKind::Free, freed_page));
     return result;
 }
 
@@ -591,6 +706,28 @@ PagerGetRootResult Pager::get_btree_root() {
     result.status = get_result.status;
     result.page = get_result.page;
     result.root_page_num = db_header.btree_root_page_num;
+    return result;
+}
+
+PagerMutationResult Pager::set_btree_root(
+    BTreeOperation& operation,
+    std::uint32_t root_page_num
+) {
+    PagerMutationResult result;
+    if (!is_open) {
+        result.status = PagerResult::DatabaseNotOpen;
+        return result;
+    }
+
+    operation.lock_exclusive(DB_HEADER_PAGE_NUM);
+    if (root_page_num != 0) operation.lock_exclusive(root_page_num);
+
+    result.status = set_btree_root(root_page_num);
+    if (result.status != PagerResult::Success) return result;
+
+    PageV2 *header_page = pCache->get(DB_HEADER_PAGE_NUM);
+    assert(header_page != nullptr);
+    result.effects.push_back(page_effect(PageEffectKind::Write, header_page));
     return result;
 }
 

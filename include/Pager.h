@@ -2,10 +2,15 @@
 #include <cstdint>
 #include <Page.h>
 #include <PageV2.h>
+#include <PageLatchManager.h>
+#include <Log/WalPayload.h>
 #include <unordered_set>
+#include <vector>
 #include <PCache.h>
 #include <Journal.h>
 #include <LockMgr.h>
+
+class BTreeOperation;
 
 enum class PagerResult : std::uint8_t {
     Success = 0,
@@ -42,6 +47,12 @@ struct PagerAllocateResult {
     PagerResult status = PagerResult::Success;
     int page_num = -1;
     PageV2 *page = nullptr;
+    std::vector<PageEffect> effects;
+};
+
+struct PagerMutationResult {
+    PagerResult status = PagerResult::Success;
+    std::vector<PageEffect> effects;
 };
 
 struct PagerGetRootResult {
@@ -56,7 +67,9 @@ class Pager {
 		~Pager();
 		PagerResult open(std::string db_file); // TODO: Should also create a btree head page if it doesn't exist. Should configure a constant defining the default order
 		PagerGetResult get(int page_num);
+        PagerAllocateResult allocate_page(BTreeOperation& operation, V2PageKind kind);
         PagerAllocateResult allocate_page(V2PageKind kind);
+        PagerMutationResult free_page(BTreeOperation& operation, std::uint32_t page_num);
         PagerResult free_page(int page_num);
 		PagerResult begin_write(int page_num);
 		PagerResult ref_page(int page_num); // increment page ref nums. if page.num_refs == 1, call pcache.pin_page(page_num)
@@ -66,7 +79,9 @@ class Pager {
 		PagerResult rollback_transaction();
 		PagerResult rollback_hot_journal();
         PagerGetRootResult get_btree_root(); //  TODO: should also return root page nuumber. 
+        PagerMutationResult set_btree_root(BTreeOperation& operation, std::uint32_t root_page_num);
         PagerResult set_btree_root(std::uint32_t root_page_num);
+        PageLatchManager& page_latch_manager() noexcept { return page_latch_manager_; }
 	private:
 		struct PagerReadPageResult {
 			PagerResult status = PagerResult::Success;
@@ -88,6 +103,7 @@ class Pager {
 		std::string jFile_name;
 		PCache *pCache = nullptr;
         LockMgr *lock_manager = nullptr;
+		PageLatchManager page_latch_manager_;
 		bool is_open = false;
 		WriteTxnState write_txn_state = WriteTxnState::None;
         DBHeader db_header{};
