@@ -314,14 +314,8 @@ BTreeStatus BTree::insert_impl(
     // We need the path this time in case the insert changes separators or causes a split.
     BTreeOperation operation(pager->page_latch_manager());
     auto finish = [&](BTreeStatus status) {
-        if (status != BTreeStatus::Success || !action) return status;
-        bool finalized = true;
-        if (transaction) {
-            finalized = finalize_action(operation, *transaction, *action);
-        } else if (append_compensation) {
-            finalized = finalize_compensation(operation, *action, *append_compensation);
-        }
-        if (!finalized) {
+        if (status != BTreeStatus::Success) return status;
+        if (!finalize_mutation(operation, action, transaction, append_compensation)) {
             return BTreeStatus::FailedToInsert;
         }
         return BTreeStatus::Success;
@@ -511,14 +505,8 @@ BTreeRemoveStatus BTree::remove_impl(
 
     BTreeOperation operation(pager->page_latch_manager());
     auto finish = [&](BTreeRemoveStatus status) {
-        if (status.status != BTreeStatus::Success || !action) return status;
-        bool finalized = true;
-        if (transaction) {
-            finalized = finalize_action(operation, *transaction, *action);
-        } else if (append_compensation) {
-            finalized = finalize_compensation(operation, *action, *append_compensation);
-        }
-        if (!finalized) {
+        if (status.status != BTreeStatus::Success) return status;
+        if (!finalize_mutation(operation, action, transaction, append_compensation)) {
             status.status = BTreeStatus::FailedToRemove;
         }
         return status;
@@ -629,6 +617,23 @@ void BTree::attach_transaction_manager(
 ) noexcept {
     transaction_manager = &manager;
     if (pager) pager->attach_log(manager.log());
+}
+
+bool BTree::finalize_mutation(
+    BTreeOperation &operation,
+    PendingBTreeAction *action,
+    const TransactionHandle *transaction,
+    TransactionUndoExecutor::CompensationAppender *append_compensation
+) {
+    if (!action) return true;
+
+    if (transaction) {
+        return finalize_action(operation, *transaction, *action);
+    }
+    if (append_compensation) {
+        return finalize_compensation(operation, *action, *append_compensation);
+    }
+    return true;
 }
 
 bool BTree::finalize_action(

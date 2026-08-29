@@ -136,6 +136,7 @@ class BTree {
 
         BTreeStatus insert_impl(const Key &key, Value &value, PendingBTreeAction *action, const TransactionHandle *transaction, TransactionUndoExecutor::CompensationAppender *append_compensation = nullptr);
         BTreeRemoveStatus remove_impl(const Key &key, PendingBTreeAction *action, const TransactionHandle *transaction, TransactionUndoExecutor::CompensationAppender *append_compensation = nullptr);
+        bool finalize_mutation(BTreeOperation &operation, PendingBTreeAction *action, const TransactionHandle *transaction, TransactionUndoExecutor::CompensationAppender *append_compensation);
         bool finalize_action(BTreeOperation &operation, const TransactionHandle &transaction, PendingBTreeAction &action);
         bool finalize_compensation(BTreeOperation &operation, PendingBTreeAction &action, TransactionUndoExecutor::CompensationAppender &append_compensation);
         BTreeStatus propagate_separator_change_upward(const std::vector<TraversalPathEntry> &path, const Key &new_subtree_min, BTreeOperation &operation, PendingBTreeAction *action);
