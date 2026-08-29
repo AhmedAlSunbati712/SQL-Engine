@@ -559,7 +559,7 @@ BTreeRemoveStatus BTree::remove_impl(
     if (key_idx == target_leaf_page.get_key_count() || !KeyCodec::equal(*target_leaf_page.key_at(key_idx), key)) {
         remove_result.status = BTreeStatus::KeyNotInTree;
         pager->unref_page(leaf_page_num);
-        return remove_result;
+        return finish(remove_result);
     }
 
     // Flag to keep track to whether we removed the first key or not
