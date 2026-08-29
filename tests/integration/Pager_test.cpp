@@ -175,7 +175,7 @@ TEST_F(PagerIntegrationTest, OperationAwareAllocationRetainsLatchesAndReturnsEff
     Pager pager;
     ASSERT_EQ(pager.open(db_path.string()), PagerResult::Success);
 
-    BTreeOperation operation(1, pager.page_latch_manager());
+    BTreeOperation operation(pager.page_latch_manager());
     PagerAllocateResult allocation = pager.allocate_page(
         operation,
         V2PageKind::BTreeLeaf);
@@ -220,7 +220,7 @@ TEST_F(PagerIntegrationTest, OperationAwareFreeReturnsEveryChangedPage) {
     ASSERT_EQ(pager.commit_phase_one(), PagerResult::Success);
     ASSERT_EQ(pager.commit_phase_two(), PagerResult::Success);
 
-    BTreeOperation operation(2, pager.page_latch_manager());
+    BTreeOperation operation(pager.page_latch_manager());
     PagerMutationResult freed = pager.free_page(operation, 2);
 
     ASSERT_EQ(freed.status, PagerResult::Success);

@@ -156,14 +156,13 @@ needs that page.
 
 ### B+ Tree Operation
 
-Every public B+ tree call creates a `BTreeOperation`. It carries the transaction
-ID for diagnostics and owns logical page latches, but never pager references or
-frame pointers:
+Every public B+ tree call creates a `BTreeOperation`. It owns logical page
+latches, but never transaction identity, pager references, or frame pointers:
 
 ```cpp
 class BTreeOperation {
 public:
-    BTreeOperation(TransactionId txn_id, PageLatchManager& latch_manager);
+    explicit BTreeOperation(PageLatchManager& latch_manager);
     ~BTreeOperation();
 
     void lock_shared(std::uint32_t page_num);
@@ -174,7 +173,6 @@ public:
     std::optional<PageLatchMode> latch_mode(std::uint32_t page_num) const;
 
 private:
-    TransactionId txn_id_;
     PageLatchManager& latch_manager_;
     std::unordered_map<std::uint32_t, HeldPageLatch> held_latches_;
 };

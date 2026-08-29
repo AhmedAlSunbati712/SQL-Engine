@@ -4,10 +4,8 @@
 #include <utility>
 
 BTreeOperation::BTreeOperation(
-    TransactionId txn_id,
     PageLatchManager& latch_manager
-) : txn_id_(txn_id),
-    latch_manager_(latch_manager) {}
+) : latch_manager_(latch_manager) {}
 
 BTreeOperation::~BTreeOperation() noexcept {
     release_all();

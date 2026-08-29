@@ -192,7 +192,7 @@ BTreeGetStatus BTree::get(const Key &key) {
         return get_result;
     }
     get_result.status = BTreeStatus::Success;
-    BTreeOperation operation(0, pager->page_latch_manager());
+    BTreeOperation operation(pager->page_latch_manager());
 
     // Descend from the root tohe leaf. We pass false to the second arg
     // Since we are not interested in keeping the parent pointers
@@ -260,7 +260,6 @@ BTreeStatus BTree::insert_impl(
     Value &value,
     PendingBTreeAction *action,
     const TransactionHandle *transaction,
-    Transaction *undo_transaction,
     TransactionUndoExecutor::CompensationAppender *append_compensation
 ) {
     /**
@@ -313,11 +312,7 @@ BTreeStatus BTree::insert_impl(
 
     // Descend from the root to the target leaf.
     // We need the path this time in case the insert changes separators or causes a split.
-    BTreeOperation operation(
-        transaction && *transaction
-            ? (*transaction)->id()
-            : (undo_transaction ? undo_transaction->id() : 0),
-        pager->page_latch_manager());
+    BTreeOperation operation(pager->page_latch_manager());
     auto finish = [&](BTreeStatus status) {
         if (status != BTreeStatus::Success || !action) return status;
         bool finalized = true;
@@ -464,7 +459,6 @@ BTreeRemoveStatus BTree::remove_impl(
     const Key &key,
     PendingBTreeAction *action,
     const TransactionHandle *transaction,
-    Transaction *undo_transaction,
     TransactionUndoExecutor::CompensationAppender *append_compensation
 ) {
     /**
@@ -515,11 +509,7 @@ BTreeRemoveStatus BTree::remove_impl(
         return remove_result;
     }
 
-    BTreeOperation operation(
-        transaction && *transaction
-            ? (*transaction)->id()
-            : (undo_transaction ? undo_transaction->id() : 0),
-        pager->page_latch_manager());
+    BTreeOperation operation(pager->page_latch_manager());
     auto finish = [&](BTreeRemoveStatus status) {
         if (status.status != BTreeStatus::Success || !action) return status;
         bool finalized = true;
@@ -729,7 +719,6 @@ bool BTree::apply_undo(
             insert->key,
             &action,
             nullptr,
-            &transaction,
             &append_compensation).status == BTreeStatus::Success;
     }
 
@@ -748,7 +737,6 @@ bool BTree::apply_undo(
         value,
         &action,
         nullptr,
-        &transaction,
         &append_compensation) == BTreeStatus::Success;
 }
 

@@ -78,8 +78,8 @@ The responsibilities are divided as follows:
 ### Operation-Scoped Page Latches
 
 Transactions own logical key locks, but they do not own page latches. Each B+
-tree call creates a `BTreeOperation` containing its transaction ID and logical
-page latches acquired by page number from a sharded `PageLatchManager`.
+tree call creates a `BTreeOperation` containing logical page latches acquired
+by page number from a sharded `PageLatchManager`.
 `PageV2` stores no latch. The operation owns no pins or frame pointers, so the
 B+ tree explicitly unreferences frames during traversal while retaining any
 ancestor latch needed for later propagation.
