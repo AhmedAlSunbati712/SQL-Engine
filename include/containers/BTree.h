@@ -26,18 +26,6 @@ enum class BTreeStatus : std::uint8_t {
     CursorActive,
 };
 
-enum class BTreeCommitStatus : std::uint8_t {
-    Success = 0,
-    Failed,
-    CursorActive
-};
-
-enum class BTreeRollbackStatus : std::uint8_t {
-    Success = 0,
-    Failed,
-    CursorActive
-};
-
 enum class ChildDirection : std::uint8_t {
     Right = 0,
     Left
@@ -86,22 +74,11 @@ class BTree {
         ~BTree();
         BTreeStatus open(std::string db_file);
         BTreeStatus close();
-        BTreeCommitStatus commit();
-        BTreeRollbackStatus rollback();
         BTreeGetStatus get(const Key &key);
-        BTreeStatus insert(const Key &key, Value &value);
-        BTreeStatus insert(
-            const Key &key,
-            Value &value,
-            PendingBTreeAction &action);
         BTreeStatus insert(
             const TransactionHandle &transaction,
             const Key &key,
             Value &value,
-            PendingBTreeAction &action);
-        BTreeRemoveStatus remove(const Key &key);
-        BTreeRemoveStatus remove(
-            const Key &key,
             PendingBTreeAction &action);
         BTreeRemoveStatus remove(
             const TransactionHandle &transaction,
@@ -147,13 +124,13 @@ class BTree {
         MergeParentContext build_merge_parent_context(const TraversalPathEntry &parent_path_entry, BInternalPage &parent_page);
         BTreeStatus finish_parent_after_merge(BInternalPage &parent_page, std::uint32_t parent_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);
 
-        BTreeStatus borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, PendingBTreeAction *action);
-        BTreeStatus borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, PendingBTreeAction *action);
+        BTreeStatus borrow_from_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, BTreeOperation &operation, PendingBTreeAction *action);
+        BTreeStatus borrow_from_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, BTreeOperation &operation, PendingBTreeAction *action);
         BTreeStatus merge_with_right_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);
         BTreeStatus merge_with_left_leaf(BLeafPage &current_leaf, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);
 
-        BTreeStatus borrow_from_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, PendingBTreeAction *action);
-        BTreeStatus borrow_from_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, PendingBTreeAction *action);
+        BTreeStatus borrow_from_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, BTreeOperation &operation, PendingBTreeAction *action);
+        BTreeStatus borrow_from_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, BTreeOperation &operation, PendingBTreeAction *action);
         BTreeStatus merge_with_right_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);
         BTreeStatus merge_with_left_internal(BInternalPage &current_page, BInternalPage &parent_page, const MergeParentContext &ctx, std::uint32_t underflow_page_num, std::vector<TraversalPathEntry> &path, BTreeOperation &operation, PendingBTreeAction *action);
 

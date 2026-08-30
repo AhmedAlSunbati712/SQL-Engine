@@ -16,8 +16,10 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -30,19 +32,10 @@ Key make_key(std::uint64_t key) {
     return KeyCodec::make_uint64(key);
 }
 
-class NoopUndoExecutor final : public TransactionUndoExecutor {
-public:
-    void undo(
-        Transaction&,
-        const UndoDescriptor&,
-        CompensationAppender) override {
-    }
-};
-
 Config wal_config() {
     return {
-        .max_index_bytes = 100 * Index::ENTRY_SIZE,
-        .max_store_bytes = 1024 * 1024,
+        .max_index_bytes = 1000 * Index::ENTRY_SIZE,
+        .max_store_bytes = 16 * 1024 * 1024,
         .initial_lsn = 1,
     };
 }
@@ -58,75 +51,157 @@ std::array<char, V2_PAGE_SIZE> read_page(
     return bytes;
 }
 
+class BTreeUndoExecutor final : public TransactionUndoExecutor {
+public:
+    BTree *tree = nullptr;
+
+    void undo(
+        Transaction &transaction,
+        const UndoDescriptor &undo,
+        CompensationAppender append_compensation
+    ) override {
+        if (!tree || !tree->apply_undo(
+                transaction,
+                undo,
+                std::move(append_compensation))) {
+            throw std::runtime_error("B-tree undo failed");
+        }
+    }
+};
+
+class BTreeHarness {
+public:
+    BTreeHarness(
+        const std::filesystem::path &db_path,
+        const std::filesystem::path &wal_path
+    ) : log(wal_config()),
+        transaction_manager(log, lock_manager, undo_executor),
+        db_path(db_path) {
+        log.open(wal_path.string());
+        tree.attach_transaction_manager(transaction_manager);
+        undo_executor.tree = &tree;
+        if (tree.open(db_path.string()) != BTreeStatus::Success) {
+            throw std::runtime_error("Failed to open B-tree test harness");
+        }
+    }
+
+    ~BTreeHarness() {
+        tree.close();
+    }
+
+    BTreeStatus insert(
+        const TransactionHandle &transaction,
+        const Key &key,
+        Value value
+    ) {
+        PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+        BTreeGetStatus previous = tree.get(key);
+        if (previous.status == BTreeStatus::Success) {
+            action.set_undo(UpdateUndo{key, previous.value});
+        } else {
+            action.set_undo(InsertUndo{key});
+        }
+        return tree.insert(transaction, key, value, action);
+    }
+
+    BTreeRemoveStatus remove(
+        const TransactionHandle &transaction,
+        const Key &key
+    ) {
+        BTreeGetStatus previous = tree.get(key);
+        if (previous.status != BTreeStatus::Success) {
+            return BTreeRemoveStatus{.status = previous.status};
+        }
+        PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+        action.set_undo(DeleteUndo{key, previous.value});
+        return tree.remove(transaction, key, action);
+    }
+
+    void reopen() {
+        if (tree.close() != BTreeStatus::Success ||
+            tree.open(db_path.string()) != BTreeStatus::Success) {
+            throw std::runtime_error("Failed to reopen B-tree test harness");
+        }
+    }
+
+    Log log;
+    LockManager lock_manager;
+    BTreeUndoExecutor undo_executor;
+    TransactionManager transaction_manager;
+    BTree tree;
+
+private:
+    std::filesystem::path db_path;
+};
+
 class BTreeIntegrationTest : public ::testing::Test {
-    protected:
-        void SetUp() override {
-            auto unique_suffix = std::to_string(
-                std::chrono::steady_clock::now().time_since_epoch().count()
-            );
-            temp_dir = std::filesystem::temp_directory_path() / ("stoneleafdb_btree_test_" + unique_suffix);
-            db_path = temp_dir / "test.db";
-            std::filesystem::create_directories(temp_dir);
-        }
+protected:
+    void SetUp() override {
+        auto unique_suffix = std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        temp_dir = std::filesystem::temp_directory_path() /
+            ("stoneleafdb_btree_test_" + unique_suffix);
+        db_path = temp_dir / "test.db";
+        std::filesystem::create_directories(temp_dir);
+    }
 
-        void TearDown() override {
-            std::error_code ec;
-            std::filesystem::remove_all(temp_dir, ec);
-        }
+    void TearDown() override {
+        std::error_code ec;
+        std::filesystem::remove_all(temp_dir, ec);
+    }
 
-        Value make_small_key_value(std::uint64_t key) {
-            char payload = static_cast<char>('A' + (key % 26));
-            return ValueCodec::make_char(std::string(1, payload));
-        }
+    Value make_small_key_value(std::uint64_t key) {
+        char payload = static_cast<char>('A' + (key % 26));
+        return ValueCodec::make_char(std::string(1, payload));
+    }
 
-        void expect_get_value(BTree &tree, std::uint64_t key, const std::string &expected_payload) {
-            BTreeGetStatus get_result = tree.get(make_key(key));
-            ASSERT_EQ(get_result.status, BTreeStatus::Success);
-            EXPECT_EQ(value_to_string(get_result.value), expected_payload);
-        }
+    void expect_get_value(
+        BTree &tree,
+        std::uint64_t key,
+        const std::string &expected_payload
+    ) {
+        BTreeGetStatus get_result = tree.get(make_key(key));
+        ASSERT_EQ(get_result.status, BTreeStatus::Success);
+        EXPECT_EQ(value_to_string(get_result.value), expected_payload);
+    }
 
-        void expect_key_missing(BTree &tree, std::uint64_t key) {
-            BTreeGetStatus get_result = tree.get(make_key(key));
-            EXPECT_EQ(get_result.status, BTreeStatus::KeyNotInTree);
-        }
+    void expect_key_missing(BTree &tree, std::uint64_t key) {
+        EXPECT_EQ(tree.get(make_key(key)).status, BTreeStatus::KeyNotInTree);
+    }
 
-        std::filesystem::path temp_dir;
-        std::filesystem::path db_path;
+    std::filesystem::path temp_dir;
+    std::filesystem::path db_path;
 };
 
 TEST_F(BTreeIntegrationTest, GetOnFreshTreeReturnsKeyNotInTree) {
     BTree tree;
     ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-    BTreeGetStatus get_result = tree.get(make_key(42));
-    EXPECT_EQ(get_result.status, BTreeStatus::KeyNotInTree);
+    EXPECT_EQ(tree.get(make_key(42)).status, BTreeStatus::KeyNotInTree);
 }
 
 TEST_F(BTreeIntegrationTest, InsertCommitAndReopenPreservesSingleKey) {
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
+    ASSERT_EQ(
+        harness.insert(transaction, make_key(7), ValueCodec::make_char("A")),
+        BTreeStatus::Success);
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
 
-        Value value = ValueCodec::make_char("A");
-        ASSERT_EQ(tree.insert(make_key(7), value), BTreeStatus::Success);
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
-    }
-
-    BTree reopened_tree;
-    ASSERT_EQ(reopened_tree.open(db_path.string()), BTreeStatus::Success);
-    expect_get_value(reopened_tree, 7, "A");
+    harness.reopen();
+    expect_get_value(harness.tree, 7, "A");
 }
 
 TEST_F(BTreeIntegrationTest, MutationActionCollectsCompleteDeduplicatedEffects) {
-    BTree tree;
-    ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
     Key key = make_key(7);
     Value value = ValueCodec::make_char("A");
-    PendingBTreeAction action(1, 1);
+    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
     action.set_undo(InsertUndo{key});
 
-    ASSERT_EQ(tree.insert(key, value, action), BTreeStatus::Success);
+    ASSERT_EQ(
+        harness.tree.insert(transaction, key, value, action),
+        BTreeStatus::Success);
     ASSERT_EQ(action.effects().size(), 2U);
 
     const PageEffect *header_effect = nullptr;
@@ -135,7 +210,6 @@ TEST_F(BTreeIntegrationTest, MutationActionCollectsCompleteDeduplicatedEffects) 
         if (effect.page_num == 0) header_effect = &effect;
         if (effect.page_num == 1) root_effect = &effect;
     }
-
     ASSERT_NE(header_effect, nullptr);
     ASSERT_NE(root_effect, nullptr);
     EXPECT_EQ(header_effect->kind, PageEffectKind::Write);
@@ -145,190 +219,148 @@ TEST_F(BTreeIntegrationTest, MutationActionCollectsCompleteDeduplicatedEffects) 
 }
 
 TEST_F(BTreeIntegrationTest, TransactionalInsertAppendsWalAndInstallsAssignedLsn) {
-    const std::filesystem::path wal_path = temp_dir / "wal";
-    Log log(wal_config());
-    log.open(wal_path.string());
-    LockManager lock_manager;
-    NoopUndoExecutor undo_executor;
-    TransactionManager transaction_manager(log, lock_manager, undo_executor);
-
-    BTree tree;
-    ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-    tree.attach_transaction_manager(transaction_manager);
-
-    const TransactionHandle transaction = transaction_manager.begin();
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
     Key key = make_key(7);
     Value value = ValueCodec::make_char("A");
     PendingBTreeAction action(transaction->id(), transaction->last_lsn());
     action.set_undo(InsertUndo{key});
 
     ASSERT_EQ(
-        tree.insert(transaction, key, value, action),
+        harness.tree.insert(transaction, key, value, action),
         BTreeStatus::Success);
     const Lsn action_lsn = transaction->last_lsn();
     ASSERT_EQ(action_lsn, 2U);
-
-    const WalRecord record = log.read(action_lsn);
-    EXPECT_EQ(record.type, WalRecordType::BTreeAction);
-    EXPECT_EQ(record.prev_lsn, 1U);
+    EXPECT_EQ(harness.log.read(action_lsn).type, WalRecordType::BTreeAction);
     EXPECT_EQ(
-        std::get<BTreeActionPayload>(WalRecords::decode(record)).effects.size(),
+        std::get<BTreeActionPayload>(
+            WalRecords::decode(harness.log.read(action_lsn))).effects.size(),
         2U);
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
 
-    // The legacy pager commit remains in place during this integration slice.
-    // Flush it so the test can inspect the installed LSNs on disk.
-    ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
-    EXPECT_GE(log.durable_lsn(), action_lsn);
+    harness.reopen();
     const auto header = read_page(db_path, 0);
     const auto root = read_page(db_path, 1);
     EXPECT_EQ(V2PageCodec::page_lsn(header), action_lsn);
     EXPECT_EQ(V2PageCodec::page_lsn(root), action_lsn);
     EXPECT_EQ(V2PageCodec::validate(header), V2PageCodecResult::Success);
     EXPECT_EQ(V2PageCodec::validate(root), V2PageCodecResult::Success);
-
-    EXPECT_EQ(
-        transaction_manager.commit(transaction),
-        CommitStatus::Success);
 }
 
-TEST_F(BTreeIntegrationTest, OverwriteExistingKeyCommitAndReopenPreservesUpdatedValue) {
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
+TEST_F(BTreeIntegrationTest, OverwriteCommitAndReopenPreservesUpdatedValue) {
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
+    ASSERT_EQ(
+        harness.insert(transaction, make_key(11), ValueCodec::make_char("F")),
+        BTreeStatus::Success);
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
 
-        Value initial_value = ValueCodec::make_char("F");
-        ASSERT_EQ(tree.insert(make_key(11), initial_value), BTreeStatus::Success);
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
-    }
-
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-        Value updated_value = ValueCodec::make_char("T");
-        ASSERT_EQ(tree.insert(make_key(11), updated_value), BTreeStatus::Success);
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
-    }
-
-    BTree reopened_tree;
-    ASSERT_EQ(reopened_tree.open(db_path.string()), BTreeStatus::Success);
-    expect_get_value(reopened_tree, 11, "T");
+    transaction = harness.transaction_manager.begin();
+    ASSERT_EQ(
+        harness.insert(transaction, make_key(11), ValueCodec::make_char("T")),
+        BTreeStatus::Success);
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
+    harness.reopen();
+    expect_get_value(harness.tree, 11, "T");
 }
 
-TEST_F(BTreeIntegrationTest, RollbackDiscardsUncommittedInsert) {
-    BTree tree;
-    ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-    Value value = ValueCodec::make_char("R");
-    ASSERT_EQ(tree.insert(make_key(25), value), BTreeStatus::Success);
-    ASSERT_EQ(tree.rollback(), BTreeRollbackStatus::Success);
-
-    expect_key_missing(tree, 25);
+TEST_F(BTreeIntegrationTest, AbortDiscardsUncommittedInsert) {
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
+    ASSERT_EQ(
+        harness.insert(transaction, make_key(25), ValueCodec::make_char("R")),
+        BTreeStatus::Success);
+    ASSERT_EQ(
+        harness.transaction_manager.abort(transaction, AbortReason::ClientRequest),
+        AbortStatus::Success);
+    expect_key_missing(harness.tree, 25);
 }
 
 TEST_F(BTreeIntegrationTest, ManyInsertsSplitRootAndRemainReadableAcrossReopen) {
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-        for (std::uint64_t key = 0; key < 260; key++) {
-            Value value = make_small_key_value(key);
-            ASSERT_EQ(tree.insert(make_key(key), value), BTreeStatus::Success);
-        }
-
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
-    }
-
-    BTree reopened_tree;
-    ASSERT_EQ(reopened_tree.open(db_path.string()), BTreeStatus::Success);
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
     for (std::uint64_t key = 0; key < 260; key++) {
-        expect_get_value(reopened_tree, key, std::string(1, static_cast<char>('A' + (key % 26))));
+        ASSERT_EQ(
+            harness.insert(transaction, make_key(key), make_small_key_value(key)),
+            BTreeStatus::Success);
+    }
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
+    harness.reopen();
+
+    for (std::uint64_t key = 0; key < 260; key++) {
+        expect_get_value(
+            harness.tree,
+            key,
+            std::string(1, static_cast<char>('A' + (key % 26))));
     }
 }
 
 TEST_F(BTreeIntegrationTest, RemoveCommitAndReopenDeletesKey) {
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
+    ASSERT_EQ(
+        harness.insert(transaction, make_key(10), ValueCodec::make_char("L")),
+        BTreeStatus::Success);
+    ASSERT_EQ(
+        harness.insert(transaction, make_key(20), ValueCodec::make_char("R")),
+        BTreeStatus::Success);
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
 
-        Value left_value = ValueCodec::make_char("L");
-        Value right_value = ValueCodec::make_char("R");
-        ASSERT_EQ(tree.insert(make_key(10), left_value), BTreeStatus::Success);
-        ASSERT_EQ(tree.insert(make_key(20), right_value), BTreeStatus::Success);
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
-    }
-
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-        BTreeRemoveStatus remove_result = tree.remove(make_key(10));
-        ASSERT_EQ(remove_result.status, BTreeStatus::Success);
-        EXPECT_EQ(value_to_string(remove_result.value), "L");
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
-    }
-
-    BTree reopened_tree;
-    ASSERT_EQ(reopened_tree.open(db_path.string()), BTreeStatus::Success);
-    expect_key_missing(reopened_tree, 10);
-    expect_get_value(reopened_tree, 20, "R");
+    transaction = harness.transaction_manager.begin();
+    BTreeRemoveStatus removed = harness.remove(transaction, make_key(10));
+    ASSERT_EQ(removed.status, BTreeStatus::Success);
+    EXPECT_EQ(value_to_string(removed.value), "L");
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
+    harness.reopen();
+    expect_key_missing(harness.tree, 10);
+    expect_get_value(harness.tree, 20, "R");
 }
 
-TEST_F(BTreeIntegrationTest, RollbackDiscardsRemove) {
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
+TEST_F(BTreeIntegrationTest, AbortDiscardsRemove) {
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
+    ASSERT_EQ(
+        harness.insert(transaction, make_key(55), ValueCodec::make_char("T")),
+        BTreeStatus::Success);
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
 
-        Value value = ValueCodec::make_char("T");
-        ASSERT_EQ(tree.insert(make_key(55), value), BTreeStatus::Success);
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
-    }
-
-    BTree tree;
-    ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-    BTreeRemoveStatus remove_result = tree.remove(make_key(55));
-    ASSERT_EQ(remove_result.status, BTreeStatus::Success);
-    ASSERT_EQ(tree.rollback(), BTreeRollbackStatus::Success);
-
-    expect_get_value(tree, 55, "T");
+    transaction = harness.transaction_manager.begin();
+    ASSERT_EQ(harness.remove(transaction, make_key(55)).status, BTreeStatus::Success);
+    ASSERT_EQ(
+        harness.transaction_manager.abort(transaction, AbortReason::ClientRequest),
+        AbortStatus::Success);
+    expect_get_value(harness.tree, 55, "T");
 }
 
-TEST_F(BTreeIntegrationTest, ManyDeletesTriggerStructuralRepairAndKeepRemainingKeysReadable) {
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-        for (std::uint64_t key = 0; key < 260; key++) {
-            Value value = make_small_key_value(key);
-            ASSERT_EQ(tree.insert(make_key(key), value), BTreeStatus::Success);
-        }
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
+TEST_F(BTreeIntegrationTest, ManyDeletesRepairTreeAndPreserveRemainingKeys) {
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
+    for (std::uint64_t key = 0; key < 260; key++) {
+        ASSERT_EQ(
+            harness.insert(transaction, make_key(key), make_small_key_value(key)),
+            BTreeStatus::Success);
     }
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
 
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-        for (std::uint64_t key = 0; key < 180; key++) {
-            BTreeRemoveStatus remove_result = tree.remove(make_key(key));
-            ASSERT_EQ(remove_result.status, BTreeStatus::Success);
-            EXPECT_EQ(remove_result.value.type, ValueType::Char);
-            EXPECT_EQ(value_to_string(remove_result.value), std::string(1, static_cast<char>('A' + (key % 26))));
-        }
-
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
+    transaction = harness.transaction_manager.begin();
+    for (std::uint64_t key = 0; key < 180; key++) {
+        BTreeRemoveStatus removed = harness.remove(transaction, make_key(key));
+        ASSERT_EQ(removed.status, BTreeStatus::Success);
+        EXPECT_EQ(
+            value_to_string(removed.value),
+            std::string(1, static_cast<char>('A' + (key % 26))));
     }
-
-    BTree reopened_tree;
-    ASSERT_EQ(reopened_tree.open(db_path.string()), BTreeStatus::Success);
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
+    harness.reopen();
 
     for (std::uint64_t key = 0; key < 180; key++) {
-        expect_key_missing(reopened_tree, key);
+        expect_key_missing(harness.tree, key);
     }
-
     for (std::uint64_t key = 180; key < 260; key++) {
-        expect_get_value(reopened_tree, key, std::string(1, static_cast<char>('A' + (key % 26))));
+        expect_get_value(
+            harness.tree,
+            key,
+            std::string(1, static_cast<char>('A' + (key % 26))));
     }
 }
 
@@ -341,28 +373,22 @@ TEST_F(BTreeIntegrationTest, HeterogeneousKeysRemainDistinctAcrossCommit) {
         KeyCodec::make_bytes({'1'})
     };
 
-    {
-        BTree tree;
-        ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-
-        for (std::size_t i = 0; i < keys.size(); i++) {
-            Value value = ValueCodec::make_varuint(i);
-            ASSERT_EQ(tree.insert(keys[i], value), BTreeStatus::Success);
-        }
-
-        ASSERT_EQ(tree.commit(), BTreeCommitStatus::Success);
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    TransactionHandle transaction = harness.transaction_manager.begin();
+    for (std::size_t i = 0; i < keys.size(); i++) {
+        ASSERT_EQ(
+            harness.insert(transaction, keys[i], ValueCodec::make_varuint(i)),
+            BTreeStatus::Success);
     }
-
-    BTree reopened_tree;
-    ASSERT_EQ(reopened_tree.open(db_path.string()), BTreeStatus::Success);
+    ASSERT_EQ(harness.transaction_manager.commit(transaction), CommitStatus::Success);
+    harness.reopen();
 
     for (std::size_t i = 0; i < keys.size(); i++) {
-        BTreeGetStatus get_result = reopened_tree.get(keys[i]);
-        ASSERT_EQ(get_result.status, BTreeStatus::Success);
-
-        std::uint64_t decoded_value = 0;
-        ASSERT_TRUE(ValueCodec::decode_varuint(get_result.value, &decoded_value));
-        EXPECT_EQ(decoded_value, i);
+        BTreeGetStatus result = harness.tree.get(keys[i]);
+        ASSERT_EQ(result.status, BTreeStatus::Success);
+        std::uint64_t decoded = 0;
+        ASSERT_TRUE(ValueCodec::decode_varuint(result.value, &decoded));
+        EXPECT_EQ(decoded, i);
     }
 }
 

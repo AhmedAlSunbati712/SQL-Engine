@@ -32,18 +32,6 @@ TEST(BTreeUnitTest, CloseOnFreshTreeSucceeds) {
     EXPECT_EQ(tree.close(), BTreeStatus::Success);
 }
 
-TEST(BTreeUnitTest, CommitOnFreshTreeFails) {
-    BTree tree;
-
-    EXPECT_EQ(tree.commit(), BTreeCommitStatus::Failed);
-}
-
-TEST(BTreeUnitTest, RollbackOnFreshTreeFails) {
-    BTree tree;
-
-    EXPECT_EQ(tree.rollback(), BTreeRollbackStatus::Failed);
-}
-
 TEST(BTreeUnitTest, OpenFailsWhenPathIsDirectory) {
     TempDbPath temp_db;
     BTree tree;
