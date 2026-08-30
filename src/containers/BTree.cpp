@@ -80,8 +80,12 @@ bool BTree::cursor_active() const {
 BTreeStatus BTree::open(std::string db_file) {
     assert(!pager_open && pager == nullptr);
 
+    // Pager only implements the WAL mutation path now, so a tree cannot open
+    // without a transaction manager to supply its Log.
+    if (!transaction_manager) return BTreeStatus::FailedToOpenDB;
+
     pager = new Pager();
-    if (transaction_manager) pager->attach_log(transaction_manager->log());
+    pager->attach_log(transaction_manager->log());
     PagerResult open_result = pager->open(db_file);
     if (open_result != PagerResult::Success) {
         delete pager;
@@ -102,13 +106,10 @@ BTreeStatus BTree::close() {
     // Closing the pager would invalidate every page and path owned by a cursor.
     if (active_cursor_count > 0) return BTreeStatus::CursorActive;
 
-    // WAL-backed pages are flushed only after their record is durable. A tree
-    // without a transaction manager still uses the isolated legacy Pager path.
+    // WAL-backed pages are flushed only after their record is durable.
     BTreeStatus close_status = BTreeStatus::Success;
     if (pager_open && pager) {
-        PagerResult finish_result = transaction_manager
-            ? pager->flush_wal_pages()
-            : pager->rollback_transaction();
+        PagerResult finish_result = pager->flush_wal_pages();
         if (finish_result != PagerResult::Success) {
             close_status = BTreeStatus::FailedToCloseDB;
         }

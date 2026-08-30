@@ -174,9 +174,8 @@ protected:
 };
 
 TEST_F(BTreeIntegrationTest, GetOnFreshTreeReturnsKeyNotInTree) {
-    BTree tree;
-    ASSERT_EQ(tree.open(db_path.string()), BTreeStatus::Success);
-    EXPECT_EQ(tree.get(make_key(42)).status, BTreeStatus::KeyNotInTree);
+    BTreeHarness harness(db_path, temp_dir / "wal");
+    EXPECT_EQ(harness.tree.get(make_key(42)).status, BTreeStatus::KeyNotInTree);
 }
 
 TEST_F(BTreeIntegrationTest, InsertCommitAndReopenPreservesSingleKey) {
