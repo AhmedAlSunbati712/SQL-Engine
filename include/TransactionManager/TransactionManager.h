@@ -71,6 +71,11 @@ public:
     // Returns an empty handle when the transaction is not active.
     TransactionHandle find(TransactionId txn_id) const;
 
+    // True while any transaction this manager owns has not yet committed or
+    // aborted. Storage owners use this to refuse tearing down shared state
+    // out from under a transaction that may still reference it.
+    bool has_active_transactions() const noexcept;
+
     // Appends one completed B-tree action and advances the transaction's WAL
     // chain only after Log assigns the record an LSN.
     Lsn append_action(const TransactionHandle& transaction, PendingWalRecord action);

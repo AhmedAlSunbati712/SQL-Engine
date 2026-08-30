@@ -28,14 +28,21 @@ namespace {
 
 class Connection {
     public:
-        explicit Connection(KeyStore &key_store) {
+        Connection(
+            KeyStore &key_store,
+            TransactionManager &transaction_manager
+        ) {
             int sockets[2] = {-1, -1};
             if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
                 throw std::runtime_error("Failed to create test socket pair");
             }
 
             session = std::make_unique<Session>(sockets[0], 0);
-            dispatcher = std::thread(CommandServer::serve_connection, sockets[1], std::ref(key_store));
+            dispatcher = std::thread(
+                CommandServer::serve_connection,
+                sockets[1],
+                std::ref(key_store),
+                std::ref(transaction_manager));
         }
 
         ~Connection() {
@@ -62,14 +69,21 @@ class Connection {
 
 class RawConnection {
     public:
-        explicit RawConnection(KeyStore &key_store) {
+        RawConnection(
+            KeyStore &key_store,
+            TransactionManager &transaction_manager
+        ) {
             int sockets[2] = {-1, -1};
             if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
                 throw std::runtime_error("Failed to create test socket pair");
             }
 
             client_fd = sockets[0];
-            dispatcher = std::thread(CommandServer::serve_connection, sockets[1], std::ref(key_store));
+            dispatcher = std::thread(
+                CommandServer::serve_connection,
+                sockets[1],
+                std::ref(key_store),
+                std::ref(transaction_manager));
         }
 
         ~RawConnection() {
@@ -94,37 +108,6 @@ class RawConnection {
         std::thread dispatcher;
 };
 
-class TransactionalConnection {
-    public:
-        TransactionalConnection(
-            KeyStore &key_store,
-            TransactionManager &transaction_manager
-        ) {
-            int sockets[2] = {-1, -1};
-            if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
-                throw std::runtime_error("Failed to create test socket pair");
-            }
-
-            session = std::make_unique<Session>(sockets[0], 0);
-            dispatcher = std::thread(
-                CommandServer::serve_transactional_connection,
-                sockets[1],
-                std::ref(key_store),
-                std::ref(transaction_manager));
-        }
-
-        ~TransactionalConnection() {
-            session->close();
-            if (dispatcher.joinable()) dispatcher.join();
-        }
-
-        Session &client() { return *session; }
-
-    private:
-        std::unique_ptr<Session> session;
-        std::thread dispatcher;
-};
-
 void send_bytes(int socket_fd, const std::uint8_t *buffer, std::size_t size) {
     std::size_t bytes_sent = 0;
 
@@ -143,24 +126,39 @@ class CommandServerIntegrationTest : public ::testing::Test {
             temp_dir = std::filesystem::temp_directory_path() / ("stoneleafdb_command_server_test_" + suffix);
             db_path = temp_dir / "test.db";
             std::filesystem::create_directories(temp_dir);
+            log = std::make_unique<Log>(Config{
+                .max_index_bytes = 100 * Index::ENTRY_SIZE,
+                .max_store_bytes = 1024 * 1024,
+                .initial_lsn = 1,
+            });
+            log->open((temp_dir / "wal").string());
+            transaction_manager = std::make_unique<TransactionManager>(
+                *log,
+                lock_manager,
+                key_store);
+            key_store.attach_transaction_manager(*transaction_manager);
             ASSERT_EQ(key_store.open(db_path.string()), KeyStoreStatus::Success);
         }
 
         void TearDown() override {
-            if (key_store.write_transaction_active()) key_store.rollback();
             key_store.close();
+            transaction_manager.reset();
+            log.reset();
 
             std::error_code error;
             std::filesystem::remove_all(temp_dir, error);
         }
 
         KeyStore key_store;
+        LockManager lock_manager;
+        std::unique_ptr<Log> log;
+        std::unique_ptr<TransactionManager> transaction_manager;
         std::filesystem::path temp_dir;
         std::filesystem::path db_path;
 };
 
 TEST_F(CommandServerIntegrationTest, ExecutesPutGetAndRemoveCommands) {
-    Connection connection(key_store);
+    Connection connection(key_store, *transaction_manager);
     Session &session = connection.client();
     const KeyInput key = std::string{"name"};
     const ValueInput value = std::string{"stoneleaf"};
@@ -179,21 +177,7 @@ TEST_F(CommandServerIntegrationTest, ExecutesPutGetAndRemoveCommands) {
 }
 
 TEST_F(CommandServerIntegrationTest, UsesConnectionLocalTransactionContext) {
-    KeyStore transactional_store;
-    Log log(Config{
-        .max_index_bytes = 100 * Index::ENTRY_SIZE,
-        .max_store_bytes = 1024 * 1024,
-        .initial_lsn = 1,
-    });
-    log.open((temp_dir / "transactional-wal").string());
-    LockManager lock_manager;
-    TransactionManager transaction_manager(log, lock_manager, transactional_store);
-    transactional_store.attach_transaction_manager(transaction_manager);
-    ASSERT_EQ(
-        transactional_store.open((temp_dir / "transactional.db").string()),
-        KeyStoreStatus::Success);
-
-    TransactionalConnection connection(transactional_store, transaction_manager);
+    Connection connection(key_store, *transaction_manager);
     Session &session = connection.client();
     const KeyInput key = std::string{"session-key"};
 
@@ -213,7 +197,7 @@ TEST_F(CommandServerIntegrationTest, UsesConnectionLocalTransactionContext) {
 }
 
 TEST_F(CommandServerIntegrationTest, CommitsAndRollsBackExplicitTransactions) {
-    Connection connection(key_store);
+    Connection connection(key_store, *transaction_manager);
     Session &session = connection.client();
     const KeyInput key = std::uint64_t{42};
 
@@ -233,19 +217,19 @@ TEST_F(CommandServerIntegrationTest, CommitsAndRollsBackExplicitTransactions) {
 TEST_F(CommandServerIntegrationTest, RollsBackActiveTransactionWhenClientDisconnects) {
     const KeyInput key = std::string{"temporary"};
     {
-        Connection connection(key_store);
+        Connection connection(key_store, *transaction_manager);
         connection.client().begin_transaction();
         connection.client().put(key, ValueInput{std::string{"uncommitted"}});
         EXPECT_THROW(connection.client().begin_transaction(), std::runtime_error);
         connection.close();
     }
 
-    Connection verification_connection(key_store);
+    Connection verification_connection(key_store, *transaction_manager);
     EXPECT_FALSE(verification_connection.client().get(key).has_value());
 }
 
 TEST_F(CommandServerIntegrationTest, ReadsACommandDeliveredOneByteAtATime) {
-    RawConnection connection(key_store);
+    RawConnection connection(key_store, *transaction_manager);
     const Command command{
         .operator_type = OperatorType::BINARY,
         .op = Operator::PUT,
@@ -263,7 +247,7 @@ TEST_F(CommandServerIntegrationTest, ReadsACommandDeliveredOneByteAtATime) {
 
 TEST_F(CommandServerIntegrationTest, ClosesConnectionForMalformedOrOversizedCommand) {
     {
-        RawConnection connection(key_store);
+        RawConnection connection(key_store, *transaction_manager);
         const std::vector<std::uint8_t> malformed = {0, 0, 0, 2, 0, 99};
         send_bytes(connection.fd(), malformed.data(), malformed.size());
 
@@ -272,7 +256,7 @@ TEST_F(CommandServerIntegrationTest, ClosesConnectionForMalformedOrOversizedComm
     }
 
     {
-        RawConnection connection(key_store);
+        RawConnection connection(key_store, *transaction_manager);
         const std::uint32_t network_payload_size = htonl(16 * 1024 * 1024 + 1);
         send_bytes(connection.fd(), reinterpret_cast<const std::uint8_t *>(&network_payload_size), sizeof(network_payload_size));
 

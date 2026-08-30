@@ -101,7 +101,7 @@ int main(int argc, char *argv[]) {
         // remain joined, while this connection-level thread runs independently.
         try {
             std::thread dispatcher(
-                CommandServer::serve_transactional_connection,
+                CommandServer::serve_connection,
                 socket_fd,
                 std::ref(key_store),
                 std::ref(transaction_manager));

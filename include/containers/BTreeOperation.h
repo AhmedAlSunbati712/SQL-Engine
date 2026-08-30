@@ -1,7 +1,6 @@
 #pragma once
 
 #include <PageLatchManager.h>
-#include <TransactionManager/Transaction.h>
 
 #include <cstdint>
 #include <optional>
@@ -12,7 +11,7 @@
 // remain the caller's responsibility and may be released while a latch stays held.
 class BTreeOperation {
 public:
-    BTreeOperation(TransactionId txn_id, PageLatchManager& latch_manager);
+    explicit BTreeOperation(PageLatchManager& latch_manager);
     ~BTreeOperation() noexcept;
 
     BTreeOperation(const BTreeOperation&) = delete;
@@ -24,10 +23,10 @@ public:
     void lock_exclusive(std::uint32_t page_num);
 
     void release(std::uint32_t page_num) noexcept;
+    void release_all_exclusive_except(std::uint32_t page_num) noexcept;
     void release_all() noexcept;
 
     std::optional<PageLatchMode> latch_mode(std::uint32_t page_num) const noexcept;
-    TransactionId transaction_id() const noexcept { return txn_id_; }
 
 private:
     struct HeldPageLatch {
@@ -35,7 +34,6 @@ private:
         std::variant<PageReadLatch, PageWriteLatch> lock;
     };
 
-    TransactionId txn_id_;
     PageLatchManager& latch_manager_;
     std::unordered_map<std::uint32_t, HeldPageLatch> held_latches_;
 };

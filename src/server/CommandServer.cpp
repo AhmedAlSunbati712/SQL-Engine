@@ -107,74 +107,6 @@ void send_get_response(int socket_fd, const KeyStoreGetResult &result) {
     send_all(socket_fd, network_value.data(), network_value.size());
 }
 
-void execute_command(int socket_fd, KeyStore &key_store, const Command &command, bool &transaction_active) {
-    // The result lives in this dispatcher until its executor joins, giving the
-    // worker a safe output reference without adding futures to this MVP.
-    switch (command.op) {
-        case Operator::GET: {
-            KeyStoreGetResult result{};
-            std::thread executor(handle_get, std::ref(key_store), std::ref(result), std::cref(*command.key));
-            executor.join();
-            send_get_response(socket_fd, result);
-            return;
-        }
-        case Operator::PUT: {
-            KeyStoreStatus result = KeyStoreStatus::WriteFailed;
-            std::thread executor(handle_put, std::ref(key_store), std::ref(result), std::cref(*command.key), std::cref(*command.value));
-            executor.join();
-            send_operation_response(socket_fd, result);
-            return;
-        }
-        case Operator::DELETE: {
-            KeyStoreRemoveResult result{};
-            std::thread executor(handle_remove, std::ref(key_store), std::ref(result), std::cref(*command.key));
-            executor.join();
-            send_operation_response(socket_fd, result.status);
-            return;
-        }
-        case Operator::BEGIN_TXN: {
-            KeyStoreStatus result = KeyStoreStatus::WriteFailed;
-            std::thread executor(handle_begin_transaction, std::ref(key_store), std::ref(result));
-            executor.join();
-            if (result == KeyStoreStatus::Success) transaction_active = true;
-            send_operation_response(socket_fd, result);
-            return;
-        }
-        case Operator::COMMIT: {
-            KeyStoreStatus result = KeyStoreStatus::CommitFailed;
-            std::thread executor(handle_commit, std::ref(key_store), std::ref(result));
-            executor.join();
-            if (result == KeyStoreStatus::Success) transaction_active = false;
-            send_operation_response(socket_fd, result);
-            return;
-        }
-        case Operator::ROLLBACK: {
-            KeyStoreStatus result = KeyStoreStatus::RollbackFailed;
-            std::thread executor(handle_rollback, std::ref(key_store), std::ref(result));
-            executor.join();
-            if (result == KeyStoreStatus::Success) transaction_active = false;
-            send_operation_response(socket_fd, result);
-            return;
-        }
-    }
-
-    throw std::runtime_error("[ERROR] Unsupported command operator");
-}
-
-void rollback_active_transaction(KeyStore &key_store, bool transaction_active) noexcept {
-    if (!transaction_active) return;
-
-    // A disconnected client cannot resolve its transaction, so finish the same
-    // joined-handler flow before allowing the dispatcher to release its socket.
-    try {
-        KeyStoreStatus result = KeyStoreStatus::RollbackFailed;
-        std::thread executor(handle_rollback, std::ref(key_store), std::ref(result));
-        executor.join();
-    } catch (...) {
-        // Connection cleanup cannot report a recovery failure to a departed client.
-    }
-}
-
 TransactionHandle command_transaction(
     SessionContext &context,
     TransactionManager &transaction_manager,
@@ -189,7 +121,8 @@ TransactionHandle command_transaction(
 void finish_implicit_transaction(
     const TransactionHandle &transaction,
     TransactionManager &transaction_manager,
-    bool success
+    bool success,
+    AbortReason failure_reason
 ) {
     if (success) {
         if (transaction_manager.commit(transaction) != CommitStatus::Success) {
@@ -200,7 +133,7 @@ void finish_implicit_transaction(
 
     if (transaction_manager.abort(
             transaction,
-            AbortReason::StatementFailure) != AbortStatus::Success) {
+            failure_reason) != AbortStatus::Success) {
         throw std::runtime_error("[ERROR] Failed to abort implicit transaction");
     }
 }
@@ -264,7 +197,13 @@ void execute_transactional_command(
         KeyStoreGetResult result = key_store.get(transaction, *command.key);
         const bool success = result.status == KeyStoreStatus::Success ||
             result.status == KeyStoreStatus::KeyNotFound;
-        if (implicit) finish_implicit_transaction(transaction, transaction_manager, success);
+        if (implicit) finish_implicit_transaction(
+            transaction,
+            transaction_manager,
+            success,
+            result.status == KeyStoreStatus::Deadlock
+                ? AbortReason::DeadlockVictim
+                : AbortReason::StatementFailure);
         if (!implicit && result.status == KeyStoreStatus::Deadlock) {
             transaction_manager.abort(transaction, AbortReason::DeadlockVictim);
             context.active_transaction.reset();
@@ -282,7 +221,10 @@ void execute_transactional_command(
             finish_implicit_transaction(
                 transaction,
                 transaction_manager,
-                result == KeyStoreStatus::Success);
+                result == KeyStoreStatus::Success,
+                result == KeyStoreStatus::Deadlock
+                    ? AbortReason::DeadlockVictim
+                    : AbortReason::StatementFailure);
         } else if (result == KeyStoreStatus::Deadlock) {
             transaction_manager.abort(transaction, AbortReason::DeadlockVictim);
             context.active_transaction.reset();
@@ -295,7 +237,13 @@ void execute_transactional_command(
     const bool success = result.status == KeyStoreStatus::Success ||
         result.status == KeyStoreStatus::KeyNotFound;
     if (implicit) {
-        finish_implicit_transaction(transaction, transaction_manager, success);
+        finish_implicit_transaction(
+            transaction,
+            transaction_manager,
+            success,
+            result.status == KeyStoreStatus::Deadlock
+                ? AbortReason::DeadlockVictim
+                : AbortReason::StatementFailure);
     } else if (result.status == KeyStoreStatus::Deadlock) {
         transaction_manager.abort(transaction, AbortReason::DeadlockVictim);
         context.active_transaction.reset();
@@ -305,45 +253,7 @@ void execute_transactional_command(
 
 } // namespace
 
-void handle_get(KeyStore &key_store, KeyStoreGetResult &result, const Key &key) {
-    result = key_store.get(key);
-}
-
-void handle_put(KeyStore &key_store, KeyStoreStatus &result, const Key &key, const Value &value) {
-    result = key_store.put(key, value);
-}
-
-void handle_remove(KeyStore &key_store, KeyStoreRemoveResult &result, const Key &key) {
-    result = key_store.remove(key);
-}
-
-void handle_begin_transaction(KeyStore &key_store, KeyStoreStatus &result) {
-    result = key_store.begin_write_transaction();
-}
-
-void handle_commit(KeyStore &key_store, KeyStoreStatus &result) {
-    result = key_store.commit();
-}
-
-void handle_rollback(KeyStore &key_store, KeyStoreStatus &result) {
-    result = key_store.rollback();
-}
-
-void serve_connection(int socket_fd, KeyStore &key_store) noexcept {
-    bool transaction_active = false;
-
-    try {
-        while (true) {
-            const Command command = read_command(socket_fd);
-            execute_command(socket_fd, key_store, command, transaction_active);
-        }
-    } catch (...) {
-        rollback_active_transaction(key_store, transaction_active);
-        ::close(socket_fd);
-    }
-}
-
-void serve_transactional_connection(
+void serve_connection(
     int socket_fd,
     KeyStore &key_store,
     TransactionManager &transaction_manager

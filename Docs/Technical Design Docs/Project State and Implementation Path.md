@@ -271,13 +271,17 @@ borrowing, merging, or separator propagation. Deleting the first key in a leaf
 may require an ancestor separator update even when the leaf remains above
 minimum occupancy.
 
-Most point writes should use an optimistic traversal:
+Point writes currently use an optimistic exclusive traversal:
 
-1. Traverse using shared latch coupling.
-2. Acquire an exclusive latch on the target leaf.
-3. Validate the page generation and structural version.
-4. Modify the leaf if it is safe.
-5. Restart with pessimistic write crabbing if a structural change may propagate.
+1. Acquire the header, root, and descendants using top-down exclusive latch
+   coupling.
+2. Release all ancestors when a newly acquired child proves that structural
+   propagation cannot reach them.
+3. Modify the leaf immediately when the leaf is safe.
+4. If the target leaf is unsafe, make no change, release every latch, and
+   restart from the header using pessimistic exclusive crabbing.
+5. Retain pessimistic logical latches through structural repair and WAL append,
+   even when their cache frames are temporarily unreferenced.
 
 This allows a writer modifying a safe rightmost leaf to run concurrently with a
 reader accessing the leftmost leaf.

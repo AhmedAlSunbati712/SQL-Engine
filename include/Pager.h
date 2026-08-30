@@ -74,6 +74,9 @@ class Pager {
         PagerMutationResult free_page(BTreeOperation& operation, std::uint32_t page_num);
         PagerResult free_page(int page_num);
 		PagerResult begin_write(int page_num);
+		PagerResult begin_wal_write(
+            BTreeOperation& operation,
+            std::uint32_t page_num);
 		PagerResult ref_page(int page_num); // increment page ref nums. if page.num_refs == 1, call pcache.pin_page(page_num)
 		PagerResult unref_page(int page_num); // decrement page ref nums. if page.num_refs == 0 call pcache.unpin_page(int page_num);
 		PagerResult commit_phase_one();
@@ -87,9 +90,7 @@ class Pager {
             BTreeOperation& operation,
             std::uint32_t page_num,
             Lsn lsn);
-        PagerResult mark_wal_pending(
-            BTreeOperation& operation,
-            std::uint32_t page_num);
+        PagerResult flush_wal_pages();
         void attach_log(Log& log) noexcept { log_ = &log; }
         PageLatchManager& page_latch_manager() noexcept { return page_latch_manager_; }
 	private:
@@ -105,6 +106,7 @@ class Pager {
 		};
 
 		std::unordered_map<int, DirtyPageEntry *> dirty_pages;
+        std::unordered_set<std::uint32_t> wal_dirty_pages_;
 
         int db_fd = -1;
         int journal_fd = -1;
@@ -127,6 +129,10 @@ class Pager {
 
 		void handle_cache_eviction(const PCacheEviction &eviction);
 		PagerResult cache_put(PageV2 *page);
+        PagerResult mark_loaded_page_wal_pending(
+            BTreeOperation& operation,
+            PageV2 *page);
+        PagerResult flush_wal_page(std::uint32_t page_num);
 		PagerResult journal_has_contents(bool &has_contents);
 		PagerResult maybe_recover_hot_journal();
         PagerResult enter_from_nolock(Lock target_lock);

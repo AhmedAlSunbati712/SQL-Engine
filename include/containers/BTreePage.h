@@ -5,6 +5,7 @@
 #include <optional>
 #include <vector>
 #include <Value.h>
+#include <PageV2.h>
 
 enum class PageType : std::uint8_t {
     Internal = 0,
@@ -22,7 +23,9 @@ class BTreePage {
         std::size_t lower_bound_key(const Key &key) const;
         std::optional<Key> first_key() const;
         std::optional<Key> key_at(std::size_t idx) const;
-        const char *data() const noexcept { return page; }
+        const char *data() const noexcept {
+            return page - V2_PAGE_HEADER_SIZE;
+        }
         virtual void write_back();
         virtual bool remove(const Key &key) = 0;
 

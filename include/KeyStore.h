@@ -10,15 +10,6 @@
 #include <optional>
 #include <string>
 
-enum class KeyStoreWritePolicy : std::uint8_t {
-    AutoCommit = 0,
-    ExplicitTransactionsOnly
-};
-
-struct KeyStoreOptions {
-    KeyStoreWritePolicy write_policy = KeyStoreWritePolicy::AutoCommit;
-};
-
 enum class KeyStoreStatus : std::uint8_t {
     Success = 0,
     FailedToOpen,
@@ -115,7 +106,7 @@ struct KeyStoreScanResult {
 
 class KeyStore : public TransactionUndoExecutor {
     public:
-        explicit KeyStore(KeyStoreOptions options = {});
+        KeyStore() = default;
         ~KeyStore();
 
         KeyStore(const KeyStore &) = delete;
@@ -126,20 +117,18 @@ class KeyStore : public TransactionUndoExecutor {
         // A KeyStore owns one open BTree at a time. Any cursor returned from a
         // scan must be destroyed before its KeyStore.
         KeyStoreStatus open(const std::string &db_file);
-        // Closing an already-closed store succeeds. Active or failed write
-        // transactions must be committed or rolled back before an explicit close.
+        // Closing an already-closed store succeeds. Fails with
+        // WriteTransactionActive while any TransactionManager transaction is
+        // still active; callers must finish it first.
         KeyStoreStatus close();
 
-        KeyStoreGetResult get(const Key &key);
         KeyStoreGetResult get(
             const TransactionHandle &transaction,
             const Key &key);
-        KeyStoreStatus put(const Key &key, const Value &value);
         KeyStoreStatus put(
             const TransactionHandle &transaction,
             const Key &key,
             const Value &value);
-        KeyStoreRemoveResult remove(const Key &key);
         KeyStoreRemoveResult remove(
             const TransactionHandle &transaction,
             const Key &key);
@@ -150,11 +139,6 @@ class KeyStore : public TransactionUndoExecutor {
             Transaction &transaction,
             const UndoDescriptor &undo,
             CompensationAppender append_compensation) override;
-
-        KeyStoreStatus begin_write_transaction();
-        KeyStoreStatus commit();
-        KeyStoreStatus rollback();
-        bool write_transaction_active() const;
 
         // Successful scans return an already-positioned cursor. An empty result
         // is represented by a cursor whose current status is EndOfScan.
@@ -171,20 +155,7 @@ class KeyStore : public TransactionUndoExecutor {
         KeyStoreScanResult scan_prefix(const Key &prefix);
 
     private:
-        enum class TransactionState : std::uint8_t {
-            None = 0,
-            Active,
-            Failed
-        };
-
-        KeyStoreStatus finish_autocommit_write(BTreeStatus write_status);
-        KeyStoreStatus handle_transactional_write(BTreeStatus write_status);
-        void clear_transaction_state();
-
         BTree tree;
-        KeyStoreOptions options;
-        TransactionState transaction_state = TransactionState::None;
-        bool transaction_has_writes = false;
         bool is_open = false;
         TransactionManager *transaction_manager = nullptr;
 };

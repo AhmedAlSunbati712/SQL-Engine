@@ -93,6 +93,8 @@ PCachePutResult PCache::put(PageV2 *page) {
             // we can just return a status code
             // rc: DirtyFlush
             result.status = PCacheResult::DirtyFlush;
+            result.eviction.page_num = victim_page->page_num;
+            result.eviction.was_dirty = true;
             return result;
         }
 
