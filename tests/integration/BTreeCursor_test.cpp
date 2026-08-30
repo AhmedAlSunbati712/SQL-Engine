@@ -301,6 +301,7 @@ TEST_F(BTreeCursorIntegrationTest, MoveConstructionTransfersRegistrationAndPosit
 TEST_F(BTreeCursorIntegrationTest, MoveAssignmentTransfersRegistrationAcrossTrees) {
     std::filesystem::path second_db_path = temp_dir / "second.db";
     BTree second_tree;
+    second_tree.attach_transaction_manager(*transaction_manager);
     ASSERT_EQ(second_tree.open(second_db_path.string()), BTreeStatus::Success);
 
     BTreeCursor source = tree->open_cursor();
