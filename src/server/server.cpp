@@ -1,11 +1,15 @@
 #include <KeyStore.h>
 #include <LockManager/LockManager.h>
 #include <Log/Log.h>
+#include <Log/WalPayloadCodec.h>
 #include <TransactionManager/TransactionManager.h>
 #include <server/CommandServer.h>
+#include <DiskIO.h>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <span>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -17,11 +21,18 @@
 #include <string>
 #include <thread>
 #include <filesystem>
+#include <Log/WalRecordCodec.h>
+#include <unordered_map>
 
 namespace {
 
 constexpr std::uint16_t SERVER_PORT = 8080;
 enum class StartupStatus : std::uint8_t {
+    SUCCESS = 0,
+    FAILED,
+};
+
+enum class AriesStatus : std::uint8_t {
     SUCCESS = 0,
     FAILED,
 };
@@ -68,6 +79,111 @@ Config setup_config(const std::string& database_directory) {
     };
 }
 
+void redo_page_effects(int db_fd, Log& log, std::vector<PageEffect>& page_effects) {
+    // db_fd is opened once by the caller for the whole redo pass and synced
+    // once at the end, rather than per record.
+    for (const PageEffect &effect : page_effects) {
+        switch (effect.kind) {
+            case PageEffectKind::Write:
+            case PageEffectKind::Allocate:
+            case PageEffectKind::Free:
+                // Every kind carries a complete after-image (see
+                // page_effect() in Pager.cpp), so redo is the same physical
+                // write regardless of which structural event produced it.
+                // PageEffect already carries page_num directly, so no PageV2
+                // decode is needed just to find where this page lives.
+                disk::write_exact_at(
+                    db_fd,
+                    std::span<const char>(effect.after_image),
+                    static_cast<std::streamoff>(effect.page_num) * static_cast<std::streamoff>(PAGE_SIZE));
+        }
+    }
+
+}
+AriesStatus aries_recovery(KeyStore& key_store, TransactionManager& _transaction_manager, Log& log, std::string db_file_name) {
+    std::unordered_map<TransactionId, Lsn> unresolved_transactions;
+    Lsn current_offset = log.base_segment_offest();
+
+    int db_fd = disk::open_file(db_file_name, O_RDWR);
+    while (true) {
+        try {
+            WalRecord record = log.read(current_offset);
+            WalRecordType record_type = record.type;
+            TransactionId txn_id = static_cast<TransactionId>(record.transaction_id);
+
+            switch (record_type) {
+                case WalRecordType::TxnBegin: {
+                    unresolved_transactions[static_cast<TransactionId>(record.transaction_id)] = current_offset;
+                    current_offset += 1;
+                    continue;
+                }
+                case WalRecordType::BTreeAction: {
+                    WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
+                    redo_page_effects(db_fd, log, std::get<BTreeActionPayload>(payload).effects);
+                    current_offset += 1;
+                    unresolved_transactions[txn_id] = static_cast<Lsn>(record.lsn);
+                    continue;
+                }
+                case WalRecordType::Compensation: {
+                    WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
+                    redo_page_effects(db_fd, log, std::get<CompensationPayload>(payload).effects);
+                    current_offset += 1;
+                    unresolved_transactions[txn_id] = static_cast<Lsn>(record.lsn);
+                    continue;
+                }
+                case WalRecordType::SystemAction: {
+                    WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
+                    redo_page_effects(db_fd, log, std::get<SystemActionPayload>(payload).effects);
+                    current_offset += 1;
+                    continue;
+                }
+                case WalRecordType::TxnCommit: {
+                    auto it = unresolved_transactions.find(txn_id);
+                    if (it != unresolved_transactions.end()) {
+                        unresolved_transactions.erase(txn_id);
+                    }
+                    current_offset += 1;
+                    continue;
+                }
+                case WalRecordType::TxnEnd: {
+                    auto it = unresolved_transactions.find(txn_id);
+                    if (it != unresolved_transactions.end()) {
+                        unresolved_transactions.erase(txn_id);
+                    }
+                    current_offset += 1;
+                    continue;
+                }
+                case WalRecordType::TxnAbort: {
+                    // The abort decision alone carries no PageEffects and
+                    // must not move where undo resumes for this transaction:
+                    // live abort() captures undo_lsn = last_lsn_ before
+                    // appending this record, so its own undo walk never
+                    // visits the TxnAbort record itself. Leave whatever LSN
+                    // is already tracked (the transaction's last BTreeAction/
+                    // Compensation, or its TxnBegin if it never wrote one)
+                    // untouched - just keep it in the unresolved set.
+                    current_offset += 1;
+                    continue;
+                }
+
+            }
+        } catch (const std::out_of_range&) {
+            // Log::read throws this specifically when current_offset has
+            // reached the end of the retained log - that's the normal,
+            // expected way this loop terminates. Any other exception type
+            // (e.g. WalPayloadCodec::decode's "Malformed..." runtime_errors)
+            // means a genuinely corrupt record, and is deliberately left to
+            // propagate out of aries_recovery uncaught rather than being
+            // silently swallowed here.
+            break;
+        }
+    }
+
+    // Redo has applied every logged page effect for this pass; make it
+    // durable once for the whole pass rather than after each record.
+    disk::sync_file_to_disk_fd(db_fd);
+    disk::close_file(db_fd);
+}
 // TODO: Need to return the keystore and everything to main
 StartupStatus setup_database(int argc, char *argv[]) {
     if (argc != 2) {
