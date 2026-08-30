@@ -13,12 +13,93 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
+#include <filesystem>
 
 namespace {
 
 constexpr std::uint16_t SERVER_PORT = 8080;
+enum class StartupStatus : std::uint8_t {
+    SUCCESS = 0,
+    FAILED,
+};
+
+// Returns {base_lsn, is_store}. Mirrors Log.cpp's own parse_segment_name:
+// a name starting with "segment-" must have the exact "<20 digits>.store" or
+// "<20 digits>.index" shape, or it's treated as corruption, not ignored.
+std::pair<std::uint64_t, bool> parse_segment_offset(const std::string& name) {
+    constexpr std::size_t prefix_size = 8;
+    constexpr std::size_t digits_size = 20;
+    if (!name.starts_with("segment-")) return {0, false};
+    const bool store = name.size() == prefix_size + digits_size + 6 && name.ends_with(".store");
+    const bool index = name.size() == prefix_size + digits_size + 6 && name.ends_with(".index");
+    if (!store && !index) throw std::runtime_error("Malformed WAL segment filename");
+    const auto digits = name.substr(prefix_size, digits_size);
+    if (digits.find_first_not_of("0123456789") != std::string::npos) throw std::runtime_error("Malformed WAL segment filename");
+    try { return {std::stoull(digits), store}; }
+    catch (...) { throw std::runtime_error("Malformed WAL segment filename"); }
+}
+
+Config setup_config(const std::string& database_directory) {
+    // Log::open() requires initial_lsn to equal the smallest existing
+    // segment's base LSN when segments already exist. A fresh database (no
+    // WAL directory yet, or an empty one) has no existing segment to match,
+    // so it starts a brand new log at LSN 1.
+    const std::string wal_directory = database_directory + ".wal";
+    std::optional<std::uint64_t> smallest_base;
+
+    if (std::filesystem::exists(wal_directory)) {
+        for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
+            const auto name = entry.path().filename().string();
+            const auto [base, is_store] = parse_segment_offset(name);
+            // Every segment has exactly one .store file, so counting only
+            // those naturally avoids double-counting its paired .index file.
+            if (!is_store) continue;
+            if (!smallest_base || base < *smallest_base) smallest_base = base;
+        }
+    }
+
+    return Config{
+        .max_index_bytes = 1024 * Index::ENTRY_SIZE,
+        .max_store_bytes = 64 * 1024 * 1024,
+        .initial_lsn = smallest_base.value_or(1),
+    };
+}
+
+// TODO: Need to return the keystore and everything to main
+StartupStatus setup_database(int argc, char *argv[]) {
+    if (argc != 2) {
+        std::cerr << "Usage: " << argv[0] << " <db-file>" << std::endl;
+        return StartupStatus::FAILED;
+    }
+
+    KeyStore key_store;
+
+    // First thing, let's set up the config appropriately:
+    Config config = setup_config(argv[1]);
+
+    Log log(config);
+    LockManager lock_manager;
+    TransactionManager transaction_manager(log, lock_manager, key_store);
+    key_store.attach_transaction_manager(transaction_manager);
+
+    try {
+        log.open(std::string{argv[1]} + ".wal");
+    } catch (const std::exception &error) {
+        std::cerr << "[ERROR] Failed to open WAL: " << error.what() << std::endl;
+        return StartupStatus::FAILED;
+    }
+    if (key_store.open(std::string{argv[1]}) != KeyStoreStatus::Success) {
+        std::cerr << "[ERROR] Failed to open database: " << argv[1] << std::endl;
+        return StartupStatus::FAILED;
+    }
+
+    // Now, we need to do ARIES recovery
+
+    return StartupStatus::SUCCESS;
+}
 
 int create_listener() {
     // Keep socket setup in one place so every startup failure closes the
@@ -53,32 +134,11 @@ int create_listener() {
 } // namespace
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <db-file>" << std::endl;
+
+    StartupStatus status = setup_database(argc, argv);
+    if (status == StartupStatus::FAILED) {
         return 1;
     }
-
-    KeyStore key_store;
-    Log log(Config{
-        .max_index_bytes = 1024 * Index::ENTRY_SIZE,
-        .max_store_bytes = 64 * 1024 * 1024,
-        .initial_lsn = 1,
-    });
-    LockManager lock_manager;
-    TransactionManager transaction_manager(log, lock_manager, key_store);
-    key_store.attach_transaction_manager(transaction_manager);
-
-    try {
-        log.open(std::string{argv[1]} + ".wal");
-    } catch (const std::exception &error) {
-        std::cerr << "[ERROR] Failed to open WAL: " << error.what() << std::endl;
-        return 1;
-    }
-    if (key_store.open(std::string{argv[1]}) != KeyStoreStatus::Success) {
-        std::cerr << "[ERROR] Failed to open database: " << argv[1] << std::endl;
-        return 1;
-    }
-
     const int listener_fd = create_listener();
     if (listener_fd < 0) {
         std::cerr << "[ERROR] Failed to listen on 127.0.0.1:" << SERVER_PORT << std::endl;
