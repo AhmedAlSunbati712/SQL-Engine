@@ -194,8 +194,6 @@ KeyStoreCursorStatus KeyStoreCursor::translate_cursor_status(
 
 // ==================================== KeyStore ====================================
 
-KeyStore::KeyStore(KeyStoreOptions options) : options(options) {}
-
 void KeyStore::attach_transaction_manager(
     TransactionManager &manager
 ) noexcept {
@@ -219,22 +217,7 @@ void KeyStore::undo(
 }
 
 KeyStore::~KeyStore() {
-    /**
-     * Destruction is the last-resort cleanup path and cannot return a status.
-     *
-     * Public close() intentionally refuses to discard an unresolved explicit
-     * transaction. A destructor has no caller left to resolve it, so it makes a
-     * best-effort rollback before closing the BTree. As documented in the
-     * header, every KeyStoreCursor must already be destroyed because it holds a
-     * pointer into this object's BTree.
-     */
     if (!is_open) return;
-
-    if (transaction_state != TransactionState::None) {
-        tree.rollback();
-        clear_transaction_state();
-    }
-
     tree.close();
     is_open = false;
 }
@@ -248,26 +231,11 @@ KeyStoreStatus KeyStore::open(const std::string &db_file) {
     if (open_status != BTreeStatus::Success) return KeyStoreStatus::FailedToOpen;
 
     is_open = true;
-    clear_transaction_state();
     return KeyStoreStatus::Success;
 }
 
 KeyStoreStatus KeyStore::close() {
-    /**
-     * Close only a transactionally clean KeyStore.
-     *
-     * Explicit close never makes an implicit commit/rollback decision for the
-     * caller. A failed transaction must be rolled back, an active transaction
-     * must be committed or rolled back, and every cursor must release its page
-     * registration before the BTree can close safely.
-     */
     if (!is_open) return KeyStoreStatus::Success;
-    if (transaction_state == TransactionState::Failed) {
-        return KeyStoreStatus::TransactionNeedsRollback;
-    }
-    if (transaction_state == TransactionState::Active) {
-        return KeyStoreStatus::WriteTransactionActive;
-    }
 
     BTreeStatus close_status = tree.close();
     if (close_status == BTreeStatus::CursorActive) {
@@ -276,55 +244,11 @@ KeyStoreStatus KeyStore::close() {
 
     // BTree::close tears down its pager even when that teardown reports failure.
     is_open = false;
-    clear_transaction_state();
     if (close_status != BTreeStatus::Success) {
         return KeyStoreStatus::FailedToClose;
     }
 
     return KeyStoreStatus::Success;
-}
-
-KeyStoreGetResult KeyStore::get(const Key &key) {
-    /**
-     * Point lookup flow:
-     *
-     * 1. Validate the encoded key.
-     * 2. Ask the BTree for the encoded value.
-     * 3. Translate absence separately from storage failure.
-     * 4. Validate the stored value before exposing it.
-     *
-     * Reads are allowed during explicit write transactions so a transaction can
-     * observe its own uncommitted page-cache changes.
-     */
-    KeyStoreGetResult result{};
-    if (!is_open) {
-        result.status = KeyStoreStatus::NotOpen;
-        return result;
-    }
-
-    if (!KeyCodec::validate_key(key)) {
-        result.status = KeyStoreStatus::InvalidKey;
-        return result;
-    }
-
-    BTreeGetStatus get_result = tree.get(key);
-    if (get_result.status == BTreeStatus::KeyNotInTree) {
-        result.status = KeyStoreStatus::KeyNotFound;
-        return result;
-    }
-    if (get_result.status != BTreeStatus::Success) {
-        result.status = KeyStoreStatus::ReadFailed;
-        return result;
-    }
-
-    if (!ValueCodec::validate_value(get_result.value)) {
-        result.status = KeyStoreStatus::DecodeFailed;
-        return result;
-    }
-
-    result.status = KeyStoreStatus::Success;
-    result.value = std::move(get_result.value);
-    return result;
 }
 
 KeyStoreGetResult KeyStore::get(
@@ -384,46 +308,6 @@ KeyStoreGetResult KeyStore::get(
 }
 
 KeyStoreStatus KeyStore::put(
-    const Key &key,
-    const Value &value
-) {
-    /**
-     * Insert or overwrite a typed key/value pair.
-     *
-     * Validation happens before transaction checks because InvalidKey and
-     * InvalidValue are caller errors and must never poison a transaction. Once
-     * BTree::insert runs, completion is delegated to either the explicit
-     * transaction state machine or the autocommit commit/rollback path.
-     */
-    if (!is_open) return KeyStoreStatus::NotOpen;
-
-    if (!KeyCodec::validate_key(key)) return KeyStoreStatus::InvalidKey;
-    if (!ValueCodec::validate_value(value)) return KeyStoreStatus::InvalidValue;
-
-    if (transaction_state == TransactionState::Failed) {
-        // A previous storage/commit failure may have left dirty state. No later
-        // write is safe until rollback restores the transaction boundary.
-        return KeyStoreStatus::TransactionNeedsRollback;
-    }
-    if (
-        transaction_state == TransactionState::None &&
-        options.write_policy == KeyStoreWritePolicy::ExplicitTransactionsOnly
-    ) {
-        return KeyStoreStatus::NoActiveTransaction;
-    }
-
-    Value stored_value = value;
-    BTreeStatus write_status = tree.insert(key, stored_value);
-    // An explicit transaction retains successful dirty pages for a later
-    // commit. With no explicit transaction, this one call owns the full write.
-    if (transaction_state == TransactionState::Active) {
-        return handle_transactional_write(write_status);
-    }
-
-    return finish_autocommit_write(write_status);
-}
-
-KeyStoreStatus KeyStore::put(
     const TransactionHandle &transaction,
     const Key &key,
     const Value &value
@@ -470,80 +354,6 @@ KeyStoreStatus KeyStore::put(
     return write_status == BTreeStatus::Success
         ? KeyStoreStatus::Success
         : KeyStoreStatus::WriteFailed;
-}
-
-KeyStoreRemoveResult KeyStore::remove(const Key &key) {
-    /**
-     * Delete a key and return the value that was stored under it.
-     *
-     * The raw value must be validated before an autocommit delete is finalized.
-     * Otherwise invalid stored data could commit the deletion while preventing the
-     * API from returning the promised previous value. In that case explicit
-     * transactions enter Failed and autocommit rolls the deletion back.
-     */
-    KeyStoreRemoveResult result{};
-    if (!is_open) {
-        result.status = KeyStoreStatus::NotOpen;
-        return result;
-    }
-
-    if (!KeyCodec::validate_key(key)) {
-        result.status = KeyStoreStatus::InvalidKey;
-        return result;
-    }
-
-    if (transaction_state == TransactionState::Failed) {
-        result.status = KeyStoreStatus::TransactionNeedsRollback;
-        return result;
-    }
-    if (
-        transaction_state == TransactionState::None &&
-        options.write_policy == KeyStoreWritePolicy::ExplicitTransactionsOnly
-    ) {
-        result.status = KeyStoreStatus::NoActiveTransaction;
-        return result;
-    }
-
-    BTreeRemoveStatus remove_result = tree.remove(key);
-    if (remove_result.status == BTreeStatus::KeyNotInTree) {
-        // Not-found is a clean logical result: no page was changed, so there is
-        // nothing to commit, roll back, or mark as a failed transaction.
-        result.status = KeyStoreStatus::KeyNotFound;
-        return result;
-    }
-
-    if (remove_result.status != BTreeStatus::Success) {
-        result.status = (transaction_state == TransactionState::Active)
-            ? handle_transactional_write(remove_result.status)
-            : finish_autocommit_write(remove_result.status);
-        return result;
-    }
-
-    if (!ValueCodec::validate_value(remove_result.value)) {
-        if (transaction_state == TransactionState::Active) {
-            // The BTree mutation already happened in this transaction. Keep the
-            // transaction alive but force the caller through rollback.
-            transaction_state = TransactionState::Failed;
-            result.status = KeyStoreStatus::DecodeFailed;
-            return result;
-        }
-
-        // Autocommit cannot publish a delete whose return value is invalid.
-        // Restore the page state before reporting DecodeFailed.
-        BTreeRollbackStatus rollback_status = tree.rollback();
-        result.status = (rollback_status == BTreeRollbackStatus::Success)
-            ? KeyStoreStatus::DecodeFailed
-            : KeyStoreStatus::RollbackFailed;
-        return result;
-    }
-
-    result.status = (transaction_state == TransactionState::Active)
-        ? handle_transactional_write(BTreeStatus::Success)
-        : finish_autocommit_write(BTreeStatus::Success);
-    if (result.status == KeyStoreStatus::Success) {
-        result.value = std::move(remove_result.value);
-    }
-    return result;
 }
 
 KeyStoreRemoveResult KeyStore::remove(
@@ -601,104 +411,6 @@ KeyStoreRemoveResult KeyStore::remove(
 
     result.value = std::move(remove_result.value);
     return result;
-}
-
-KeyStoreStatus KeyStore::begin_write_transaction() {
-    /**
-     * Begin a logical explicit transaction.
-     *
-     * The Pager acquires write-side locks lazily on the first actual mutation,
-     * so beginning an empty transaction changes only KeyStore state.
-     */
-    if (!is_open) return KeyStoreStatus::NotOpen;
-    if (transaction_state == TransactionState::Failed) {
-        return KeyStoreStatus::TransactionNeedsRollback;
-    }
-    if (transaction_state == TransactionState::Active) {
-        return KeyStoreStatus::TransactionAlreadyActive;
-    }
-
-    transaction_state = TransactionState::Active;
-    transaction_has_writes = false;
-    return KeyStoreStatus::Success;
-}
-
-KeyStoreStatus KeyStore::commit() {
-    /**
-     * Commit the active explicit transaction.
-     *
-     * Empty transactions are completed locally because the Pager has no dirty
-     * state or write lock to publish. Transactions with writes delegate to the
-     * BTree two-phase commit. A storage commit failure changes the state to
-     * Failed because only rollback can establish a safe next boundary.
-     */
-    if (!is_open) return KeyStoreStatus::NotOpen;
-    if (transaction_state == TransactionState::None) {
-        return KeyStoreStatus::NoActiveTransaction;
-    }
-    if (transaction_state == TransactionState::Failed) {
-        return KeyStoreStatus::TransactionNeedsRollback;
-    }
-    // A cursor pins a leaf and commit may flush/release the pages beneath it.
-    if (tree.cursor_active()) return KeyStoreStatus::CursorActive;
-    if (!transaction_has_writes) {
-        clear_transaction_state();
-        return KeyStoreStatus::Success;
-    }
-
-    BTreeCommitStatus commit_status = tree.commit();
-    if (commit_status == BTreeCommitStatus::CursorActive) {
-        return KeyStoreStatus::CursorActive;
-    }
-    if (commit_status != BTreeCommitStatus::Success) {
-        transaction_state = TransactionState::Failed;
-        return KeyStoreStatus::CommitFailed;
-    }
-
-    clear_transaction_state();
-    return KeyStoreStatus::Success;
-}
-
-KeyStoreStatus KeyStore::rollback() {
-    /**
-     * Roll back either an active or failed explicit transaction.
-     *
-     * Failed transactions always reach BTree::rollback, even if no successful
-     * write was recorded: the failed BTree operation may have partially dirtied
-     * storage state before returning. A clean empty transaction can be cleared
-     * locally.
-     */
-    if (!is_open) return KeyStoreStatus::NotOpen;
-    if (transaction_state == TransactionState::None) {
-        return KeyStoreStatus::NoActiveTransaction;
-    }
-    // Rollback may invalidate cached pages owned by a cursor.
-    if (tree.cursor_active()) return KeyStoreStatus::CursorActive;
-    if (
-        transaction_state == TransactionState::Active &&
-        !transaction_has_writes
-    ) {
-        clear_transaction_state();
-        return KeyStoreStatus::Success;
-    }
-
-    BTreeRollbackStatus rollback_status = tree.rollback();
-    if (rollback_status == BTreeRollbackStatus::CursorActive) {
-        return KeyStoreStatus::CursorActive;
-    }
-    if (rollback_status != BTreeRollbackStatus::Success) {
-        transaction_state = TransactionState::Failed;
-        return KeyStoreStatus::RollbackFailed;
-    }
-
-    clear_transaction_state();
-    return KeyStoreStatus::Success;
-}
-
-bool KeyStore::write_transaction_active() const {
-    // Failed still counts as active: its locks and dirty state are not resolved
-    // until rollback succeeds.
-    return transaction_state != TransactionState::None;
 }
 
 // ====================================== Scans =====================================
@@ -853,77 +565,4 @@ KeyStoreScanResult KeyStore::scan_prefix(const Key &prefix) {
     ));
     result.status = KeyStoreStatus::Success;
     return result;
-}
-
-// ==================================== Writes ======================================
-
-KeyStoreStatus KeyStore::finish_autocommit_write(BTreeStatus write_status) {
-    /**
-     * Finish the write unit owned by one autocommit put/remove call.
-     *
-     * State machine:
-     *
-     *   BTree write failed -> rollback -> WriteFailed / RollbackFailed
-     *   BTree write passed -> commit
-     *   commit passed      -> Success
-     *   commit failed      -> rollback -> CommitFailed / RollbackFailed
-     *
-     * CursorActive is known to occur before BTree mutation, so it can be
-     * returned directly without rollback. Every other lower-level failure is
-     * conservatively treated as potentially dirty.
-     */
-    if (write_status == BTreeStatus::CursorActive) {
-        return KeyStoreStatus::CursorActive;
-    }
-    if (write_status != BTreeStatus::Success) {
-        BTreeRollbackStatus rollback_status = tree.rollback();
-        return (rollback_status == BTreeRollbackStatus::Success)
-            ? KeyStoreStatus::WriteFailed
-            : KeyStoreStatus::RollbackFailed;
-    }
-
-    BTreeCommitStatus commit_status = tree.commit();
-    if (commit_status == BTreeCommitStatus::Success) {
-        return KeyStoreStatus::Success;
-    }
-
-    // Commit failure must not leak an unresolved implicit transaction into the
-    // next API call. Roll back before translating the original failure.
-    BTreeRollbackStatus rollback_status = tree.rollback();
-    if (rollback_status != BTreeRollbackStatus::Success) {
-        return KeyStoreStatus::RollbackFailed;
-    }
-    if (commit_status == BTreeCommitStatus::CursorActive) {
-        return KeyStoreStatus::CursorActive;
-    }
-    return KeyStoreStatus::CommitFailed;
-}
-
-KeyStoreStatus KeyStore::handle_transactional_write(BTreeStatus write_status) {
-    /**
-     * Record the outcome of a write inside an explicit transaction.
-     *
-     * Successful writes remain dirty until commit/rollback. CursorActive is a
-     * pre-mutation conflict and leaves the transaction usable. Any other BTree
-     * failure may have partially changed transaction-owned state, so future
-     * writes and commit are blocked until rollback.
-     */
-    if (write_status == BTreeStatus::CursorActive) {
-        return KeyStoreStatus::CursorActive;
-    }
-    if (write_status != BTreeStatus::Success) {
-        transaction_state = TransactionState::Failed;
-        return KeyStoreStatus::WriteFailed;
-    }
-
-    transaction_has_writes = true;
-    return KeyStoreStatus::Success;
-}
-
-void KeyStore::clear_transaction_state() {
-    // Call only after a successful commit/rollback or an empty transaction.
-    // Keeping both fields reset together avoids a stale has-writes bit leaking
-    // into the next explicit transaction.
-    transaction_state = TransactionState::None;
-    transaction_has_writes = false;
 }
