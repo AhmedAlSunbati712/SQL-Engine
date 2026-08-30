@@ -30,6 +30,8 @@ public:
 
     Lsn next_lsn() const noexcept;
     Lsn durable_lsn() const noexcept;
+    Lsn base_segment_offest() const noexcept;
+    void set_initial_lsn(Lsn initial_lsn) noexcept;
     bool recovery_required() const noexcept;
 
 private:

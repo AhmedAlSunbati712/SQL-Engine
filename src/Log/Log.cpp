@@ -170,6 +170,8 @@ void Log::sync_through(Lsn target_lsn) {
 }
 Lsn Log::next_lsn() const noexcept { std::shared_lock lock(mutex_); return next_lsn_; }
 Lsn Log::durable_lsn() const noexcept { std::shared_lock lock(mutex_); return durable_lsn_; }
+Lsn Log::base_segment_offest() const noexcept { return static_cast<Lsn>(config_.initial_lsn); }
+void Log::set_initial_lsn(Lsn initial_lsn) noexcept { config_.initial_lsn = initial_lsn; }
 bool Log::recovery_required() const noexcept { std::shared_lock lock(mutex_); return recovery_required_; }
 
 void Log::create_segment(Lsn base_lsn) {
