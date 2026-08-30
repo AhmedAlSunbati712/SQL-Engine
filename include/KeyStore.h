@@ -117,8 +117,9 @@ class KeyStore : public TransactionUndoExecutor {
         // A KeyStore owns one open BTree at a time. Any cursor returned from a
         // scan must be destroyed before its KeyStore.
         KeyStoreStatus open(const std::string &db_file);
-        // Closing an already-closed store succeeds. Session owners must finish
-        // their TransactionManager transactions before closing shared storage.
+        // Closing an already-closed store succeeds. Fails with
+        // WriteTransactionActive while any TransactionManager transaction is
+        // still active; callers must finish it first.
         KeyStoreStatus close();
 
         KeyStoreGetResult get(

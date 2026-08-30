@@ -237,6 +237,13 @@ KeyStoreStatus KeyStore::open(const std::string &db_file) {
 KeyStoreStatus KeyStore::close() {
     if (!is_open) return KeyStoreStatus::Success;
 
+    // A transaction may still hold locks and an undo chain that reference this
+    // store's BTree. Tearing the pager down underneath it would leave a later
+    // abort/undo dereferencing a closed session.
+    if (transaction_manager && transaction_manager->has_active_transactions()) {
+        return KeyStoreStatus::WriteTransactionActive;
+    }
+
     BTreeStatus close_status = tree.close();
     if (close_status == BTreeStatus::CursorActive) {
         return KeyStoreStatus::CursorActive;

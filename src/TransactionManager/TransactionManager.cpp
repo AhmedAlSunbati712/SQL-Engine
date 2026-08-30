@@ -57,6 +57,11 @@ TransactionHandle TransactionManager::find(TransactionId txn_id) const {
     return transaction->second;
 }
 
+bool TransactionManager::has_active_transactions() const noexcept {
+    std::shared_lock lock(transactions_mutex_);
+    return !active_transactions_.empty();
+}
+
 Lsn TransactionManager::append_action(const TransactionHandle& transaction, PendingWalRecord action) {
     std::shared_lock lock(transactions_mutex_);
     if (!owns_handle_locked(transaction)) {
