@@ -258,6 +258,13 @@ KeyStoreStatus KeyStore::close() {
     return KeyStoreStatus::Success;
 }
 
+KeyStoreStatus KeyStore::flush() {
+    if (!is_open) return KeyStoreStatus::NotOpen;
+    return tree.flush() == BTreeStatus::Success
+        ? KeyStoreStatus::Success
+        : KeyStoreStatus::WriteFailed;
+}
+
 KeyStoreGetResult KeyStore::get(
     const TransactionHandle &transaction,
     const Key &key

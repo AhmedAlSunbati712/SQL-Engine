@@ -46,6 +46,12 @@ public:
     TransactionState state() const noexcept { return state_; }
     Lsn last_lsn() const noexcept { return last_lsn_; }
 
+    // For standalone Transaction objects a caller constructs and owns
+    // directly (e.g. crash recovery), not for one TransactionManager already
+    // tracks - TransactionManager updates last_lsn_ itself via friend access
+    // as part of append_action/commit/abort.
+    void set_last_lsn(Lsn lsn) noexcept { last_lsn_ = lsn; }
+
 private:
     friend class TransactionManager;
 

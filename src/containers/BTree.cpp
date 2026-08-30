@@ -127,6 +127,17 @@ BTreeStatus BTree::close() {
     return close_status;
 }
 
+BTreeStatus BTree::flush() {
+    // Unlike close(), flushing never invalidates a page a cursor might be
+    // holding - pages stay resident in cache, just written out and marked
+    // clean - so no cursor guard is needed here.
+    if (!pager_open || !pager) return BTreeStatus::FailedToFlush;
+
+    return pager->flush_wal_pages() == PagerResult::Success
+        ? BTreeStatus::Success
+        : BTreeStatus::FailedToFlush;
+}
+
 BTreeGetStatus BTree::get(const Key &key) {
     /**
      * status <- BTreeGetStatus{}

@@ -24,6 +24,7 @@ enum class BTreeStatus : std::uint8_t {
     FailedToRemove,
     FailedToAllocateNewPage,
     CursorActive,
+    FailedToFlush,
 };
 
 enum class ChildDirection : std::uint8_t {
@@ -74,6 +75,9 @@ class BTree {
         ~BTree();
         BTreeStatus open(std::string db_file);
         BTreeStatus close();
+        // Writes every WAL-dirty page's bytes to the database file and syncs
+        // once, without closing the pager or disturbing any active cursor.
+        BTreeStatus flush();
         BTreeGetStatus get(const Key &key);
         BTreeStatus insert(
             const TransactionHandle &transaction,
