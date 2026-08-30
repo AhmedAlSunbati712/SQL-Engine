@@ -121,6 +121,9 @@ class KeyStore : public TransactionUndoExecutor {
         // WriteTransactionActive while any TransactionManager transaction is
         // still active; callers must finish it first.
         KeyStoreStatus close();
+        // Writes every dirty page to the database file and syncs once,
+        // without closing the store.
+        KeyStoreStatus flush();
 
         KeyStoreGetResult get(
             const TransactionHandle &transaction,
